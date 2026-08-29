@@ -258,6 +258,43 @@ func cropBBox(src image.Image, bb [4]float64) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// FaceThumb renders a square display thumbnail cropped around the face
+// described by f's bounding box: the crop side is 1.6x the larger bbox side
+// (≈30% margin around the face), centered on the bbox center (clamped into
+// the image), resized to size x size, and JPEG-encoded. It is meant for UI
+// avatars — not for recognition, which uses the aligned ArcFace crop.
+func FaceThumb(imgBytes []byte, f Face, size int) ([]byte, error) {
+	src, _, err := image.Decode(bytes.NewReader(imgBytes))
+	if err != nil {
+		return nil, fmt.Errorf("decode source image: %w", err)
+	}
+	if size <= 0 {
+		size = 160
+	}
+	if f.BBox[2] <= 0 || f.BBox[3] <= 0 {
+		return nil, fmt.Errorf("degenerate face bbox")
+	}
+	b := src.Bounds()
+	w, h := f.BBox[2], f.BBox[3]
+	cx, cy := f.BBox[0]+w/2, f.BBox[1]+h/2
+	side := 1.6 * math.Max(w, h)
+	// Clamp the crop origin so the square stays inside the image where
+	// possible; near the edges the crop shrinks (the resize stretches it).
+	x0 := math.Max(float64(b.Min.X), math.Min(cx-side/2, float64(b.Max.X)-side))
+	y0 := math.Max(float64(b.Min.Y), math.Min(cy-side/2, float64(b.Max.Y)-side))
+	r := image.Rect(int(math.Round(x0)), int(math.Round(y0)),
+		int(math.Round(x0+side)), int(math.Round(y0+side))).Intersect(b)
+	if r.Dx() <= 0 || r.Dy() <= 0 {
+		return nil, fmt.Errorf("empty face crop")
+	}
+	cropped := resizeBilinear(cropImage(src, r), size, size)
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, cropped, &jpeg.Options{Quality: 92}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 // cropImage copies the given rectangle of src into a new image anchored at the
 // origin.
 func cropImage(src image.Image, r image.Rectangle) *image.NRGBA {

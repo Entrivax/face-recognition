@@ -31,6 +31,7 @@ type Person struct {
 	ID     string  `json:"id"`
 	Name   string  `json:"name"`
 	Photos []Photo `json:"photos"`
+	Thumb  string  `json:"thumb,omitempty"` // face thumbnail sidecar file name in ThumbDir
 }
 
 // DB is the on-disk face database. The zero value is not ready; use Open.
@@ -165,17 +166,72 @@ func (d *DB) PhotoHash(name, relPath string) string {
 }
 
 // RemovePerson deletes a person (by name, case-insensitive). Returns whether
-// one existed.
+// one existed. The person's face thumbnail sidecar, if any, is deleted too.
 func (d *DB) RemovePerson(name string) (bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for i, p := range d.data.People {
 		if strings.EqualFold(p.Name, name) {
+			thumb := p.Thumb
 			d.data.People = append(d.data.People[:i], d.data.People[i+1:]...)
+			if thumb != "" {
+				_ = os.Remove(filepath.Join(d.ThumbDir(), thumb)) // best-effort
+			}
 			return true, d.saveLocked()
 		}
 	}
 	return false, nil
+}
+
+// ThumbDir returns the sidecar directory holding face thumbnails, located
+// next to the database file (data/thumbs for a DB at data/embeddings.json).
+func (d *DB) ThumbDir() string {
+	return filepath.Join(filepath.Dir(d.path), "thumbs")
+}
+
+// SetThumbnail stores jpg as the person's face thumbnail sidecar
+// (<personID>.jpg under ThumbDir) and records the file name on the person.
+// Meant to be called once, at first enrollment: if the person already has a
+// thumbnail, it is a no-op. Callers find the person ID via Get/People.
+func (d *DB) SetThumbnail(personID string, jpg []byte) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var p *Person
+	for _, cand := range d.data.People {
+		if cand.ID == personID {
+			p = cand
+			break
+		}
+	}
+	if p == nil {
+		return fmt.Errorf("person %q not found", personID)
+	}
+	if p.Thumb != "" {
+		return nil // already has one; first enrollment wins
+	}
+	dir := d.ThumbDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create thumbnail dir: %w", err)
+	}
+	fileName := personID + ".jpg"
+	if err := os.WriteFile(filepath.Join(dir, fileName), jpg, 0o644); err != nil {
+		return fmt.Errorf("write thumbnail: %w", err)
+	}
+	p.Thumb = fileName
+	return d.saveLocked()
+}
+
+// ThumbFile returns the full path of the person's recorded thumbnail, or ""
+// when the person is unknown or has no thumbnail.
+func (d *DB) ThumbFile(personID string) string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	for _, p := range d.data.People {
+		if p.ID == personID && p.Thumb != "" {
+			return filepath.Join(d.ThumbDir(), p.Thumb)
+		}
+	}
+	return ""
 }
 
 // RemovePhoto deletes a single photo from a person.

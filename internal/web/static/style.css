@@ -209,6 +209,10 @@ html, body {
   font-weight: 700; font-size: 14px;
   background: var(--accent); color: #0b0e12; flex-shrink: 0;
 }
+.person-avatar-img {
+  display: block; object-fit: cover;
+  background: var(--bg-raise); border: 1px solid var(--line-soft);
+}
 .person-name { font-size: 14.5px; font-weight: 500; }
 .person-count { font-family: var(--mono); font-size: 11px; color: var(--ink-faint); }
 .person-del {

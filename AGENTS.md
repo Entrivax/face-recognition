@@ -58,6 +58,7 @@ third_party/onnxruntime/ ORT C header + libonnxruntime.so (via `make ort`)
 models/                  det_10g.onnx, w600k_r50.onnx  (gitignored; downloaded)
 people/<Name>/*.jpg      the dataset — 11 people, 38 photos
 data/embeddings.json     generated face DB (gitignored)
+data/thumbs/             face thumbnail sidecars, one per person (gitignored)
 Dockerfile, docker-compose.yml, .dockerignore
 Makefile, README.md, scripts/dataset-test.sh
 ```
@@ -171,6 +172,11 @@ command hits a permission error.
   a warning, never stored. DB photo paths are **basenames relative to the
   person's folder** (folder scans and API uploads both derive the same name);
   API uploads additionally persist the image bytes into `people/<Name>/`.
+- **Face thumbnails** are a DB sidecar: `thumbs/<personID>.jpg` next to
+  `embeddings.json` (see `db.SetThumbnail`/`ThumbFile`, crop via
+  `engine.FaceThumb`). Written once at first enrollment — never overwritten —
+  and **best-effort**: thumbnail failures must never fail an enrollment.
+  Missing thumbnails are backfilled by rescans without re-embedding.
 - **onnxrt memory discipline**: every `OrtValue`/buffer allocated in the C shim
   is freed (tensor data via `ort_free`, sessions via `ort_close`). If you extend
   the shim, keep the ownership rules in `onnxrt.h` accurate and re-run the

@@ -3,6 +3,9 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"image"
+	"image/color"
+	"image/png"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -366,4 +369,95 @@ func slicesContain(list []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// pngBytes renders a deterministic w x h gradient as PNG bytes (real,
+// decodable image content, needed for thumbnail generation).
+func pngBytes(t *testing.T, w, h int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.Set(x, y, color.RGBA{uint8(x % 256), uint8(y % 256), 128, 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("encode png: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestPeopleThumbServing(t *testing.T) {
+	eng := &stubEngine{faces: []engine.Face{{BBox: [4]float64{10, 10, 40, 40}}}}
+	s, _ := newTestServer(t, eng)
+
+	// Alice: real image → thumbnail generated. Bob: fake bytes → crop fails,
+	// enrollment still succeeds but without a thumbnail (best-effort).
+	rec := enrollPerson(t, s, "Alice", map[string][]byte{"a.png": pngBytes(t, 120, 120)})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("alice enroll: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	rec = enrollPerson(t, s, "Bob", map[string][]byte{"b.jpg": []byte("not-an-image")})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bob enroll: got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	get := func(path string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		r := httptest.NewRecorder()
+		s.Handler().ServeHTTP(r, req)
+		return r
+	}
+
+	// People list carries thumb URLs: set for Alice, empty for Bob.
+	var resp struct {
+		People []struct {
+			ID    string `json:"id"`
+			Thumb string `json:"thumb"`
+		} `json:"people"`
+	}
+	if err := json.NewDecoder(get("/api/people").Body).Decode(&resp); err != nil {
+		t.Fatalf("decode people: %v", err)
+	}
+	thumbs := map[string]string{}
+	for _, p := range resp.People {
+		thumbs[p.ID] = p.Thumb
+	}
+	if thumbs["alice"] != "/api/thumbs/alice.jpg" {
+		t.Errorf("alice thumb = %q", thumbs["alice"])
+	}
+	if thumbs["bob"] != "" {
+		t.Errorf("bob should have no thumb, got %q", thumbs["bob"])
+	}
+
+	// Serving: JPEG bytes with cache headers.
+	r := get("/api/thumbs/alice.jpg")
+	if r.Code != http.StatusOK {
+		t.Fatalf("GET thumb: got %d", r.Code)
+	}
+	if ct := r.Header().Get("Content-Type"); !strings.HasPrefix(ct, "image/jpeg") {
+		t.Errorf("content type %q, want image/jpeg", ct)
+	}
+	if r.Header().Get("Cache-Control") == "" {
+		t.Errorf("expected Cache-Control header")
+	}
+	if r.Body.Len() == 0 {
+		t.Errorf("empty thumbnail body")
+	}
+
+	// Unknown person / no-thumbnail person / bad method.
+	if code := get("/api/thumbs/nosuch.jpg").Code; code != http.StatusNotFound {
+		t.Errorf("unknown id: got %d, want 404", code)
+	}
+	if code := get("/api/thumbs/bob.jpg").Code; code != http.StatusNotFound {
+		t.Errorf("missing thumbnail: got %d, want 404", code)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/thumbs/alice.jpg", nil)
+	r2 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(r2, req)
+	if r2.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST thumb: got %d, want 405", r2.Code)
+	}
 }

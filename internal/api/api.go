@@ -58,6 +58,7 @@ func (s *Server) routes() {
 	m.HandleFunc("/api/people/", s.handlePersonSubroutes)     // enroll/delete
 	m.HandleFunc("/api/enroll", s.handleEnrollFolder)         // rescan people/
 	m.HandleFunc("/api/config", s.handleConfig)               // GET/POST threshold
+	m.HandleFunc("/api/thumbs/", s.handleThumb)               // face thumbnails
 	s.mux = m
 }
 
@@ -123,10 +124,19 @@ func (s *Server) handlePeople(w http.ResponseWriter, r *http.Request) {
 		Name    string `json:"name"`
 		Photos  int    `json:"photos"`
 		Embeds  int    `json:"embeddings"`
+		Thumb   string `json:"thumb"`
 	}
 	out := make([]summary, 0, len(people))
 	for _, p := range people {
-		out = append(out, summary{ID: p.ID, Name: p.Name, Photos: len(p.Photos), Embeds: len(p.Photos)})
+		var thumb string
+		if p.Thumb != "" {
+			thumb = "/api/thumbs/" + p.ID + ".jpg"
+		}
+		out = append(out, summary{
+			ID: p.ID, Name: p.Name,
+			Photos: len(p.Photos), Embeds: len(p.Photos),
+			Thumb: thumb,
+		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"people": out, "count": len(out)})
 }
@@ -285,6 +295,44 @@ func (s *Server) handleEnrollFolder(w http.ResponseWriter, r *http.Request) {
 		"failed":        res.PhotosFailed,
 		"skipped_count": len(res.Skipped),
 	})
+}
+
+// handleThumb serves a person's face thumbnail sidecar as JPEG. The id is
+// validated and resolved through the DB before any filesystem access.
+func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "GET required")
+		return
+	}
+	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/thumbs/"), ".jpg")
+	if !validThumbID(id) || s.db.GetByID(id) == nil {
+		http.NotFound(w, r)
+		return
+	}
+	path := s.db.ThumbFile(id)
+	if path == "" {
+		http.NotFound(w, r)
+		return
+	}
+	// Thumbnails are written once at first enrollment, so they can be cached.
+	w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
+	http.ServeFile(w, r, path)
+}
+
+// validThumbID restricts thumbnail ids to the charset db.newID produces,
+// keeping the value safe to use as a file name.
+func validThumbID(id string) bool {
+	if id == "" {
+		return false
+	}
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {

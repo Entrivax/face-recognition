@@ -105,6 +105,31 @@ func Scan(eng FaceEngine, database *db.DB, opts Options) (Result, error) {
 	return res, nil
 }
 
+// thumbSize is the pixel size (square) of the generated face thumbnails.
+const thumbSize = 160
+
+// saveThumb stores a face thumbnail for the person if they do not have one
+// yet (first enrollment wins). Best-effort: thumbnail problems must never
+// fail an enrollment.
+func saveThumb(database *db.DB, name string, imgBytes []byte, f engine.Face) {
+	p := database.Get(name)
+	if p == nil || p.Thumb != "" {
+		return // person unknown, or thumbnail already set
+	}
+	jpg, err := engine.FaceThumb(imgBytes, f, thumbSize)
+	if err != nil {
+		return // best-effort
+	}
+	_ = database.SetThumbnail(p.ID, jpg)
+}
+
+// thumbPending reports whether the named person exists but has no face
+// thumbnail yet (drives the one-time backfill during folder scans).
+func thumbPending(database *db.DB, name string) bool {
+	p := database.Get(name)
+	return p != nil && p.Thumb == ""
+}
+
 // enrollOne processes a single image. It returns (added, skipReason, err).
 // added=false with empty reason means the file was unchanged (hash match).
 // Note: DB photo paths are basenames relative to the person's folder, so
@@ -116,7 +141,8 @@ func enrollOne(eng FaceEngine, database *db.DB, name, folder, file string, force
 		return false, "", err
 	}
 	h := db.HashBytes(b)
-	if !force && database.PhotoHash(name, file) == h {
+	unchanged := !force && database.PhotoHash(name, file) == h
+	if unchanged && !thumbPending(database, name) {
 		return false, "", nil // unchanged
 	}
 
@@ -135,6 +161,12 @@ func enrollOne(eng FaceEngine, database *db.DB, name, folder, file string, force
 			best, bestArea = f, a
 		}
 	}
+	if unchanged {
+		// The photo is unchanged, but the person still lacks a thumbnail:
+		// crop only — no re-embedding, no DB write.
+		saveThumb(database, name, b, best)
+		return false, "", nil
+	}
 	emb, err := eng.EmbedFace(b, best)
 	if err != nil {
 		return false, "", fmt.Errorf("embed: %w", err)
@@ -142,6 +174,7 @@ func enrollOne(eng FaceEngine, database *db.DB, name, folder, file string, force
 	if err := database.AddPhotoHashed(name, file, h, emb); err != nil {
 		return false, "", err
 	}
+	saveThumb(database, name, b, best)
 	return true, "", nil
 }
 
@@ -201,6 +234,7 @@ func EnrollBytes(eng FaceEngine, database *db.DB, peopleDir, name, fileName stri
 		// enroll it, so the dataset self-heals.
 		return "", err
 	}
+	saveThumb(database, name, imgBytes, best)
 	return filepath.Join(folder, fileName), nil
 }
 

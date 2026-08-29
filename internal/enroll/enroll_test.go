@@ -1,6 +1,11 @@
 package enroll
 
 import (
+	"bytes"
+	"image"
+	"image/color"
+	"image/jpeg"
+	"image/png"
 	"os"
 	"path/filepath"
 	"testing"
@@ -21,6 +26,23 @@ func (s *stubEngine) EmbedFace([]byte, engine.Face) ([]float32, error) {
 
 func testFace() []engine.Face {
 	return []engine.Face{{BBox: [4]float64{0, 0, 10, 10}}}
+}
+
+// pngBytes renders a deterministic w x h gradient as PNG bytes (real,
+// decodable image content, needed for thumbnail generation).
+func pngBytes(t *testing.T, w, h int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.Set(x, y, color.RGBA{uint8(x % 256), uint8(y % 256), 128, 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("encode png: %v", err)
+	}
+	return buf.Bytes()
 }
 
 // TestScanIncrementalByHash checks that a rescan skips unchanged files by
@@ -156,5 +178,87 @@ func TestCheckName(t *testing.T) {
 		if err := CheckName(name); err == nil {
 			t.Errorf("CheckName(%q) = nil, want error", name)
 		}
+	}
+}
+
+// TestEnrollBytesGeneratesThumbnail checks that the first successful upload
+// also stores a face-crop JPEG sidecar next to the DB file, and that later
+// uploads never overwrite it.
+func TestEnrollBytesGeneratesThumbnail(t *testing.T) {
+	peopleDir := t.TempDir()
+	dbDir := t.TempDir()
+	database, err := db.Open(filepath.Join(dbDir, "emb.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := &stubEngine{faces: []engine.Face{{BBox: [4]float64{30, 20, 40, 50}}}}
+	img := pngBytes(t, 120, 120)
+
+	if _, err := EnrollBytes(eng, database, peopleDir, "Bob", "photo.png", img); err != nil {
+		t.Fatal(err)
+	}
+	p := database.Get("Bob")
+	if p == nil || p.Thumb == "" {
+		t.Fatalf("expected thumbnail sidecar recorded, got %+v", p)
+	}
+	thumbPath := filepath.Join(dbDir, "thumbs", p.Thumb)
+	raw, err := os.ReadFile(thumbPath)
+	if err != nil {
+		t.Fatalf("read sidecar: %v", err)
+	}
+	decoded, err := jpeg.Decode(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("sidecar is not a decodable JPEG: %v", err)
+	}
+	if b := decoded.Bounds(); b.Dx() != thumbSize || b.Dy() != thumbSize {
+		t.Fatalf("thumbnail %dx%d, want %dx%d", b.Dx(), b.Dy(), thumbSize, thumbSize)
+	}
+
+	// A second upload must not overwrite the existing thumbnail.
+	before := append([]byte(nil), raw...)
+	if _, err := EnrollBytes(eng, database, peopleDir, "Bob", "photo.png", img); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := os.ReadFile(thumbPath)
+	if !bytes.Equal(before, after) {
+		t.Error("thumbnail was overwritten on re-enroll")
+	}
+}
+
+// TestScanBackfillsThumbnail checks that a rescan generates the missing
+// thumbnail for an already-enrolled person without re-adding their photos.
+func TestScanBackfillsThumbnail(t *testing.T) {
+	dir := t.TempDir()
+	dbDir := t.TempDir()
+	database, err := db.Open(filepath.Join(dbDir, "emb.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	img := pngBytes(t, 100, 100)
+	if err := os.MkdirAll(filepath.Join(dir, "Carol"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Carol", "c.jpg"), img, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Pre-enroll without a thumbnail, the way an older DB looks.
+	if err := database.AddPhoto("Carol", "c.jpg", img, []float32{0.3}); err != nil {
+		t.Fatal(err)
+	}
+	eng := &stubEngine{faces: []engine.Face{{BBox: [4]float64{5, 5, 20, 20}}}}
+
+	res, err := Scan(eng, database, Options{PeopleDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.PhotosAdded != 0 || res.PhotosKept != 1 {
+		t.Fatalf("backfill scan should keep the photo unchanged, got %+v", res)
+	}
+	p := database.Get("Carol")
+	if p == nil || p.Thumb == "" {
+		t.Fatalf("thumbnail not backfilled, got %+v", p)
+	}
+	if _, err := os.Stat(filepath.Join(dbDir, "thumbs", p.Thumb)); err != nil {
+		t.Fatalf("sidecar missing: %v", err)
 	}
 }

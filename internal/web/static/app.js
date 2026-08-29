@@ -239,13 +239,26 @@
       people.forEach((p) => {
         const li = document.createElement("li");
         li.className = "person-row";
+        const avatar = p.thumb
+          ? `<img class="person-avatar person-avatar-img" src="${escapeHtml(p.thumb)}" alt="" data-initials="${escapeHtml(initials(p.name))}">`
+          : `<span class="person-avatar">${escapeHtml(initials(p.name))}</span>`;
         li.innerHTML = `
-          <span class="person-avatar">${escapeHtml(initials(p.name))}</span>
+          ${avatar}
           <div>
             <div class="person-name">${escapeHtml(p.name)}</div>
             <div class="person-count">${p.photos} photo(s)</div>
           </div>
           <button class="person-del" title="Remove ${escapeHtml(p.name)}" aria-label="Remove ${escapeHtml(p.name)}">×</button>`;
+        const img = li.querySelector("img.person-avatar-img");
+        if (img) {
+          // Missing/broken thumbnail (e.g. deleted sidecar) → initials.
+          img.addEventListener("error", () => {
+            const span = document.createElement("span");
+            span.className = "person-avatar";
+            span.textContent = img.dataset.initials || "";
+            img.replaceWith(span);
+          });
+        }
         li.querySelector(".person-del").addEventListener("click", () => removePerson(p.name));
         peopleList.appendChild(li);
       });

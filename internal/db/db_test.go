@@ -1,6 +1,8 @@
 package db
 
 import (
+	"bytes"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -100,6 +102,50 @@ func TestRemovePersonAndPhoto(t *testing.T) {
 	ok, _ = d.RemovePerson("A")
 	if ok {
 		t.Errorf("expected ok=false removing missing person")
+	}
+}
+
+func TestThumbnailSidecar(t *testing.T) {
+	d := openTemp(t)
+	_ = d.AddPhoto("Alice", "a/1.jpg", []byte("img"), []float32{1})
+	p := d.Get("Alice")
+
+	if d.ThumbFile(p.ID) != "" {
+		t.Errorf("expected no thumbnail before SetThumbnail")
+	}
+	jpg := []byte("fake-jpeg-bytes")
+	if err := d.SetThumbnail(p.ID, jpg); err != nil {
+		t.Fatalf("SetThumbnail: %v", err)
+	}
+	want := filepath.Join(d.ThumbDir(), p.ID+".jpg")
+	if got := d.ThumbFile(p.ID); got != want {
+		t.Errorf("ThumbFile = %q, want %q", got, want)
+	}
+	b, err := os.ReadFile(want)
+	if err != nil || !bytes.Equal(b, jpg) {
+		t.Errorf("sidecar file mismatch: err=%v len=%d", err, len(b))
+	}
+	if d.Get("Alice").Thumb != p.ID+".jpg" {
+		t.Errorf("Thumb not recorded on person: %q", d.Get("Alice").Thumb)
+	}
+
+	// Setting again is a no-op: first enrollment wins.
+	if err := d.SetThumbnail(p.ID, []byte("other")); err != nil {
+		t.Fatalf("second SetThumbnail: %v", err)
+	}
+	if b, _ := os.ReadFile(want); !bytes.Equal(b, jpg) {
+		t.Errorf("thumbnail should not be overwritten")
+	}
+	if err := d.SetThumbnail("nobody", jpg); err == nil {
+		t.Errorf("expected error for unknown person")
+	}
+
+	// Removing the person removes the sidecar.
+	if ok, err := d.RemovePerson("Alice"); !ok || err != nil {
+		t.Fatalf("RemovePerson: ok=%v err=%v", ok, err)
+	}
+	if _, err := os.Stat(want); !os.IsNotExist(err) {
+		t.Errorf("sidecar should be deleted, err=%v", err)
 	}
 }
 
