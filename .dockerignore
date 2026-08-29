@@ -1,0 +1,30 @@
+# Keep the build context small and avoid leaking local artifacts.
+
+# VCS
+.git
+.gitignore
+
+# Build artifacts & local caches
+recogn
+.gocache/
+.gopath/
+.gomodcache/
+
+# Downloaded models are fetched fresh inside the image build.
+models/
+
+# The generated DB is runtime state, not source. Mounted as a volume.
+data/
+
+# Your dataset is mounted at runtime, not baked into the image.
+people/
+
+# Scratch / logs / OS noise
+tmp/
+*.log
+.DS_Store
+
+# Docker's own files
+Dockerfile
+.dockerignore
+docker-compose.yml

@@ -1,0 +1,426 @@
+// Package engine owns the face-recognition pipeline: detect faces in an
+// image, align each to 112x112, compute embeddings, and match them against a
+// set of known identities. Inference itself is delegated to a Python ONNX
+// sidecar (see sidecar.go); this file holds the pure-Go logic around it.
+package engine
+
+import (
+	"bytes"
+	"fmt"
+	"image"
+	_ "image/gif" // register decoders
+	"image/jpeg"
+	_ "image/png"
+	"math"
+	"os"
+	"path/filepath"
+
+	_ "golang.org/x/image/bmp"
+	_ "golang.org/x/image/webp"
+)
+
+// Face is a single detected face with its detection metadata and, after
+// embedding+matching, the recognition outcome.
+type Face struct {
+	BBox      [4]float64   `json:"bbox"`      // x, y, width, height
+	Score     float64      `json:"score"`     // detector confidence 0..1
+	Landmarks [][2]float64 `json:"landmarks"` // 5-point landmarks (eyes, nose, mouth corners)
+	Embedding []float32    `json:"-"`         // 512-d, not serialised to clients by default
+
+	// Recognition result (populated by Engine.Recognize).
+	Name       string  `json:"name"`       // matched identity, or "unknown"
+	PersonID   string  `json:"person_id"`  // matched person's ID, or ""
+	Confidence float64 `json:"confidence"` // best cosine similarity 0..1
+}
+
+// Match describes one candidate identity for a face.
+type Match struct {
+	PersonID string
+	Name     string
+	Score    float64
+}
+
+// KnownPerson is the engine-facing view of an enrolled identity.
+type KnownPerson struct {
+	ID         string
+	Name       string
+	Embeddings [][]float32
+}
+
+// ArcFace reference 5-point landmarks for a 112x112 aligned crop.
+var arcfaceTemplate = [5][2]float32{
+	{38.2946, 51.6963},
+	{73.5318, 51.5014},
+	{56.0252, 71.7366},
+	{41.5493, 92.3655},
+	{70.7299, 92.2041},
+}
+
+// Engine runs detection→alignment→embedding→matching. It is safe for
+// concurrent use; the underlying sidecar serialises inference.
+type Engine struct {
+	sc      *sidecar
+	known   []KnownPerson
+	thresh  float64
+}
+
+// New creates an Engine. detModel/embModel are paths to the ONNX models and
+// are handed to the sidecar via environment. thresh is the match threshold.
+func New(pythonBin, script, detModel, embModel string, thresh float64) *Engine {
+	env := append(os.Environ(),
+		"RECOGN_DET_MODEL="+detModel,
+		"RECOGN_EMB_MODEL="+embModel,
+	)
+	return &Engine{
+		sc:     newSidecar(pythonBin, script, env),
+		thresh: thresh,
+	}
+}
+
+// Close shuts the engine (and its sidecar) down.
+func (e *Engine) Close() { e.sc.Close() }
+
+// SetThreshold updates the match threshold.
+func (e *Engine) SetThreshold(t float64) { e.thresh = t }
+
+// Threshold returns the current match threshold.
+func (e *Engine) Threshold() float64 { return e.thresh }
+
+// SetKnown replaces the in-memory identity set.
+func (e *Engine) SetKnown(people []KnownPerson) { e.known = people }
+
+// Known returns the current identity set.
+func (e *Engine) Known() []KnownPerson { return e.known }
+
+// Ping warms up the sidecar and verifies models load.
+func (e *Engine) Ping() error { return e.sc.ping() }
+
+// Detect finds all faces in an image (raw bytes of a jpeg/png/webp/bmp/gif).
+func (e *Engine) Detect(imgBytes []byte) ([]Face, error) {
+	return e.sc.detect(imgBytes)
+}
+
+// EmbedFace aligns a detected face and computes its embedding. imgBytes is the
+// original full image; the face's landmarks drive the alignment crop.
+func (e *Engine) EmbedFace(imgBytes []byte, f Face) ([]float32, error) {
+	aligned, err := alignFace(imgBytes, f)
+	if err != nil {
+		return nil, fmt.Errorf("align: %w", err)
+	}
+	return e.sc.embed(aligned)
+}
+
+// MatchEmbedding returns the best identity for an embedding plus whether it
+// clears the threshold. The score is the max cosine similarity across every
+// enrolled embedding of every person.
+func (e *Engine) MatchEmbedding(emb []float32) (Match, bool) {
+	best := Match{Score: -1}
+	for _, p := range e.known {
+		for _, pe := range p.Embeddings {
+			s := Cosine(emb, pe)
+			if s > best.Score {
+				best = Match{PersonID: p.ID, Name: p.Name, Score: s}
+			}
+		}
+	}
+	return best, best.Score >= e.thresh
+}
+
+// Recognize runs the full pipeline on one image: detect every face, embed and
+// match each, and annotate the returned faces with identities.
+func (e *Engine) Recognize(imgBytes []byte) ([]Face, error) {
+	faces, err := e.sc.detect(imgBytes)
+	if err != nil {
+		return nil, err
+	}
+	for i := range faces {
+		emb, err := e.EmbedFace(imgBytes, faces[i])
+		if err != nil {
+			// A single bad crop shouldn't sink the whole photo.
+			faces[i].Name = "unknown"
+			continue
+		}
+		faces[i].Embedding = emb
+		m, ok := e.MatchEmbedding(emb)
+		faces[i].Confidence = math.Max(0, m.Score)
+		if ok {
+			faces[i].Name = m.Name
+			faces[i].PersonID = m.PersonID
+		} else {
+			faces[i].Name = "unknown"
+		}
+	}
+	return faces, nil
+}
+
+// Cosine returns the cosine similarity between two embeddings. Both are
+// expected L2-normalised (ArcFace output), so this is a dot product, but we
+// divide by norms anyway for safety.
+func Cosine(a, b []float32) float64 {
+	if len(a) == 0 || len(b) == 0 || len(a) != len(b) {
+		return 0
+	}
+	var dot, na, nb float64
+	for i := range a {
+		dot += float64(a[i]) * float64(b[i])
+		na += float64(a[i]) * float64(a[i])
+		nb += float64(b[i]) * float64(b[i])
+	}
+	if na == 0 || nb == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(na) * math.Sqrt(nb))
+}
+
+// alignFace warps the face described by f's 5-point landmarks into a 112x112
+// crop matching the ArcFace reference template, returning JPEG bytes.
+func alignFace(imgBytes []byte, f Face) ([]byte, error) {
+	src, _, err := image.Decode(bytes.NewReader(imgBytes))
+	if err != nil {
+		return nil, fmt.Errorf("decode source image: %w", err)
+	}
+	if len(f.Landmarks) < 5 {
+		// Fall back to a plain bbox crop when landmarks are unavailable.
+		return cropBBox(src, f.BBox)
+	}
+
+	// Estimate the similarity transform mapping the detected landmarks onto
+	// the ArcFace template (Umeyama). We then render it with an affine warp.
+	M := umeyama(f.Landmarks[:5], arcfaceTemplate)
+
+	// Backward-warp: build the aligned image by sampling the source through
+	// the inverse (dst->src) of the forward landmark transform.
+	inv := invertAffine(M)
+	dst := affineWarp(src, inv, 112, 112)
+
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 92}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// cropBBox extracts a padded bounding-box crop (fallback when landmarks are
+// missing) and resizes to 112x112.
+func cropBBox(src image.Image, bb [4]float64) ([]byte, error) {
+	b := src.Bounds()
+	x, y := int(bb[0]), int(bb[1])
+	w, h := int(bb[2]), int(bb[3])
+	// pad a little around the box
+	padx, pady := w/8, h/8
+	x0 := max(0, x-padx)
+	y0 := max(0, y-pady)
+	x1 := min(b.Max.X, x+w+padx)
+	y1 := min(b.Max.Y, y+h+pady)
+	if x1 <= x0 || y1 <= y0 {
+		return nil, fmt.Errorf("empty crop")
+	}
+	cropped := cropImage(src, image.Rect(x0, y0, x1, y1))
+	resized := resizeBilinear(cropped, 112, 112)
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, resized, &jpeg.Options{Quality: 92}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// cropImage copies the given rectangle of src into a new image anchored at the
+// origin.
+func cropImage(src image.Image, r image.Rectangle) *image.NRGBA {
+	dst := image.NewNRGBA(image.Rect(0, 0, r.Dx(), r.Dy()))
+	for y := 0; y < r.Dy(); y++ {
+		for x := 0; x < r.Dx(); x++ {
+			dst.Set(x, y, src.At(r.Min.X+x, r.Min.Y+y))
+		}
+	}
+	return dst
+}
+
+// resizeBilinear scales src to w x h with bilinear interpolation.
+func resizeBilinear(src image.Image, w, h int) *image.NRGBA {
+	sb := src.Bounds()
+	sw, sh := sb.Dx(), sb.Dy()
+	dst := image.NewNRGBA(image.Rect(0, 0, w, h))
+	if sw == 0 || sh == 0 {
+		return dst
+	}
+	for y := 0; y < h; y++ {
+		fy := (float64(y)+0.5)*float64(sh)/float64(h) - 0.5 + float64(sb.Min.Y)
+		for x := 0; x < w; x++ {
+			fx := (float64(x)+0.5)*float64(sw)/float64(w) - 0.5 + float64(sb.Min.X)
+			dst.Set(x, y, bilinear(src, sb, fx, fy))
+		}
+	}
+	return dst
+}
+
+// umeyama estimates a similarity transform (scale, rotation, translation)
+// mapping src points onto dst points, returned as a 2x3 affine matrix that
+// maps src -> dst. src must have 5 points; dst is the 5-point template.
+func umeyama(src [][2]float64, dst [5][2]float32) [2][3]float64 {
+	n := 5
+	// means
+	var msx, msy, mdx, mdy float64
+	for i := 0; i < n; i++ {
+		msx += src[i][0]
+		msy += src[i][1]
+		mdx += float64(dst[i][0])
+		mdy += float64(dst[i][1])
+	}
+	msx, msy, mdx, mdy = msx/float64(n), msy/float64(n), mdx/float64(n), mdy/float64(n)
+
+	// centre
+	sx := make([]float64, n)
+	sy := make([]float64, n)
+	dx := make([]float64, n)
+	dy := make([]float64, n)
+	var srcVar float64
+	for i := 0; i < n; i++ {
+		sx[i] = src[i][0] - msx
+		sy[i] = src[i][1] - msy
+		dx[i] = float64(dst[i][0]) - mdx
+		dy[i] = float64(dst[i][1]) - mdy
+		srcVar += sx[i]*sx[i] + sy[i]*sy[i]
+	}
+	srcVar /= float64(n)
+
+	// cross-covariance
+	var sxx, sxy, syx, syy float64
+	for i := 0; i < n; i++ {
+		sxx += dx[i] * sx[i]
+		sxy += dx[i] * sy[i]
+		syx += dy[i] * sx[i]
+		syy += dy[i] * sy[i]
+	}
+	sxx, sxy, syx, syy = sxx/float64(n), sxy/float64(n), syx/float64(n), syy/float64(n)
+
+	// For the 2-D similarity case the optimal rotation+scale reduces to:
+	//   a = (sxx + syy) / srcVar
+	//   b = (syx - sxy) / srcVar
+	// giving R*scale = [[a, -b],[b, a]].
+	a := (sxx + syy) / srcVar
+	b := (syx - sxy) / srcVar
+
+	tx := mdx - a*msx + b*msy
+	ty := mdy - b*msx - a*msy
+
+	return [2][3]float64{
+		{a, -b, tx},
+		{b, a, ty},
+	}
+}
+
+// invertAffine inverts a 2x3 affine matrix that maps src->dst, producing the
+// matrix mapping dst->src used for backward warping.
+func invertAffine(m [2][3]float64) [2][3]float64 {
+	a, b, tx := m[0][0], m[0][1], m[0][2]
+	c, d, ty := m[1][0], m[1][1], m[1][2]
+	det := a*d - b*c
+	if det == 0 {
+		// identity fallback
+		return [2][3]float64{{1, 0, 0}, {0, 1, 0}}
+	}
+	ia := d / det
+	ib := -b / det
+	ic := -c / det
+	id := a / det
+	itx := -(ia*tx + ib*ty)
+	ity := -(ic*tx + id*ty)
+	return [2][3]float64{
+		{ia, ib, itx},
+		{ic, id, ity},
+	}
+}
+
+// affineWarp renders a w x h image by sampling src through the dst->src affine
+// matrix m using bilinear interpolation.
+func affineWarp(src image.Image, m [2][3]float64, w, h int) *image.NRGBA {
+	dst := image.NewNRGBA(image.Rect(0, 0, w, h))
+	sb := src.Bounds()
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			fx := m[0][0]*float64(x) + m[0][1]*float64(y) + m[0][2]
+			fy := m[1][0]*float64(x) + m[1][1]*float64(y) + m[1][2]
+			c := bilinear(src, sb, fx, fy)
+			dst.Set(x, y, c)
+		}
+	}
+	return dst
+}
+
+func bilinear(src image.Image, b image.Rectangle, fx, fy float64) (nrgba color8) {
+	x0 := int(math.Floor(fx))
+	y0 := int(math.Floor(fy))
+	x1 := x0 + 1
+	y1 := y0 + 1
+	dx := fx - float64(x0)
+	dy := fy - float64(y0)
+
+	sample := func(x, y int) (r, g, bl, a float64) {
+		if x < b.Min.X || y < b.Min.Y || x >= b.Max.X || y >= b.Max.Y {
+			return 0, 0, 0, 0
+		}
+		cr, cg, cb, ca := src.At(x, y).RGBA()
+		return float64(cr) / 257, float64(cg) / 257, float64(cb) / 257, float64(ca) / 257
+	}
+	r00, g00, b00, a00 := sample(x0, y0)
+	r10, g10, b10, a10 := sample(x1, y0)
+	r01, g01, b01, a01 := sample(x0, y1)
+	r11, g11, b11, a11 := sample(x1, y1)
+
+	lerp := func(v00, v10, v01, v11 float64) float64 {
+		top := v00*(1-dx) + v10*dx
+		bot := v01*(1-dx) + v11*dx
+		return top*(1-dy) + bot*dy
+	}
+	return color8{
+		r: uint8(clamp(lerp(r00, r10, r01, r11))),
+		g: uint8(clamp(lerp(g00, g10, g01, g11))),
+		b: uint8(clamp(lerp(b00, b10, b01, b11))),
+		a: uint8(clamp(lerp(a00, a10, a01, a11))),
+	}
+}
+
+type color8 struct{ r, g, b, a uint8 }
+
+func (c color8) RGBA() (r, g, b, a uint32) {
+	r = uint32(c.r) * 0x101
+	g = uint32(c.g) * 0x101
+	b = uint32(c.b) * 0x101
+	a = uint32(c.a) * 0x101
+	return
+}
+
+func clamp(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 255 {
+		return 255
+	}
+	return v
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// Ensure the models referenced exist before trying to serve requests.
+func CheckModels(detPath, embPath string) error {
+	for _, p := range []string{detPath, embPath} {
+		if _, err := os.Stat(p); err != nil {
+			return fmt.Errorf("model missing: %s (download it into the models directory)", filepath.Base(p))
+		}
+	}
+	return nil
+}
