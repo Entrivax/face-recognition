@@ -292,13 +292,15 @@ body.modal-open { overflow: hidden; }
 }
 .enroll-drop:hover, .enroll-drop:focus-visible { border-color: var(--accent); }
 .enroll-drop.drag { border-color: var(--match); background: var(--match-dim); }
+.enroll-drop.pulse { border-color: var(--match); }
 .enroll-drop.disabled { opacity: 0.55; pointer-events: none; }
 .edz-icon { width: 34px; height: 34px; color: var(--ink-faint); margin-bottom: 10px; }
-.enroll-drop.drag .edz-icon { color: var(--match); }
+.enroll-drop.drag .edz-icon, .enroll-drop.pulse .edz-icon { color: var(--match); }
 .edz-primary { margin: 0 0 5px; font-size: 13.5px; color: var(--ink); }
 .edz-browse { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
 .edz-hint { margin: 0; font-family: var(--mono); font-size: 10.5px; color: var(--ink-faint); }
-/* corner brackets while dragging — the same framing the detector draws */
+/* corner brackets while dragging — the same framing the detector draws;
+   the pulse variant flashes them when a pasted photo lands */
 .enroll-drop::before, .enroll-drop::after {
   content: ""; position: absolute; width: 16px; height: 16px;
   border: 2px solid var(--match);
@@ -307,7 +309,8 @@ body.modal-open { overflow: hidden; }
 }
 .enroll-drop::before { top: 7px; left: 7px; border-right: 0; border-bottom: 0; border-top-left-radius: 6px; }
 .enroll-drop::after { bottom: 7px; right: 7px; border-left: 0; border-top: 0; border-bottom-right-radius: 6px; }
-.enroll-drop.drag::before, .enroll-drop.drag::after { opacity: 1; }
+.enroll-drop.drag::before, .enroll-drop.drag::after,
+.enroll-drop.pulse::before, .enroll-drop.pulse::after { opacity: 1; }
 
 /* selected-photo review grid */
 .enroll-thumbs {

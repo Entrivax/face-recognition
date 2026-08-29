@@ -27,7 +27,7 @@
   <section class="panel stage" aria-labelledby="stageTitle">
     <div class="panel-head">
       <h1 id="stageTitle">Inspect a photo</h1>
-      <p class="lede">Drop an image to detect every face and match each against the enrolled people.</p>
+      <p class="lede">Drop or paste an image to detect every face and match each against the enrolled people.</p>
     </div>
 
     <div id="dropzone" class="dropzone" tabindex="0" role="button"
@@ -40,7 +40,7 @@
           <path d="M6 34l10-9 8 7 8-6 10 8" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
         </svg>
         <p class="dz-primary">Drop a photo here, or <span class="dz-browse">browse</span></p>
-        <p class="dz-hint">JPG, PNG, WebP or BMP — multiple faces are detected and named</p>
+        <p class="dz-hint">JPG, PNG, WebP or BMP — or paste from the clipboard (Ctrl+V)</p>
       </div>
       <div class="dz-preview" id="dzPreview" hidden>
         <div class="canvas-wrap">
@@ -101,14 +101,14 @@
       <p class="field-hint" id="enrollNameHint">Shown as the identity when their face is recognized.</p>
 
       <div id="enrollDrop" class="enroll-drop" tabindex="0" role="button"
-           aria-label="Add photos — drag and drop here, or press Enter to browse">
+           aria-label="Add photos — drag and drop, paste, or press Enter to browse">
         <svg viewBox="0 0 48 48" class="edz-icon" aria-hidden="true">
           <path d="M15 8h-5a2 2 0 0 0-2 2v5M33 8h5a2 2 0 0 1 2 2v5M15 40h-5a2 2 0 0 1-2-2v-5M33 40h5a2 2 0 0 0 2-2v-5"
                 fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
           <circle cx="24" cy="21" r="5" fill="none" stroke="currentColor" stroke-width="2"/>
           <path d="M15 36c2-4.5 5.4-6 9-6s7 1.6 9 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
         </svg>
-        <p class="edz-primary">Drag &amp; drop photos here, or <span class="edz-browse">browse</span></p>
+        <p class="edz-primary">Drag &amp; drop, paste, or <span class="edz-browse">browse</span></p>
         <p class="edz-hint">Nothing uploads until you review and confirm</p>
         <input id="enrollPhotos" type="file" accept="image/*" multiple hidden>
       </div>

@@ -506,6 +506,56 @@
     }
   });
 
+  // ---------- clipboard paste ----------
+  // Ctrl+V / Cmd+V routes by context: with the enroll modal open, pasted
+  // images join the review list; otherwise they are inspected on the stage.
+  // Plain-text pastes into inputs are never hijacked.
+  let pulseTimer = null;
+
+  function imageFilesFromClipboard(dt) {
+    if (!dt || !dt.items) return [];
+    const out = [];
+    for (const item of dt.items) {
+      if (item.kind === "file" && item.type.startsWith("image/")) {
+        const f = item.getAsFile();
+        if (f) out.push(f);
+      }
+    }
+    return out;
+  }
+
+  function pulseEnrollDrop() {
+    enrollDrop.classList.add("pulse");
+    clearTimeout(pulseTimer);
+    pulseTimer = setTimeout(() => enrollDrop.classList.remove("pulse"), 900);
+  }
+
+  document.addEventListener("paste", (e) => {
+    const files = imageFilesFromClipboard(e.clipboardData);
+    if (!files.length) return; // normal text paste — leave to the browser
+
+    const t = e.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA") &&
+        typeof e.clipboardData.getData === "function" &&
+        e.clipboardData.getData("text/plain")) {
+      return; // text field + text on the clipboard: default behaviour wins
+    }
+    e.preventDefault();
+
+    if (!enrollModal.hidden) {
+      if (enrolling) return;
+      addPending(files);
+      pulseEnrollDrop();
+      if (enrollThumbs.lastElementChild) {
+        enrollThumbs.lastElementChild.scrollIntoView({ block: "nearest" });
+      }
+      showToast(`Added ${files.length} photo${files.length === 1 ? "" : "s"} from clipboard.`, "ok");
+    } else {
+      handleFile(files[0]);
+      if (files.length > 1) showToast("Clipboard had several images — inspecting the first.");
+    }
+  });
+
   rescanBtn.addEventListener("click", async () => {
     rescanBtn.disabled = true;
     rescanBtn.textContent = "Rescanning…";
