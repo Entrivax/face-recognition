@@ -8,6 +8,8 @@
 #
 # To add someone new: drop people/<Name>/*.jpg into ./people and either
 # restart, hit POST /api/enroll, or use the "Rescan people folder" button.
+# Photos enrolled through the API/UI are saved back into ./people (as
+# <Name>/<sha1>.<ext>), so the mount below must stay writable.
 
 services:
   recogn:
@@ -21,8 +23,11 @@ services:
       RECOGN_THRESHOLD: "0.45"
       # RECOGN_ADDR: ":8080"        # listen address inside the container
     volumes:
-      # Your dataset, mounted read-only: ./people/<Person Name>/*.jpg
-      - ./people:/data/people:ro
+      # Your dataset: ./people/<Person Name>/*.jpg — mounted writable so
+      # API/UI enrollments can save uploaded photos into it. The container
+      # runs as uid 10001; make sure the host folder allows writes for that
+      # uid (e.g. `sudo chown -R 10001 ./people`).
+      - ./people:/data/people
       # Persist the generated face DB across rebuilds/restarts.
       - ./data:/data/db
     restart: unless-stopped

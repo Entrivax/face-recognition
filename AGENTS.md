@@ -127,8 +127,9 @@ export GOPATH=$PWD/.gopath GOMODCACHE=$PWD/.gomodcache GOCACHE=$PWD/.gocache \
 the CGO binary with `gcc` + ORT (rpath set to `/usr/lib/recogn`), (4) slim
 `debian:bookworm-slim` runtime with `libonnxruntime` in `/usr/lib/recogn` +
 `ldconfig`, `curl` for the healthcheck, non-root user, `EXPOSE 8080`, `VOLUME
-/data/db`. `docker-compose.yml` mounts `./people` read-only at `/data/people`,
-persists the DB via `./data` → `/data/db`, sets `RECOGN_THRESHOLD`, healthcheck
+/data/db`. `docker-compose.yml` mounts `./people` writable at `/data/people`
+(API enrollments save uploaded photos back into it), persists the DB via
+`./data` → `/data/db`, sets `RECOGN_THRESHOLD`, healthcheck
 via `curl /api/health`. `.dockerignore` excludes `people/`, `models/`, `data/`,
 `third_party/`, `python/`, caches.
 
@@ -141,7 +142,12 @@ command hits a permission error.
 
 - **Add a person**: drop `people/<Name>/*.jpg`, then `./recogn enroll` (or
   `POST /api/enroll`, or the UI's "Rescan people folder"). Or upload at runtime:
-  `POST /api/people/<name>/enroll`.
+  `POST /api/people/<name>/enroll` — successful uploads are also written to
+  `people/<Name>/<sha1-12><ext>` (content-derived name; the DB photo path is
+  the matching basename), so the dataset folder and DB stay in sync and a
+  rescan recognizes them as already enrolled. The Docker `people` mount must
+  therefore be writable (container uid 10001 needs write access on the host
+  folder).
 - **Tune strictness**: raise/lower `RECOGN_THRESHOLD` / `--threshold` /
   `POST /api/config`. Higher = fewer false positives, more `unknown`s.
 - **Run the server**: `make serve` (or `./recogn serve --addr :8080` with the
@@ -162,7 +168,9 @@ command hits a permission error.
   or nil-ed) — don't leak 512-float arrays to clients.
 - Enrollment stores **one embedding per photo** (largest face) and matches
   per-person by best similarity. Photos with no detectable face are skipped with
-  a warning, never stored.
+  a warning, never stored. DB photo paths are **basenames relative to the
+  person's folder** (folder scans and API uploads both derive the same name);
+  API uploads additionally persist the image bytes into `people/<Name>/`.
 - **onnxrt memory discipline**: every `OrtValue`/buffer allocated in the C shim
   is freed (tensor data via `ort_free`, sessions via `ort_close`). If you extend
   the shim, keep the ownership rules in `onnxrt.h` accurate and re-run the

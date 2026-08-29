@@ -58,7 +58,8 @@ On first start, if the face DB is empty, the container **auto-enrolls** from
 the mounted `./people` folder before serving. The generated database lives in a
 named volume (`recogn-db`) so it survives rebuilds and restarts.
 
-- **Dataset**: `./people` is mounted read-only at `/data/people`.
+- **Dataset**: `./people` is mounted writable at `/data/people` so photos
+  enrolled through the API/UI are saved back into it (as `<Name>/<sha1>.<ext>`).
 - **Threshold**: set `RECOGN_THRESHOLD` in `docker-compose.yml`.
 - **One-off CLI** (against the same image):
 
@@ -72,7 +73,7 @@ Without compose, plain Docker works too:
 
 ```sh
 docker build -t recogn .
-docker run -p 8080:8080 -v "$PWD/people:/data/people:ro" -v recogn-db:/data/db recogn
+docker run -p 8080:8080 -v "$PWD/people:/data/people" -v recogn-db:/data/db recogn
 ```
 
 ## Run from source
@@ -157,7 +158,7 @@ re-scan the `people/` folder.
 | `POST` | `/api/recognize` | multipart `image` → `{count, faces:[{bbox,name,person_id,confidence,score,landmarks}]}` |
 | `GET`  | `/api/people` | list enrolled people + photo counts |
 | `GET`  | `/api/people/{name}` | one person's enrolled photos |
-| `POST` | `/api/people/{name}/enroll` | add photo(s) (field `images`) for a new/existing person |
+| `POST` | `/api/people/{name}/enroll` | add photo(s) (field `images`) for a new/existing person; each enrolled image is also saved into `people/<name>/` |
 | `DELETE` | `/api/people/{name}` | remove a person |
 | `POST` | `/api/enroll?force=true` | re-scan the `people/` folder (incremental unless `force`) |
 | `GET`/`POST` | `/api/config` | read/set the match threshold |
@@ -176,7 +177,11 @@ someone new, either:
 
 1. **Drop a folder** `people/<Their Name>/` with a few photos and run
    `./recogn enroll` (or `POST /api/enroll`), **or**
-2. **Upload photos** at runtime: `POST /api/people/<name>/enroll`.
+2. **Upload photos** at runtime: `POST /api/people/<name>/enroll`. Each
+   successfully enrolled upload is written to `people/<name>/<sha1>.<ext>`
+   (content-derived name, so re-uploading the same photo is idempotent) and
+   its DB entry points at that file — a later `POST /api/enroll` rescan
+   recognizes it as already enrolled.
 
 Photos with no detectable face are skipped with a warning, never silently
 poisoning the database.

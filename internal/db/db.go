@@ -21,7 +21,7 @@ import (
 // Photo records one enrolled image and the embedding derived from it. Hash is
 // the content hash used to skip re-embedding unchanged files on re-enroll.
 type Photo struct {
-	Path      string    `json:"path"`      // path relative to the people dir
+	Path      string    `json:"path"`      // file name, relative to the person's folder under the people dir
 	Hash      string    `json:"hash"`      // sha1 of file bytes
 	Embedding []float32 `json:"embedding"` // 512-d ArcFace embedding
 }

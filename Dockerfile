@@ -10,8 +10,9 @@
 # Stage 4 is the slim runtime: debian-slim + libonnxruntime + binary + models.
 #
 # Build:  docker build -t recogn .
-# Run:    docker run -p 8080:8080 -v $PWD/people:/data/people:ro recogn
-# (see docker-compose.yml for the convenient form)
+# Run:    docker run -p 8080:8080 -v "$PWD/people:/data/people" recogn
+# (see docker-compose.yml for the convenient form; the people mount must be
+# writable so photos enrolled through the API/UI are saved back into it)
 # ---------------------------------------------------------------------------
 
 # ---- Stage 1: ONNX Runtime C library + headers ----------------------------
@@ -105,7 +106,7 @@ VOLUME ["/data/db"]
 # and a people/ dataset is mounted, the server auto-enrolls before serving.
 #
 # For one-off CLI commands, override the entrypoint args, e.g.:
-#   docker run --rm -v $PWD/people:/data/people:ro recogn enroll
-#   docker run --rm -v $PWD/people:/data/people:ro recogn recognize /data/people/Yana/img_0103.jpg
+#   docker run --rm -v $PWD/people:/data/people recogn enroll
+#   docker run --rm -v $PWD/people:/data/people recogn recognize /data/people/Yana/img_0103.jpg
 ENTRYPOINT ["/app/recogn"]
 CMD ["serve", "--addr", ":8080"]

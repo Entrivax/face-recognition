@@ -6,7 +6,9 @@
 package enroll
 
 import (
+	"bytes"
 	"fmt"
+	"image"
 	"os"
 	"path/filepath"
 	"sort"
@@ -44,10 +46,17 @@ type Options struct {
 	Progress  func(person, file string, idx, total int)
 }
 
+// FaceEngine is the subset of the recognition engine that enrollment needs.
+// *engine.Engine satisfies it; tests provide stubs.
+type FaceEngine interface {
+	Detect(imgBytes []byte) ([]engine.Face, error)
+	EmbedFace(imgBytes []byte, f engine.Face) ([]float32, error)
+}
+
 // Scan walks peopleDir, embeds each new/changed image, and stores results in
 // the database. The engine must already have its identity set loaded if you
 // want matching afterwards; this only writes the DB.
-func Scan(eng *engine.Engine, database *db.DB, opts Options) (Result, error) {
+func Scan(eng FaceEngine, database *db.DB, opts Options) (Result, error) {
 	var res Result
 	entries, err := os.ReadDir(opts.PeopleDir)
 	if err != nil {
@@ -98,13 +107,14 @@ func Scan(eng *engine.Engine, database *db.DB, opts Options) (Result, error) {
 
 // enrollOne processes a single image. It returns (added, skipReason, err).
 // added=false with empty reason means the file was unchanged (hash match).
-func enrollOne(eng *engine.Engine, database *db.DB, name, folder, file string, force bool) (bool, string, error) {
+// Note: DB photo paths are basenames relative to the person's folder, so
+// PhotoHash is keyed by the bare file name.
+func enrollOne(eng FaceEngine, database *db.DB, name, folder, file string, force bool) (bool, string, error) {
 	full := filepath.Join(folder, file)
 	b, err := os.ReadFile(full)
 	if err != nil {
 		return false, "", err
 	}
-	rel := filepath.Join(filepath.Base(folder), file)
 	h := db.HashBytes(b)
 	if !force && database.PhotoHash(name, file) == h {
 		return false, "", nil // unchanged
@@ -132,19 +142,25 @@ func enrollOne(eng *engine.Engine, database *db.DB, name, folder, file string, f
 	if err := database.AddPhotoHashed(name, file, h, emb); err != nil {
 		return false, "", err
 	}
-	_ = rel
 	return true, "", nil
 }
 
-// EnrollBytes embeds a single uploaded image for a person and stores it under
-// a synthetic path, used by the API's "add photos to a person" endpoint.
-func EnrollBytes(eng *engine.Engine, database *db.DB, name, fileName string, imgBytes []byte) (int, error) {
+// EnrollBytes embeds a single uploaded image for a person, stores the
+// embedding in the database, and writes the original image bytes into the
+// people folder under the person's name, so runtime enrollments become part
+// of the dataset (a later Scan treats them like any other photo).
+//
+// The file is saved as peopleDir/<Person>/<sha1[:12]><ext> — content-derived,
+// so re-uploading the same image is idempotent — and the DB photo path is the
+// same basename a folder rescan would derive for it, keeping rescans
+// duplicate-free.
+func EnrollBytes(eng FaceEngine, database *db.DB, peopleDir, name, fileName string, imgBytes []byte) (string, error) {
 	faces, err := eng.Detect(imgBytes)
 	if err != nil {
-		return 0, fmt.Errorf("detect: %w", err)
+		return "", fmt.Errorf("detect: %w", err)
 	}
 	if len(faces) == 0 {
-		return 0, fmt.Errorf("no face detected in %s", fileName)
+		return "", fmt.Errorf("no face detected in %s", fileName)
 	}
 	best := faces[0]
 	bestArea := area(best.BBox)
@@ -155,24 +171,88 @@ func EnrollBytes(eng *engine.Engine, database *db.DB, name, fileName string, img
 	}
 	emb, err := eng.EmbedFace(imgBytes, best)
 	if err != nil {
-		return 0, fmt.Errorf("embed: %w", err)
+		return "", fmt.Errorf("embed: %w", err)
 	}
-	// Store under an upload/ path with a content-derived name for idempotency.
-	rel := "upload/" + db.HashBytes(imgBytes)[:12] + extOr(fileName, ".jpg")
-	if err := database.AddPhotoHashed(name, rel, db.HashBytes(imgBytes), emb); err != nil {
-		return 0, err
+	name = strings.TrimSpace(name)
+	if err := CheckName(name); err != nil {
+		return "", err
 	}
-	return len(faces), nil
+	if peopleDir == "" {
+		return "", fmt.Errorf("people folder not configured; cannot save %s", fileName)
+	}
+	h := db.HashBytes(imgBytes)
+	ext := imageExt(imgBytes) // content-derived, so re-uploads are idempotent
+	// Use the DB-canonical person name so enrolling "alice" when "Alice"
+	// exists lands in the existing folder instead of a case-duplicate one.
+	folder := name
+	if p := database.Get(name); p != nil {
+		folder = p.Name
+	}
+	fileName = h[:12] + ext
+	full := filepath.Join(peopleDir, folder, fileName)
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		return "", fmt.Errorf("create people folder: %w", err)
+	}
+	if err := os.WriteFile(full, imgBytes, 0o644); err != nil {
+		return "", fmt.Errorf("write to people folder: %w", err)
+	}
+	if err := database.AddPhotoHashed(name, fileName, h, emb); err != nil {
+		// The image is already on disk; leave it. The next folder rescan will
+		// enroll it, so the dataset self-heals.
+		return "", err
+	}
+	return filepath.Join(folder, fileName), nil
+}
+
+// CheckName validates a person name that will also be used as a folder name
+// under the people directory. Spaces and unicode are fine (dataset folders
+// use them); path-like or control-character names are not.
+func CheckName(name string) error {
+	n := strings.TrimSpace(name)
+	if n == "" {
+		return fmt.Errorf("person name is empty")
+	}
+	if n == "." || n == ".." {
+		return fmt.Errorf("invalid person name %q", n)
+	}
+	if strings.ContainsAny(n, `/\`) || strings.ContainsRune(n, os.PathSeparator) {
+		return fmt.Errorf("invalid person name %q: path separators not allowed", n)
+	}
+	if strings.HasPrefix(n, ".") {
+		return fmt.Errorf("invalid person name %q: leading dot not allowed", n)
+	}
+	for _, r := range n {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("invalid person name %q: control characters not allowed", n)
+		}
+	}
+	return nil
 }
 
 func area(bb [4]float64) float64 { return bb[2] * bb[3] }
 
-func extOr(name, def string) string {
-	e := strings.ToLower(filepath.Ext(name))
-	if imageExts[e] {
-		return e
+// imageExt returns the file extension for imgBytes' actual format (decided by
+// sniffing the decoded header, not by the upload's original name, so the saved
+// name is a pure function of the content). Falls back to .jpg when the format
+// cannot be sniffed.
+func imageExt(imgBytes []byte) string {
+	if _, format, err := image.DecodeConfig(bytes.NewReader(imgBytes)); err == nil {
+		switch format {
+		case "jpeg":
+			return ".jpg"
+		case "png":
+			return ".png"
+		case "gif":
+			return ".gif"
+		case "bmp":
+			return ".bmp"
+		case "webp":
+			return ".webp"
+		case "tiff":
+			return ".tiff"
+		}
 	}
-	return def
+	return ".jpg"
 }
 
 // listImages returns image file names (not full paths) directly under dir.

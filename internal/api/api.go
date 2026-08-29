@@ -190,10 +190,17 @@ func (s *Server) handleDeletePerson(w http.ResponseWriter, r *http.Request, name
 }
 
 // handleEnrollPerson adds one or more uploaded photos to a (new or existing)
-// person. Accepts multipart files under "images" (or "image").
+// person. Accepts multipart files under "images" (or "image"). On success each
+// photo's embedding goes into the DB and the image file itself is written into
+// the person's folder under the people directory, so runtime uploads become
+// part of the dataset.
 func (s *Server) handleEnrollPerson(w http.ResponseWriter, r *http.Request, name string) {
 	if r.Method != http.MethodPost {
 		writeErr(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	if err := enroll.CheckName(name); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if err := r.ParseMultipartForm(maxUpload); err != nil {
@@ -233,15 +240,18 @@ func (s *Server) handleEnrollPerson(w http.ResponseWriter, r *http.Request, name
 	}
 	added := 0
 	var failures []string
+	saved := make([]string, 0, len(files))
 	for _, f := range files {
-		if _, err := enroll.EnrollBytes(s.engine(), s.db, name, f.name, f.data); err != nil {
+		rel, err := enroll.EnrollBytes(s.eng, s.db, s.cfg.PeopleDir, name, f.name, f.data)
+		if err != nil {
 			failures = append(failures, fmt.Sprintf("%s: %v", f.name, err))
 			continue
 		}
 		added++
+		saved = append(saved, rel)
 	}
 	s.reload()
-	resp := map[string]any{"person": name, "added": added, "total": len(files)}
+	resp := map[string]any{"person": name, "added": added, "total": len(files), "saved": saved}
 	if len(failures) > 0 {
 		resp["failures"] = failures
 	}
@@ -259,7 +269,7 @@ func (s *Server) handleEnrollFolder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	force := r.URL.Query().Get("force") == "true"
-	res, err := enroll.Scan(s.engine(), s.db, enroll.Options{
+	res, err := enroll.Scan(s.eng, s.db, enroll.Options{
 		PeopleDir: s.cfg.PeopleDir,
 		Force:     force,
 	})
@@ -298,15 +308,6 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeErr(w, http.StatusMethodNotAllowed, "unsupported method")
 	}
-}
-
-// engine returns the concrete engine for enroll, which needs detection/embedding
-// beyond the narrow Engine interface.
-func (s *Server) engine() *engine.Engine {
-	if e, ok := s.eng.(*engine.Engine); ok {
-		return e
-	}
-	return nil
 }
 
 // reload pushes DB identities into the engine after a mutation.
