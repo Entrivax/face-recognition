@@ -154,8 +154,9 @@ html, body {
   background: var(--accent); border-color: var(--accent); color: #0b0e12; font-weight: 600;
 }
 .btn-accent:hover { background: #6f9aff; border-color: #6f9aff; }
-.btn-file { display: inline-flex; align-items: center; cursor: pointer; }
-
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn:disabled:hover { border-color: var(--line); }
+.btn-accent:disabled:hover { background: var(--accent); border-color: var(--accent); }
 /* ---------- results ---------- */
 .results { margin-top: 20px; }
 .results-title {
@@ -192,15 +193,8 @@ html, body {
 .face-right { margin-left: auto; display: flex; flex-direction: column; align-items: flex-end; }
 
 /* ---------- people panel ---------- */
-.add-person { display: flex; gap: 8px; margin-top: 16px; }
-.add-person input[type="text"] {
-  flex: 1; min-width: 0;
-  background: var(--bg-raise); border: 1px solid var(--line);
-  border-radius: 8px; color: var(--ink);
-  padding: 9px 12px; font-family: var(--display); font-size: 13.5px;
-}
-.add-person input[type="text"]:focus { outline: none; border-color: var(--accent); }
-.add-hint { font-family: var(--mono); font-size: 11px; color: var(--ink-faint); margin: 8px 0 0; }
+.people-actions { margin-top: 16px; }
+.people-actions .btn { width: 100%; }
 
 .people-list { list-style: none; margin: 18px 0 0; padding: 0; display: grid; gap: 8px; max-height: 52vh; overflow: auto; }
 .person-row {
@@ -224,6 +218,139 @@ html, body {
 .person-del:hover { color: var(--danger); background: var(--unknown-dim); }
 .people-footer { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line-soft); }
 
+/* ---------- enroll modal ---------- */
+.modal {
+  position: fixed; inset: 0; z-index: 40;
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+}
+.modal[hidden] { display: none; }
+.modal-backdrop {
+  position: absolute; inset: 0;
+  background: rgba(4, 7, 10, 0.72);
+  backdrop-filter: blur(6px);
+}
+body.modal-open { overflow: hidden; }
+.modal-card {
+  position: relative;
+  width: min(560px, 100%);
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+  background: linear-gradient(180deg, var(--bg-panel), var(--bg-raise));
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.55);
+  animation: modal-in 0.18s ease;
+}
+@keyframes modal-in { from { opacity: 0; transform: translateY(10px) scale(0.985); } }
+.modal-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+  padding: 20px 22px 0;
+}
+.modal-eyebrow {
+  margin: 0 0 4px;
+  font-family: var(--mono); font-size: 10.5px;
+  text-transform: uppercase; letter-spacing: 1.6px;
+  color: var(--match);
+}
+.modal-head h2 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: 0.2px; }
+.modal-close {
+  background: none; border: none; cursor: pointer;
+  color: var(--ink-faint); font-size: 20px; line-height: 1;
+  padding: 4px 8px; border-radius: 6px; flex-shrink: 0;
+}
+.modal-close:hover { color: var(--ink); background: var(--bg-panel); }
+.modal-body { padding: 16px 22px 22px; }
+.field-label {
+  display: block; margin: 0 0 6px;
+  font-family: var(--mono); font-size: 11px; font-weight: 500;
+  text-transform: uppercase; letter-spacing: 1.4px;
+  color: var(--ink-faint);
+}
+#enrollName {
+  width: 100%;
+  background: var(--bg-raise); border: 1px solid var(--line);
+  border-radius: 8px; color: var(--ink);
+  padding: 10px 12px; font-family: var(--display); font-size: 13.5px;
+}
+#enrollName:focus { outline: none; border-color: var(--accent); }
+#enrollName:disabled { opacity: 0.6; }
+.field-hint { margin: 7px 0 0; font-family: var(--mono); font-size: 11px; color: var(--ink-faint); }
+.field-hint.warn { color: var(--unknown); }
+
+/* review dropzone — compact sibling of the main stage dropzone */
+.enroll-drop {
+  position: relative;
+  margin-top: 16px;
+  border: 1.5px dashed var(--line);
+  border-radius: 8px;
+  padding: 24px 16px;
+  text-align: center;
+  cursor: pointer;
+  outline: none;
+  transition: border-color 0.18s ease, background 0.18s ease;
+}
+.enroll-drop:hover, .enroll-drop:focus-visible { border-color: var(--accent); }
+.enroll-drop.drag { border-color: var(--match); background: var(--match-dim); }
+.enroll-drop.disabled { opacity: 0.55; pointer-events: none; }
+.edz-icon { width: 34px; height: 34px; color: var(--ink-faint); margin-bottom: 10px; }
+.enroll-drop.drag .edz-icon { color: var(--match); }
+.edz-primary { margin: 0 0 5px; font-size: 13.5px; color: var(--ink); }
+.edz-browse { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+.edz-hint { margin: 0; font-family: var(--mono); font-size: 10.5px; color: var(--ink-faint); }
+/* corner brackets while dragging — the same framing the detector draws */
+.enroll-drop::before, .enroll-drop::after {
+  content: ""; position: absolute; width: 16px; height: 16px;
+  border: 2px solid var(--match);
+  opacity: 0; transition: opacity 0.15s ease;
+  pointer-events: none;
+}
+.enroll-drop::before { top: 7px; left: 7px; border-right: 0; border-bottom: 0; border-top-left-radius: 6px; }
+.enroll-drop::after { bottom: 7px; right: 7px; border-left: 0; border-top: 0; border-bottom-right-radius: 6px; }
+.enroll-drop.drag::before, .enroll-drop.drag::after { opacity: 1; }
+
+/* selected-photo review grid */
+.enroll-thumbs {
+  list-style: none; margin: 14px 0 0; padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+  gap: 10px;
+}
+.enroll-thumbs[hidden] { display: none; }
+.enroll-thumb {
+  position: relative;
+  border: 1px solid var(--line); border-radius: 8px;
+  background: var(--bg-raise); overflow: hidden;
+  animation: thumb-in 0.16s ease;
+}
+@keyframes thumb-in { from { opacity: 0; transform: scale(0.94); } }
+.enroll-thumb img { display: block; width: 100%; aspect-ratio: 1 / 1; object-fit: cover; }
+.enroll-thumb-meta { padding: 6px 8px 7px; }
+.enroll-thumb-name {
+  font-family: var(--mono); font-size: 10px; color: var(--ink-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.enroll-thumb-size { font-family: var(--mono); font-size: 9.5px; color: var(--ink-faint); margin-top: 2px; }
+.enroll-thumb-del {
+  position: absolute; top: 6px; right: 6px;
+  width: 22px; height: 22px; border-radius: 6px;
+  border: none; cursor: pointer;
+  background: rgba(11, 14, 18, 0.78); color: var(--ink-dim);
+  font-size: 13px; line-height: 1;
+  display: grid; place-items: center;
+}
+.enroll-thumb-del:hover { color: var(--danger); background: rgba(242, 96, 122, 0.2); }
+.enroll-thumb.failed { border-color: var(--unknown); }
+.enroll-thumb-note { margin: 0; padding: 0 8px 7px; font-family: var(--mono); font-size: 9.5px; color: var(--unknown); }
+.enroll-thumb-note:empty { display: none; }
+.modal.locked .enroll-drop, .modal.locked .enroll-thumbs { opacity: 0.55; pointer-events: none; }
+.enroll-meta { margin: 12px 0 0; font-family: var(--mono); font-size: 11px; color: var(--ink-faint); }
+.modal-foot {
+  display: flex; justify-content: flex-end; gap: 10px;
+  margin-top: 20px; padding-top: 16px;
+  border-top: 1px solid var(--line-soft);
+}
+
 /* ---------- toast ---------- */
 .toast {
   position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(20px);
@@ -239,5 +366,5 @@ html, body {
 .toast.ok { border-color: var(--match); }
 
 @media (prefers-reduced-motion: reduce) {
-  * { transition: none !important; }
+  * { transition: none !important; animation: none !important; }
 }

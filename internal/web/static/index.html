@@ -69,14 +69,9 @@
       <p class="lede" id="peopleCount">Loading…</p>
     </div>
 
-    <form id="addPerson" class="add-person">
-      <input id="personName" type="text" placeholder="New person's name" autocomplete="off" required>
-      <label class="btn btn-accent btn-file">
-        Add photos
-        <input id="personPhotos" type="file" accept="image/*" multiple hidden>
-      </label>
-    </form>
-    <p class="add-hint" id="addHint">Pick a name, then choose one or more photos to enroll them.</p>
+    <div class="people-actions">
+      <button id="enrollBtn" class="btn btn-accent" aria-haspopup="dialog">Enroll new person</button>
+    </div>
 
     <ul id="peopleList" class="people-list"></ul>
 
@@ -87,6 +82,47 @@
     </div>
   </aside>
 </main>
+
+<!-- Enroll modal: pick a name, review the selected photos, then upload -->
+<div id="enrollModal" class="modal" hidden>
+  <div class="modal-backdrop" data-close></div>
+  <div class="modal-card" id="enrollCard" role="dialog" aria-modal="true" aria-labelledby="enrollTitle">
+    <header class="modal-head">
+      <div>
+        <p class="modal-eyebrow">enrollment</p>
+        <h2 id="enrollTitle">Enroll a new person</h2>
+      </div>
+      <button class="modal-close" type="button" data-close aria-label="Close">×</button>
+    </header>
+
+    <form id="enrollForm" class="modal-body" novalidate>
+      <label class="field-label" for="enrollName">Name</label>
+      <input id="enrollName" type="text" placeholder="Person's name" autocomplete="off" spellcheck="false">
+      <p class="field-hint" id="enrollNameHint">Shown as the identity when their face is recognized.</p>
+
+      <div id="enrollDrop" class="enroll-drop" tabindex="0" role="button"
+           aria-label="Add photos — drag and drop here, or press Enter to browse">
+        <svg viewBox="0 0 48 48" class="edz-icon" aria-hidden="true">
+          <path d="M15 8h-5a2 2 0 0 0-2 2v5M33 8h5a2 2 0 0 1 2 2v5M15 40h-5a2 2 0 0 1-2-2v-5M33 40h5a2 2 0 0 0 2-2v-5"
+                fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+          <circle cx="24" cy="21" r="5" fill="none" stroke="currentColor" stroke-width="2"/>
+          <path d="M15 36c2-4.5 5.4-6 9-6s7 1.6 9 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+        <p class="edz-primary">Drag &amp; drop photos here, or <span class="edz-browse">browse</span></p>
+        <p class="edz-hint">Nothing uploads until you review and confirm</p>
+        <input id="enrollPhotos" type="file" accept="image/*" multiple hidden>
+      </div>
+
+      <ul id="enrollThumbs" class="enroll-thumbs" hidden></ul>
+      <p class="enroll-meta" id="enrollMeta">No photos selected yet.</p>
+
+      <footer class="modal-foot">
+        <button type="button" class="btn btn-ghost" data-close>Cancel</button>
+        <button type="submit" id="enrollSubmit" class="btn btn-accent" disabled>Enroll photos</button>
+      </footer>
+    </form>
+  </div>
+</div>
 
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
