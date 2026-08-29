@@ -13,6 +13,12 @@ recogn
 # Downloaded models are fetched fresh inside the image build.
 models/
 
+# The ONNX Runtime C library is fetched fresh inside the image build (stage 1).
+third_party/
+
+# The Python sidecar was removed; nothing under python/ is needed.
+python/
+
 # The generated DB is runtime state, not source. Mounted as a volume.
 data/
 

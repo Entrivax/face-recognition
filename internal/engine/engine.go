@@ -56,29 +56,47 @@ var arcfaceTemplate = [5][2]float32{
 	{70.7299, 92.2041},
 }
 
+// inferencer abstracts how faces are detected and embedded. The production
+// implementation is the in-process CGO backend (onnxrt); the interface exists
+// so the engine can be exercised with a stub in tests.
+type inferencer interface {
+	// detect finds all faces in a raw image (jpeg/png/webp/bmp/gif bytes).
+	detect(imgBytes []byte) ([]Face, error)
+	// embedImage computes the 512-d embedding of an aligned 112x112 face.
+	embedImage(aligned *image.NRGBA) ([]float32, error)
+	// ping warms up the backend and verifies the models load.
+	ping() error
+	// close releases backend resources.
+	close()
+}
+
 // Engine runs detection→alignment→embedding→matching. It is safe for
-// concurrent use; the underlying sidecar serialises inference.
+// concurrent use; the underlying inferencer serialises inference.
 type Engine struct {
-	sc      *sidecar
-	known   []KnownPerson
-	thresh  float64
+	inf    inferencer
+	known  []KnownPerson
+	thresh float64
 }
 
-// New creates an Engine. detModel/embModel are paths to the ONNX models and
-// are handed to the sidecar via environment. thresh is the match threshold.
-func New(pythonBin, script, detModel, embModel string, thresh float64) *Engine {
-	env := append(os.Environ(),
-		"RECOGN_DET_MODEL="+detModel,
-		"RECOGN_EMB_MODEL="+embModel,
-	)
-	return &Engine{
-		sc:     newSidecar(pythonBin, script, env),
-		thresh: thresh,
+// New creates an Engine backed by the in-process CGO/ONNX-Runtime inferencer.
+// detModel/embModel are paths to the ONNX models; thresh is the match
+// threshold. It returns an error if the models cannot be loaded.
+func New(detModel, embModel string, thresh float64) (*Engine, error) {
+	inf, err := NewCGOInferencer(detModel, embModel)
+	if err != nil {
+		return nil, err
 	}
+	return &Engine{inf: inf, thresh: thresh}, nil
 }
 
-// Close shuts the engine (and its sidecar) down.
-func (e *Engine) Close() { e.sc.Close() }
+// NewWithInferencer creates an Engine with an explicit inference backend
+// (used by tests).
+func NewWithInferencer(inf inferencer, thresh float64) *Engine {
+	return &Engine{inf: inf, thresh: thresh}
+}
+
+// Close shuts the engine (and its inference backend) down.
+func (e *Engine) Close() { e.inf.close() }
 
 // SetThreshold updates the match threshold.
 func (e *Engine) SetThreshold(t float64) { e.thresh = t }
@@ -92,22 +110,22 @@ func (e *Engine) SetKnown(people []KnownPerson) { e.known = people }
 // Known returns the current identity set.
 func (e *Engine) Known() []KnownPerson { return e.known }
 
-// Ping warms up the sidecar and verifies models load.
-func (e *Engine) Ping() error { return e.sc.ping() }
+// Ping warms up the inference backend and verifies models load.
+func (e *Engine) Ping() error { return e.inf.ping() }
 
 // Detect finds all faces in an image (raw bytes of a jpeg/png/webp/bmp/gif).
 func (e *Engine) Detect(imgBytes []byte) ([]Face, error) {
-	return e.sc.detect(imgBytes)
+	return e.inf.detect(imgBytes)
 }
 
 // EmbedFace aligns a detected face and computes its embedding. imgBytes is the
 // original full image; the face's landmarks drive the alignment crop.
 func (e *Engine) EmbedFace(imgBytes []byte, f Face) ([]float32, error) {
-	aligned, err := alignFace(imgBytes, f)
+	aligned, err := alignFaceImage(imgBytes, f)
 	if err != nil {
 		return nil, fmt.Errorf("align: %w", err)
 	}
-	return e.sc.embed(aligned)
+	return e.inf.embedImage(aligned)
 }
 
 // MatchEmbedding returns the best identity for an embedding plus whether it
@@ -129,7 +147,7 @@ func (e *Engine) MatchEmbedding(emb []float32) (Match, bool) {
 // Recognize runs the full pipeline on one image: detect every face, embed and
 // match each, and annotate the returned faces with identities.
 func (e *Engine) Recognize(imgBytes []byte) ([]Face, error) {
-	faces, err := e.sc.detect(imgBytes)
+	faces, err := e.inf.detect(imgBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -172,16 +190,16 @@ func Cosine(a, b []float32) float64 {
 	return dot / (math.Sqrt(na) * math.Sqrt(nb))
 }
 
-// alignFace warps the face described by f's 5-point landmarks into a 112x112
-// crop matching the ArcFace reference template, returning JPEG bytes.
-func alignFace(imgBytes []byte, f Face) ([]byte, error) {
+// alignFaceImage warps the face described by f's 5-point landmarks into a
+// 112x112 crop matching the ArcFace reference template, returning the image.
+func alignFaceImage(imgBytes []byte, f Face) (*image.NRGBA, error) {
 	src, _, err := image.Decode(bytes.NewReader(imgBytes))
 	if err != nil {
 		return nil, fmt.Errorf("decode source image: %w", err)
 	}
 	if len(f.Landmarks) < 5 {
 		// Fall back to a plain bbox crop when landmarks are unavailable.
-		return cropBBox(src, f.BBox)
+		return cropBBoxImage(src, f.BBox)
 	}
 
 	// Estimate the similarity transform mapping the detected landmarks onto
@@ -191,8 +209,16 @@ func alignFace(imgBytes []byte, f Face) ([]byte, error) {
 	// Backward-warp: build the aligned image by sampling the source through
 	// the inverse (dst->src) of the forward landmark transform.
 	inv := invertAffine(M)
-	dst := affineWarp(src, inv, 112, 112)
+	return affineWarp(src, inv, 112, 112), nil
+}
 
+// alignFace is alignFaceImage but returns JPEG bytes (used by the sidecar
+// backend, which needs to ship the crop to a separate process).
+func alignFace(imgBytes []byte, f Face) ([]byte, error) {
+	dst, err := alignFaceImage(imgBytes, f)
+	if err != nil {
+		return nil, err
+	}
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 92}); err != nil {
 		return nil, err
@@ -200,9 +226,9 @@ func alignFace(imgBytes []byte, f Face) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// cropBBox extracts a padded bounding-box crop (fallback when landmarks are
-// missing) and resizes to 112x112.
-func cropBBox(src image.Image, bb [4]float64) ([]byte, error) {
+// cropBBoxImage extracts a padded bounding-box crop (fallback when landmarks
+// are missing) and resizes to 112x112, returning the image.
+func cropBBoxImage(src image.Image, bb [4]float64) (*image.NRGBA, error) {
 	b := src.Bounds()
 	x, y := int(bb[0]), int(bb[1])
 	w, h := int(bb[2]), int(bb[3])
@@ -216,7 +242,15 @@ func cropBBox(src image.Image, bb [4]float64) ([]byte, error) {
 		return nil, fmt.Errorf("empty crop")
 	}
 	cropped := cropImage(src, image.Rect(x0, y0, x1, y1))
-	resized := resizeBilinear(cropped, 112, 112)
+	return resizeBilinear(cropped, 112, 112), nil
+}
+
+// cropBBox is cropBBoxImage but returns JPEG bytes.
+func cropBBox(src image.Image, bb [4]float64) ([]byte, error) {
+	resized, err := cropBBoxImage(src, bb)
+	if err != nil {
+		return nil, err
+	}
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, resized, &jpeg.Options{Quality: 92}); err != nil {
 		return nil, err

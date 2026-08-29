@@ -7,21 +7,48 @@ export GOMODCACHE := $(CURDIR)/.gomodcache
 export GOCACHE    := $(CURDIR)/.gocache
 export GOFLAGS    := -mod=mod
 export GOPROXY    := off
+export CGO_ENABLED := 1
 
-BINARY := recogn
+BINARY  := recogn
+ORT_DIR := third_party/onnxruntime
+ORT_VER := 1.23.2
+ORT_TGZ := onnxruntime-linux-x64-$(ORT_VER).tgz
+ORT_URL := https://github.com/microsoft/onnxruntime/releases/download/v$(ORT_VER)/$(ORT_TGZ)
 
-.PHONY: all build test vet enroll serve clean models
+# CGO include/lib paths for the ONNX Runtime C API.
+export CGO_CFLAGS  := -I$(CURDIR)/$(ORT_DIR)/include
+export CGO_LDFLAGS := -L$(CURDIR)/$(ORT_DIR)/lib -lonnxruntime -Wl,-rpath,$(CURDIR)/$(ORT_DIR)/lib
+
+.PHONY: all build test vet enroll serve clean models ort dataset-test
 
 all: build
 
-build:
+# The CGO backend needs the ONNX Runtime C library present first.
+build: ort
 	go build -o $(BINARY) .
 
-test:
+test: ort
 	go test ./...
 
 vet:
 	go vet ./...
+
+# Fetch the ONNX Runtime C library + headers (for the CGO backend).
+ort:
+	@if [ ! -f $(ORT_DIR)/lib/libonnxruntime.so ]; then \
+	  echo "Downloading ONNX Runtime C $(ORT_VER)..."; \
+	  mkdir -p $(ORT_DIR) tmp; \
+	  curl -fSL -o tmp/$(ORT_TGZ) $(ORT_URL); \
+	  tar xzf tmp/$(ORT_TGZ) -C tmp; \
+	  mv tmp/onnxruntime-linux-x64-$(ORT_VER)/include $(ORT_DIR)/include; \
+	  mv tmp/onnxruntime-linux-x64-$(ORT_VER)/lib $(ORT_DIR)/lib; \
+	  rm -rf tmp; \
+	  echo "ORT C ready in $(ORT_DIR)"; \
+	fi
+
+# Dataset regression gate: CGO pipeline correctness over people/.
+dataset-test: ort
+	./scripts/dataset-test.sh
 
 # Build, then enroll the people/ dataset into data/embeddings.json.
 enroll: build

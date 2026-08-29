@@ -1,6 +1,0 @@
-# Python dependencies for the inference sidecar (python/infer.py).
-# Pinned for reproducible image builds. CPU-only onnxruntime is used on
-# purpose; swap in onnxruntime-gpu if you add a GPU base image.
-onnxruntime==1.23.2
-opencv-python-headless==4.13.0.92
-numpy==2.2.6

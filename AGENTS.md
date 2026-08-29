@@ -6,84 +6,79 @@ works, and the gotchas that will otherwise waste your time.
 ## What this is
 
 `recogn` is a **face-recognition application** — CLI + REST API + minimal web UI,
-written in **Go**. It maintains a database of known people (from a `people/`
-photo folder) and, given any photo, **detects every face** in it and identifies
-each one (name + confidence, or `unknown`). It runs entirely on CPU.
+written in **Go** with **CGO**. It maintains a database of known people (from a
+`people/` photo folder) and, given any photo, **detects every face** in it and
+identifies each one (name + confidence, or `unknown`). It runs on CPU.
 
-Current state: **complete and working.** Enrolled 11 people / 38 photos, all
-tests pass, Docker image builds and runs.
+Current state: **complete and working.** Inference runs **in-process via CGO +
+the ONNX Runtime C API** (no Python, no subprocess). Enrolled 11 people / 38
+photos, all tests pass, Docker image builds and runs (~508 MB).
 
 ## Architecture (important — don't reinvent this)
 
-Pure-Go face recognition is impractical, so the design is a **Go core + a Python
-ONNX inference sidecar**. This split is deliberate; keep it.
+Go owns the **entire** pipeline. The only thing delegated to native code is
+executing the two ONNX models, done in-process through `libonnxruntime` via a
+small CGO wrapper. **There is no Python and no sidecar** (both were removed after
+the CGO backend proved output-parity).
 
-- **Go** owns everything user-facing and stateful: CLI, HTTP API, web UI, the
-  face database, enrollment orchestration, face alignment, and matching.
-- **Python** (`python/infer.py`) does only tensor inference and speaks **NDJSON
-  over stdin/stdout**. Go spawns it once as a persistent process and
-  mutex-serializes requests (CPU inference is single-stream). On a transport
-  error Go kills and restarts it transparently.
+- **Go**: CLI, HTTP API, web UI, the JSON face DB, enrollment orchestration,
+  face alignment (Umeyama), matching (cosine), AND the detector's
+  pre/post-processing (letterbox, CHW tensor build, SCRFD decode, NMS).
+- **CGO** (`internal/onnxrt`): a thin shim over the ORT C API — open a session,
+  run one float tensor, read output tensors. All `OrtApi` calls live in
+  `onnxrt.c`; the Go side sees plain `[]float32`.
 
 Models (insightface `buffalo_l` pack, downloaded into `models/`):
 - **SCRFD** `det_10g.onnx` — multi-face detection, returns bbox + 5 landmarks.
+  Raw output is 9 tensors (3 FPN strides × scores/bboxes/landmarks); decoded in
+  `internal/engine/scrfd.go`.
 - **ArcFace** `w600k_r50.onnx` — aligned 112×112 face → 512-d L2-normalized embedding.
 
 Matching: **cosine similarity** of a query embedding vs. every enrolled embedding,
 best score per person wins; `>= threshold` (default **0.45**) → identity, else
-`unknown`. Alignment is a **Umeyama similarity transform** (in Go) mapping the 5
-landmarks onto the ArcFace 112×112 reference template.
+`unknown`. Alignment is a **Umeyama similarity transform** mapping the 5
+landmarks onto the ArcFace 112×112 reference template (`engine.go`).
 
 ## Layout
 
 ```
 main.go                  CLI entry: enroll | recognize | people | serve
 internal/
-  config/config.go       paths, threshold; all settings via RECOGN_* env vars
-  engine/engine.go       Face/KnownPerson types, pipeline, Umeyama align, cosine
-  engine/sidecar.go      spawn/manage python sidecar, NDJSON protocol, restart
+  config/config.go       paths, threshold; settings via RECOGN_* env vars
+  onnxrt/onnxrt.{c,h,go} CGO binding to the ONNX Runtime C API
+  engine/engine.go       Face/KnownPerson, pipeline, Umeyama align, cosine
+  engine/preprocess.go   image → CHW float tensor (letterbox + normalise)
+  engine/scrfd.go        SCRFD output decode + NMS (pure Go)
+  engine/cgo_backend.go  inferencer impl using onnxrt (mutex-serialised)
   db/db.go               JSON face DB (data/embeddings.json), CRUD, atomic saves
   enroll/enroll.go       scan people/ → embeddings (incremental by content hash)
   api/api.go             REST handlers; depends on an Engine INTERFACE (testable)
   web/web.go + static/   embedded single-page UI (go:embed, no build step)
-python/infer.py          ONNX sidecar (SCRFD + ArcFace), NDJSON loop
-python/requirements.txt  pinned: onnxruntime, opencv-python-headless, numpy
+third_party/onnxruntime/ ORT C header + libonnxruntime.so (via `make ort`)
 models/                  det_10g.onnx, w600k_r50.onnx  (gitignored; downloaded)
 people/<Name>/*.jpg      the dataset — 11 people, 38 photos
 data/embeddings.json     generated face DB (gitignored)
 Dockerfile, docker-compose.yml, .dockerignore
-Makefile, README.md
+Makefile, README.md, scripts/dataset-test.sh
 ```
 
-## Sidecar protocol (if you touch engine/sidecar.go or python/infer.py)
+## The inference seam (if you touch internal/engine or internal/onnxrt)
 
-One JSON object per line, both directions. `"id"` is echoed back.
+`engine.Engine` talks to an unexported `inferencer` interface
+(`detect` / `embedImage` / `ping` / `close`). The production impl is
+`cgoInferencer`. `engine.New(detModel, embModel, thresh)` builds it;
+`engine.NewWithInferencer` is for tests. Keep inference behind this seam.
 
-- `{"id":N,"cmd":"ping"}` → `{"id":N,"status":"ok"}`
-- `{"id":N,"cmd":"detect","image":"<b64>"}` →
-  `{"id":N,"faces":[{"bbox":[x,y,w,h],"score":f,"landmarks":[[x,y]×5]}]}`
-- `{"id":N,"cmd":"embed","image":"<b64 112×112 aligned>"}` → `{"id":N,"embedding":[512 floats]}`
-- Error → `{"id":N,"error":"..."}`
-
-The sidecar reads model paths from env `RECOGN_DET_MODEL` / `RECOGN_EMB_MODEL`
-(absolute paths set by `engine.New`). **stdout is protocol-only** — diagnostics
-go to stderr (Go prefixes them `[sidecar]`). Never print to stdout from Python.
-
-## REST API
-
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| POST | `/api/recognize` | multipart `image` → `{count, faces:[{bbox,name,person_id,confidence,score,landmarks}]}` |
-| GET | `/api/people` | list people + photo counts |
-| GET/DELETE | `/api/people/{name}` | get photos / remove person |
-| POST | `/api/people/{name}/enroll` | add photo(s) (field `images`) to new/existing person |
-| POST | `/api/enroll?force=true` | rescan `people/` (incremental unless force) |
-| GET/POST | `/api/config` | read/set match threshold |
-| GET | `/api/health` | status, people count, threshold |
-| GET | `/` | web UI (+ `/app.js`, `/style.css`) |
-
-`api.Server` takes the engine via the `api.Engine` **interface**, so handler
-tests use a stub — see `internal/api/api_test.go`. Keep it that way.
+**Preprocessing must match the models exactly** (these were validated
+bit-for-bit against the reference Python/insightface pipeline):
+- **Detector**: letterbox to 640×640 (aspect preserved, top-left, zero pad),
+  then per-pixel `(v - 127.5) * (1/128)`, RGB, CHW. Coordinates scale back by
+  `1/detScale` where `detScale = newHeight/origHeight`.
+- **Embedder**: the aligned 112×112 image → `(v - 127.5) * (1/127.5)`, RGB, CHW.
+- Go decodes to RGB; the models expect RGB, so **no channel swap** is needed.
+- **SCRFD decode**: bbox and landmark predictions must be **multiplied by the
+  stride** {8,16,32} before `distance2bbox`/`distance2kps` (a past bug was
+  omitting this, yielding tiny boxes). Then NMS (IoU 0.4), threshold 0.5.
 
 ## ⚠️ Build/test gotchas (read before running go)
 
@@ -92,39 +87,50 @@ and they're not writable. All go commands must redirect caches into the workspac
 
 ```sh
 export GOPATH=$PWD/.gopath GOMODCACHE=$PWD/.gomodcache GOCACHE=$PWD/.gocache \
-       GOFLAGS=-mod=mod GOPROXY=off
+       GOFLAGS=-mod=mod GOPROXY=off CGO_ENABLED=1
 ```
 
-The **`Makefile` already sets these** — prefer `make build` / `make test` /
-`make vet` / `make serve`. `GOPROXY=off` works because the single dependency
-(`golang.org/x/image v0.45.0`) is vendored in the local module cache; if you add
-a new dependency you'll need network (`GOPROXY=https://proxy.golang.org,direct`)
-plus `GOPATH` pointed in-workspace so the checksum db is writable.
+**Prefer the `Makefile`** — it sets all of these plus the CGO include/lib flags:
+`make build` / `make test` / `make vet` / `make serve` / `make ort` / `make dataset-test`.
 
+- **CGO is required** (`CGO_ENABLED=1`) and needs `gcc`. The ORT C lib+header
+  must exist in `third_party/onnxruntime` — `make ort` fetches them (needs
+  network once). The Go `#cgo` directive bakes an rpath of
+  `$ORIGIN/third_party/onnxruntime/lib`, so the binary runs in place; keep
+  `third_party/` next to the binary.
+- `GOPROXY=off` works because the single Go module dep (`golang.org/x/image`)
+  is vendored in the local module cache; adding a new Go dep needs network
+  (`GOPROXY=https://proxy.golang.org,direct`) + in-workspace `GOPATH` so the
+  checksum db is writable.
 - Flags are **per-subcommand** (`flag.NewFlagSet`) and Go stops flag parsing at
   the first positional arg: `./recogn recognize --json img.jpg` ✓, `... img.jpg --json` ✗.
-- Not a git repo yet — no VCS history. `git init` if you want it.
+- Not a git repo yet — `git init` if you want history.
 
 ## Verified baseline (don't regress these)
 
-- `go vet ./...` clean; `go test ./...` all pass (engine, db, api).
-- Held-out accuracy on this dataset: **11/11 = 100%** (right-person scores
-  0.47–0.80, wrong-person <0.20 → 0.45 threshold has good margin).
+- `go vet ./...` clean; `go test ./...` all pass (engine, db, api, onnxrt).
+- Held-out accuracy (CGO, own enrollment + recognition): **11/11 = 100%**
+  (held-out scores 0.47–0.81, wrong-person <0.20 → 0.45 threshold has margin).
+- CGO↔Python parity (measured before the sidecar was removed): detection bbox
+  IoU ≥ 0.995, score |Δ| ≤ 0.009 across all 38 photos; ORT numerics are
+  bit-identical between CGO and Python for the same input tensor. (Embeddings
+  differ ~0.98–0.995 cosine only because the old sidecar lossy-JPEG-encoded the
+  aligned crop; the CGO path tensorizes directly and is *more* faithful.)
 - Multi-face: a two-person composite returns both identities with separate boxes.
 - No-face photo → `{count:0, faces:[]}` (HTTP 200), not an error.
-- Docker: `docker compose up --build` auto-enrolls on first run, serves UI+API,
-  healthcheck goes `healthy`, DB persists in the `recogn-db` volume across restarts.
-  Image is ~1.11 GB.
+- Docker: `docker compose up --build` serves UI+API, healthcheck `healthy`,
+  DB persists in the mounted `./data` → `/data/db`. Image ~508 MB.
 
 ## Docker
 
-`Dockerfile` is multi-stage (golang build → model download → python slim
-runtime), CGO off, non-root user, models baked in, `EXPOSE 8080`, `VOLUME
-/data/db`, `ENTRYPOINT ["recogn"]`, `CMD ["serve"]`. `docker-compose.yml` mounts
-`./people` read-only at `/data/people`, persists the DB in mounted path `./data` at `/data/db`,
-sets `RECOGN_THRESHOLD`, and adds a `/api/health` healthcheck (40s start_period
-for first-run enrollment). `.dockerignore` excludes `people/`, `models/`,
-`data/`, caches.
+`Dockerfile` is multi-stage: (1) fetch ORT C lib, (2) fetch models, (3) build
+the CGO binary with `gcc` + ORT (rpath set to `/usr/lib/recogn`), (4) slim
+`debian:bookworm-slim` runtime with `libonnxruntime` in `/usr/lib/recogn` +
+`ldconfig`, `curl` for the healthcheck, non-root user, `EXPOSE 8080`, `VOLUME
+/data/db`. `docker-compose.yml` mounts `./people` read-only at `/data/people`,
+persists the DB via `./data` → `/data/db`, sets `RECOGN_THRESHOLD`, healthcheck
+via `curl /api/health`. `.dockerignore` excludes `people/`, `models/`, `data/`,
+`third_party/`, `python/`, caches.
 
 **Docker CLI commands need elevated sandbox permissions** (the daemon socket and
 `~/.docker/buildx` state live outside the workspace) — retry with
@@ -140,27 +146,37 @@ command hits a permission error.
   `POST /api/config`. Higher = fewer false positives, more `unknown`s.
 - **Run the server**: `make serve` (or `./recogn serve --addr :8080` with the
   env exports above). Auto-enrolls if the DB is empty and `people/` exists.
+- **Re-verify the dataset pipeline**: `RECOGN_DATASET=1 go test ./internal/engine/
+  -run TestCGODatasetPipeline` (checks every enrolled photo detects a face and
+  that intra-person embeddings cluster tighter than inter-person).
 
 ## Conventions to keep
 
-- **Zero new Go dependencies** unless truly necessary — the module is stdlib +
-  `x/image` only. Image crop/resize/warp are hand-rolled in `engine.go`; reuse
-  them.
-- The engine is safe for concurrent use; the sidecar is the serialization point.
+- **Minimal Go deps** — stdlib + `x/image` only. Image crop/resize/warp are
+  hand-rolled in `engine.go`; reuse them.
+- The engine is safe for concurrent use; a **single mutex** serialises CGO
+  inference (matches ORT CPU single-stream semantics). Don't run sessions
+  concurrently without checking ORT thread-safety.
 - DB writes are atomic (temp file + rename) and mutex-guarded — preserve this.
 - Embeddings are stripped from API/CLI JSON output (`Face.Embedding` is `json:"-"`
   or nil-ed) — don't leak 512-float arrays to clients.
 - Enrollment stores **one embedding per photo** (largest face) and matches
   per-person by best similarity. Photos with no detectable face are skipped with
   a warning, never stored.
+- **onnxrt memory discipline**: every `OrtValue`/buffer allocated in the C shim
+  is freed (tensor data via `ort_free`, sessions via `ort_close`). If you extend
+  the shim, keep the ownership rules in `onnxrt.h` accurate and re-run the
+  repeated-run test (`internal/onnxrt/onnxrt_test.go`) to catch leaks.
 
 ## Known limitations / possible next tasks
 
-- **CPU-only** inference (~0.2–0.6 s/photo). GPU would mean swapping
-  `onnxruntime` → `onnxruntime-gpu` and a CUDA base image.
-- Sidecar is a single serialized stream — high-throughput batch work would need
-  a pool of sidecars or batching in `infer.py`.
+- **CPU-only** inference (~0.2–0.6 s/photo). GPU = use the ORT GPU build of
+  `libonnxruntime` + enable a CUDA execution provider in the C shim + a CUDA
+  base image.
+- Single serialized inference stream — high-throughput batch work would need a
+  session pool or batched tensors.
+- CGO means no static/cross-compiled binary; the binary links glibc +
+  libonnxruntime. Builds are for the host (linux/amd64) unless you set up a
+  cross C toolchain.
 - No auth/TLS on the API — it's a local tool; add middleware if you expose it.
-- No screenshot-based UI test was done (no headless browser in this env).
-- Alignment is redone per request; a face-embedding cache by content hash could
-  speed repeat queries.
+- No screenshot-based UI test (no headless browser in this env).

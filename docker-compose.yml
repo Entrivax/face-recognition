@@ -26,9 +26,9 @@ services:
       # Persist the generated face DB across rebuilds/restarts.
       - ./data:/data/db
     restart: unless-stopped
-    # Liveness: the app exposes /api/health.
+    # Liveness: the app exposes /api/health. (curl is in the runtime image.)
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:8080/api/health',timeout=5).status==200 else 1)"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/health"]
       interval: 30s
       timeout: 10s
       retries: 3

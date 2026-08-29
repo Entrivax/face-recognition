@@ -13,11 +13,13 @@ detects **every face** in the image and tells you who each one is (or
 - **Recognition** — [ArcFace](https://github.com/deepinsight/insightface) (`w600k_r50`) turns the crop into a 512-d embedding; a face is identified by **cosine similarity** against every enrolled embedding, matched per-person by best score.
 - A match above the **threshold** (default `0.45`, tunable) names the person; below it the face is reported as `unknown`.
 
-Go owns the CLI, HTTP API, web UI and the face database. The tensor inference
-runs in a small **Python ONNX sidecar** (`python/infer.py`, using
-`onnxruntime` + OpenCV) that Go spawns and talks to over stdio. This keeps the
-Go binary dependency-light while using best-in-class models, and runs entirely
-on CPU.
+Go owns the whole pipeline: CLI, HTTP API, web UI, face database, face
+alignment (Umeyama), matching (cosine similarity), and the detection
+pre/post-processing. The only thing delegated to native code is running the two
+ONNX models, which happens **in-process via CGO + the [ONNX Runtime C
+API](https://onnxruntime.ai)** (`libonnxruntime`). There is no Python and no
+separate inference process — the binary is self-contained apart from the ORT
+shared library. Everything runs on CPU.
 
 ## Layout
 
@@ -26,12 +28,16 @@ recogn                 the single binary (built)
 main.go                CLI entry: enroll | recognize | people | serve
 internal/
   config/              paths, threshold, env/flags
-  engine/              detect→align→embed→match pipeline + sidecar client
+  onnxrt/              minimal CGO binding to the ONNX Runtime C API
+  engine/              detect→align→embed→match pipeline
+    preprocess.go        image → CHW float tensor (SCRFD + ArcFace)
+    scrfd.go             SCRFD output decode + NMS
+    cgo_backend.go       in-process inference backend (onnxrt)
   db/                  JSON face database (data/embeddings.json)
   enroll/              people/ folder scanning + embedding
   api/                 REST API handlers
   web/                 embedded web UI (static/)
-python/infer.py        ONNX inference sidecar (SCRFD + ArcFace)
+third_party/onnxruntime/  ORT C header + libonnxruntime (via `make ort`)
 models/                det_10g.onnx, w600k_r50.onnx  (downloaded)
 people/                <Person Name>/*.jpg ...       (your dataset)
 data/embeddings.json   generated face DB
@@ -39,8 +45,8 @@ data/embeddings.json   generated face DB
 
 ## Run with Docker (easiest)
 
-The image is all-in-one: Go binary + Python ONNX sidecar + baked-in models.
-You only need Docker.
+The image is all-in-one: the CGO-enabled Go binary, the ONNX Runtime library,
+and the models — no Python. You only need Docker.
 
 ```sh
 docker compose up --build      # build and start
@@ -73,15 +79,21 @@ docker run -p 8080:8080 -v "$PWD/people:/data/people:ro" -v recogn-db:/data/db r
 ### Prerequisites
 
 - Go 1.22+
-- Python 3 with `onnxruntime`, `opencv-python` (`cv2`) and `numpy` (see `python/requirements.txt`)
+- A C toolchain (`gcc`) — inference uses CGO
+- The ONNX Runtime C library + header (fetched into `third_party/onnxruntime` by `make ort`)
 - The two ONNX models in `./models` (see below)
 
 ### Setup
 
 ```sh
 make models     # download SCRFD + ArcFace into ./models (~289 MB, once)
-make build      # build ./recogn
+make build      # fetch the ORT C library (make ort) and build ./recogn with CGO
 ```
+
+`make build` depends on `make ort`, which downloads `libonnxruntime` +
+`onnxruntime_c_api.h` into `third_party/onnxruntime`. The binary is linked with
+an `$ORIGIN`-relative rpath, so it runs in place as long as `third_party/`
+stays next to it.
 
 ## Use
 
@@ -92,8 +104,8 @@ make build      # build ./recogn
 ./recogn enroll
 
 # Identify every face in one or more photos
-./recognize photo.jpg group.jpg
-./recogn recognize photo.jpg --json
+# (flags go before the image paths)
+./recogn recognize --json photo.jpg group.jpg
 
 # List enrolled identities
 ./recogn people
@@ -149,7 +161,7 @@ poisoning the database.
   score <0.20, so `0.45` has comfortable margin.
 - **Multiple photos per person** improve robustness — enrollment keeps every
   photo's embedding and matches against the best.
-- **Concurrency** — inference is serialized through one sidecar process
-  (CPU inference is single-stream); the HTTP layer itself is concurrent and
-  the DB saves are atomic.
-- **No GPU required** — everything runs on CPU via onnxruntime.
+- **Concurrency** — inference is serialized through a single mutex around the
+  ORT sessions (CPU inference is single-stream); the HTTP layer itself is
+  concurrent and the DB saves are atomic.
+- **No GPU required** — everything runs on CPU via the ONNX Runtime C library.

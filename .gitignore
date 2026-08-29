@@ -7,6 +7,9 @@ recogn
 # Downloaded ONNX models (large; fetched via `make models`)
 models
 
+# ONNX Runtime C library + headers (fetched via `make ort`)
+third_party
+
 # Generated face database (rebuilt via `recogn enroll`)
 data
 

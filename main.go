@@ -108,12 +108,15 @@ To add someone new, drop a folder with their photos into people/ and run
 }
 
 // openEngine builds the engine + DB and loads identities into the engine.
+// Inference runs in-process via CGO + the ONNX Runtime C API.
 func openEngine(cfg config.Config) (*engine.Engine, *db.DB, error) {
 	if err := engine.CheckModels(cfg.DetModelPath(), cfg.EmbModelPath()); err != nil {
 		return nil, nil, err
 	}
-	eng := engine.New(cfg.PythonBin, cfg.SidecarScript,
-		cfg.DetModelPath(), cfg.EmbModelPath(), cfg.Threshold)
+	eng, err := engine.New(cfg.DetModelPath(), cfg.EmbModelPath(), cfg.Threshold)
+	if err != nil {
+		return nil, nil, fmt.Errorf("init inference backend: %w", err)
+	}
 	database, err := db.Open(cfg.DBPath)
 	if err != nil {
 		eng.Close()
