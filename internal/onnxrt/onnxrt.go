@@ -1,15 +1,25 @@
 // Package onnxrt is a minimal Go binding to the ONNX Runtime C API, sufficient
 // to run recogn's two single-input float models (SCRFD detector and ArcFace
 // embedder) in-process. It requires CGO and the ONNX Runtime C library/header
-// (fetched into third_party/onnxruntime by `make ort`).
+// (fetched into third_party/onnxruntime by `make ort` for Linux, or
+// third_party/onnxruntime-win by `make ort-win` for Windows cross-compilation).
 //
 // The include/lib paths are supplied via CGO_CFLAGS / CGO_LDFLAGS (the
-// Makefile sets them). A relative -L here is a fallback for in-package builds.
+// Makefile sets them). The #cgo directives below provide platform-appropriate
+// fallbacks for in-package builds.
 package onnxrt
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../third_party/onnxruntime/include
-#cgo LDFLAGS: -L${SRCDIR}/../../third_party/onnxruntime/lib -lonnxruntime -Wl,-rpath,$ORIGIN/third_party/onnxruntime/lib -Wl,-rpath,${SRCDIR}/../../third_party/onnxruntime/lib
+// Linux: use rpath so the binary finds libonnxruntime.so next to itself.
+#cgo linux CFLAGS: -I${SRCDIR}/../../third_party/onnxruntime/include
+#cgo linux LDFLAGS: -L${SRCDIR}/../../third_party/onnxruntime/lib -lonnxruntime -Wl,-rpath,$ORIGIN/third_party/onnxruntime/lib -Wl,-rpath,${SRCDIR}/../../third_party/onnxruntime/lib
+
+// Windows: no rpath; onnxruntime.dll must be next to the .exe or on PATH.
+// The mingw-w64 linker resolves -lonnxruntime against onnxruntime.lib or
+// libonnxruntime.a in the ORT lib directory.
+#cgo windows CFLAGS: -I${SRCDIR}/../../third_party/onnxruntime-win/include
+#cgo windows LDFLAGS: -L${SRCDIR}/../../third_party/onnxruntime-win/lib -lonnxruntime
+
 #include <stdlib.h>
 #include "onnxrt.h"
 */

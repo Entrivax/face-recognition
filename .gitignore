@@ -1,5 +1,7 @@
 # Build artifacts
 recogn
+recogn.exe
+dist
 .gocache
 .gopath
 .gomodcache
@@ -7,7 +9,7 @@ recogn
 # Downloaded ONNX models (large; fetched via `make models`)
 models
 
-# ONNX Runtime C library + headers (fetched via `make ort`)
+# ONNX Runtime C library + headers (fetched via `make ort` / `make ort-win`)
 third_party
 
 # Generated face database (rebuilt via `recogn enroll`)

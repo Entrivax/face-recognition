@@ -38,6 +38,7 @@ internal/
   api/                 REST API handlers
   web/                 embedded web UI (static/)
 third_party/onnxruntime/  ORT C header + libonnxruntime (via `make ort`)
+third_party/onnxruntime-win/  Windows ORT C header + onnxruntime.dll (via `make ort-win`)
 models/                det_10g.onnx, w600k_r50.onnx  (downloaded)
 people/                <Person Name>/*.jpg ...       (your dataset)
 data/embeddings.json   generated face DB
@@ -94,6 +95,33 @@ make build      # fetch the ORT C library (make ort) and build ./recogn with CGO
 `onnxruntime_c_api.h` into `third_party/onnxruntime`. The binary is linked with
 an `$ORIGIN`-relative rpath, so it runs in place as long as `third_party/`
 stays next to it.
+
+### Cross-compile for Windows
+
+You can build a Windows binary (`recogn.exe`) from Linux or macOS using
+[mingw-w64](https://www.mingw-w64.org/):
+
+```sh
+# Install the cross-compiler (once):
+#   Debian/Ubuntu : sudo apt install gcc-mingw-w64-x86-64
+#   Fedora        : sudo dnf install mingw64-gcc
+#   macOS (brew)  : brew install mingw-w64
+
+make build-windows   # fetch Windows ORT + cross-compile recogn.exe
+```
+
+This downloads the Windows ONNX Runtime distribution into
+`third_party/onnxruntime-win/` and produces `recogn.exe`. To run the binary on
+Windows, `onnxruntime.dll` must be next to the `.exe` (or on `PATH`).
+
+To produce a self-contained zip with the binary, DLL, and models:
+
+```sh
+make dist-windows    # → dist/recogn-windows-x64.zip
+```
+
+Unzip on a Windows machine, open a terminal in the folder, and use
+`recogn.exe` exactly like the Linux binary (e.g. `recogn.exe serve`).
 
 ## Use
 

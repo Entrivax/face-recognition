@@ -17,9 +17,21 @@
 #include "onnxruntime_c_api.h"
 
 // --------------------------------------------------------------------------
+// Portable thread-local storage
+// --------------------------------------------------------------------------
+// C11 _Thread_local works on GCC ≥4.9 and Clang, which covers both the Linux
+// host toolchain and mingw-w64 cross-compiler. MSVC would need
+// __declspec(thread), but we don't target MSVC (CGO on Windows uses mingw).
+#if defined(_MSC_VER)
+  #define ORT_TLS __declspec(thread)
+#else
+  #define ORT_TLS _Thread_local
+#endif
+
+// --------------------------------------------------------------------------
 // Error reporting (thread-local)
 // --------------------------------------------------------------------------
-static _Thread_local char g_err[1024];
+static ORT_TLS char g_err[1024];
 
 static void set_err(const char* fmt, const char* detail) {
   if (detail) {
@@ -59,6 +71,26 @@ int ort_global_init(void) {
 }
 
 // --------------------------------------------------------------------------
+// Path conversion for Windows (ORTCHAR_T is wchar_t on Windows, char on Linux)
+// --------------------------------------------------------------------------
+#ifdef _WIN32
+#include <wchar.h>
+
+// Convert a UTF-8 narrow path to a wide-character path for the Windows ORT
+// API. Returns a malloc'd wchar_t* on success (caller frees), NULL on failure.
+static wchar_t* path_to_wide(const char* path) {
+  // mbstowcs with NULL first arg returns the required buffer size (in wchars,
+  // excluding the null terminator).
+  size_t len = mbstowcs(NULL, path, 0);
+  if (len == (size_t)-1) return NULL;
+  wchar_t* wpath = (wchar_t*)malloc((len + 1) * sizeof(wchar_t));
+  if (!wpath) return NULL;
+  mbstowcs(wpath, path, len + 1);
+  return wpath;
+}
+#endif
+
+// --------------------------------------------------------------------------
 // Session
 // --------------------------------------------------------------------------
 struct ort_session {
@@ -85,7 +117,19 @@ ort_session* ort_open(const char* path) {
   if (st_opt) g_api->ReleaseStatus(st_opt);
 
   OrtSession* session = NULL;
+#ifdef _WIN32
+  // On Windows, ORTCHAR_T is wchar_t — convert the path.
+  wchar_t* wpath = path_to_wide(path);
+  if (!wpath) {
+    set_err("%s", "failed to convert model path to wide chars");
+    g_api->ReleaseSessionOptions(opts);
+    return NULL;
+  }
+  st = g_api->CreateSession(g_env, wpath, opts, &session);
+  free(wpath);
+#else
   st = g_api->CreateSession(g_env, path, opts, &session);
+#endif
   g_api->ReleaseSessionOptions(opts);
   if (check_status(st, "CreateSession")) return NULL;
 
