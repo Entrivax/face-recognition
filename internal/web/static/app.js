@@ -29,6 +29,11 @@
   const enrollThumbs = $("enrollThumbs");
   const enrollMeta = $("enrollMeta");
   const enrollSubmit = $("enrollSubmit");
+  const thumbModal = $("thumbModal");
+  const thumbCard = $("thumbCard");
+  const thumbTitle = $("thumbTitle");
+  const thumbHint = $("thumbHint");
+  const thumbGrid = $("thumbGrid");
   const rescanBtn = $("rescanBtn");
   const statusEl = $("status");
   const statusText = $("statusText");
@@ -243,7 +248,8 @@
           ? `<img class="person-avatar person-avatar-img" src="${escapeHtml(p.thumb)}" alt="" data-initials="${escapeHtml(initials(p.name))}">`
           : `<span class="person-avatar">${escapeHtml(initials(p.name))}</span>`;
         li.innerHTML = `
-          ${avatar}
+          <button type="button" class="person-avatar-btn" title="Choose thumbnail photo"
+                  aria-label="Choose thumbnail photo for ${escapeHtml(p.name)}">${avatar}</button>
           <div>
             <div class="person-name">${escapeHtml(p.name)}</div>
             <div class="person-count">${p.photos} photo(s)</div>
@@ -259,6 +265,8 @@
             img.replaceWith(span);
           });
         }
+        li.querySelector(".person-avatar-btn")
+          .addEventListener("click", () => openThumbModal(p.name));
         li.querySelector(".person-del").addEventListener("click", () => removePerson(p.name));
         peopleList.appendChild(li);
       });
@@ -280,6 +288,119 @@
       showToast(e.message, "err");
     }
   }
+
+  // ---------- thumbnail chooser modal ----------
+  // Opens from a person's avatar; shows their enrolled photos and regenerates
+  // the face thumbnail from whichever one the user clicks.
+  let thumbPerson = null;   // name of the person being edited
+  let thumbPhotos = [];     // photos fetched for the modal
+  let thumbCurrent = "";    // photo path the thumbnail is generated from
+  let thumbBusy = false;
+  let thumbLastFocus = null;
+
+  async function openThumbModal(name) {
+    thumbLastFocus = document.activeElement;
+    thumbPerson = name;
+    thumbTitle.textContent = name;
+    thumbGrid.innerHTML = "";
+    thumbHint.textContent = "Loading photos…";
+    thumbModal.hidden = false;
+    document.body.classList.add("modal-open");
+    thumbCard.querySelector(".modal-close").focus();
+    try {
+      const r = await fetch(`/api/people/${encodeURIComponent(name)}`);
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || "could not load photos");
+      thumbCurrent = j.thumb_src || "";
+      renderThumbTiles(j.photos || []);
+    } catch (e) {
+      thumbHint.textContent = e.message || "Could not load photos.";
+    }
+  }
+
+  function closeThumbModal() {
+    if (thumbBusy) return; // locked while the request is in flight
+    thumbModal.hidden = true;
+    document.body.classList.remove("modal-open");
+    thumbGrid.innerHTML = "";
+    thumbPerson = null;
+    thumbPhotos = [];
+    if (thumbLastFocus && thumbLastFocus.focus) thumbLastFocus.focus();
+  }
+
+  function renderThumbTiles(photos) {
+    thumbPhotos = photos;
+    thumbGrid.innerHTML = "";
+    thumbHint.textContent = photos.length
+      ? "Pick the photo to crop the face avatar from — applies immediately."
+      : "No photos enrolled for this person.";
+    for (const ph of photos) {
+      const li = document.createElement("li");
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "thumb-tile" + (ph.path === thumbCurrent ? " current" : "");
+      btn.title = ph.path;
+      const img = document.createElement("img");
+      img.alt = ph.path;
+      img.src = `/api/people/${encodeURIComponent(thumbPerson)}/photos/${encodeURIComponent(ph.path)}`;
+      img.addEventListener("error", () => {
+        // File gone from the people folder (e.g. legacy DB entry).
+        li.classList.add("unavailable");
+        btn.disabled = true;
+        btn.textContent = "unavailable";
+        img.remove();
+      });
+      btn.appendChild(img);
+      btn.addEventListener("click", () => selectThumb(ph.path));
+      li.appendChild(btn);
+      thumbGrid.appendChild(li);
+    }
+  }
+
+  async function selectThumb(photoPath) {
+    if (thumbBusy || !thumbPerson) return;
+    thumbBusy = true;
+    thumbModal.classList.add("locked");
+    try {
+      const r = await fetch(`/api/people/${encodeURIComponent(thumbPerson)}/thumbnail`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ photo: photoPath }),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || "could not update thumbnail");
+      thumbCurrent = photoPath;
+      showToast("Thumbnail updated.", "ok");
+      loadPeople();
+      thumbBusy = false; // allow close
+      thumbModal.classList.remove("locked");
+      closeThumbModal();
+    } catch (e) {
+      showToast(e.message || "Could not update thumbnail.", "err");
+    } finally {
+      thumbBusy = false;
+      thumbModal.classList.remove("locked");
+      if (!thumbModal.hidden) renderThumbTiles(thumbPhotos); // reset disabled tiles
+    }
+  }
+
+  thumbModal.addEventListener("click", (e) => {
+    if (e.target === thumbModal || e.target.closest("[data-close]")) closeThumbModal();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !thumbModal.hidden) closeThumbModal();
+  });
+  thumbCard.addEventListener("keydown", (e) => {
+    if (e.key !== "Tab") return;
+    const focusables = [...thumbCard.querySelectorAll(
+      "button, [href], input, select, textarea, [tabindex]:not([tabindex='-1'])"
+    )].filter((el) => !el.disabled && el.offsetParent !== null);
+    if (!focusables.length) return;
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    if (e.shiftKey && document.activeElement === first) { last.focus(); e.preventDefault(); }
+    else if (!e.shiftKey && document.activeElement === last) { first.focus(); e.preventDefault(); }
+  });
 
   // ---------- enroll modal ----------
   // Photos chosen for enrollment are held client-side for review; the upload

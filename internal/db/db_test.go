@@ -114,7 +114,7 @@ func TestThumbnailSidecar(t *testing.T) {
 		t.Errorf("expected no thumbnail before SetThumbnail")
 	}
 	jpg := []byte("fake-jpeg-bytes")
-	if err := d.SetThumbnail(p.ID, jpg); err != nil {
+	if err := d.SetThumbnail(p.ID, jpg, "a/1.jpg"); err != nil {
 		t.Fatalf("SetThumbnail: %v", err)
 	}
 	want := filepath.Join(d.ThumbDir(), p.ID+".jpg")
@@ -125,18 +125,26 @@ func TestThumbnailSidecar(t *testing.T) {
 	if err != nil || !bytes.Equal(b, jpg) {
 		t.Errorf("sidecar file mismatch: err=%v len=%d", err, len(b))
 	}
-	if d.Get("Alice").Thumb != p.ID+".jpg" {
-		t.Errorf("Thumb not recorded on person: %q", d.Get("Alice").Thumb)
+	p = d.Get("Alice")
+	if p.Thumb != p.ID+".jpg" {
+		t.Errorf("Thumb not recorded on person: %q", p.Thumb)
+	}
+	if p.ThumbSrc != "a/1.jpg" {
+		t.Errorf("ThumbSrc not recorded: %q", p.ThumbSrc)
 	}
 
-	// Setting again is a no-op: first enrollment wins.
-	if err := d.SetThumbnail(p.ID, []byte("other")); err != nil {
+	// Setting again replaces the sidecar and updates the source.
+	jpg2 := []byte("other-jpeg-bytes")
+	if err := d.SetThumbnail(p.ID, jpg2, "a/2.jpg"); err != nil {
 		t.Fatalf("second SetThumbnail: %v", err)
 	}
-	if b, _ := os.ReadFile(want); !bytes.Equal(b, jpg) {
-		t.Errorf("thumbnail should not be overwritten")
+	if b, _ := os.ReadFile(want); !bytes.Equal(b, jpg2) {
+		t.Errorf("thumbnail should be overwritten")
 	}
-	if err := d.SetThumbnail("nobody", jpg); err == nil {
+	if p := d.Get("Alice"); p.ThumbSrc != "a/2.jpg" {
+		t.Errorf("ThumbSrc should be updated, got %q", p.ThumbSrc)
+	}
+	if err := d.SetThumbnail("nobody", jpg, "x.jpg"); err == nil {
 		t.Errorf("expected error for unknown person")
 	}
 

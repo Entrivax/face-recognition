@@ -174,9 +174,13 @@ command hits a permission error.
   API uploads additionally persist the image bytes into `people/<Name>/`.
 - **Face thumbnails** are a DB sidecar: `thumbs/<personID>.jpg` next to
   `embeddings.json` (see `db.SetThumbnail`/`ThumbFile`, crop via
-  `engine.FaceThumb`). Written once at first enrollment — never overwritten —
-  and **best-effort**: thumbnail failures must never fail an enrollment.
-  Missing thumbnails are backfilled by rescans without re-embedding.
+  `engine.FaceThumb`). Auto-generated at first enrollment only (enrollment
+  callers skip when one exists); the API's `POST /api/people/{name}/thumbnail`
+  re-selects the source photo, which **overwrites** the sidecar and records it
+  as `Person.ThumbSrc`. Always **best-effort**: thumbnail failures must never
+  fail an enrollment. Missing thumbnails are backfilled by rescans without
+  re-embedding. Thumbnail URLs carry a `?v=` cache-buster derived from
+  `ThumbSrc`.
 - **onnxrt memory discipline**: every `OrtValue`/buffer allocated in the C shim
   is freed (tensor data via `ort_free`, sessions via `ort_close`). If you extend
   the shim, keep the ownership rules in `onnxrt.h` accurate and re-run the

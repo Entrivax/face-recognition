@@ -157,9 +157,11 @@ re-scan the `people/` folder.
 |--------|----------|-------------|
 | `POST` | `/api/recognize` | multipart `image` → `{count, faces:[{bbox,name,person_id,confidence,score,landmarks}]}` |
 | `GET`  | `/api/people` | list enrolled people + photo counts (incl. `thumb` URL when a face thumbnail exists) |
-| `GET`  | `/api/people/{name}` | one person's enrolled photos |
+| `GET`  | `/api/people/{name}` | one person's enrolled photos (`thumb_src` = photo the avatar comes from) |
 | `POST` | `/api/people/{name}/enroll` | add photo(s) (field `images`) for a new/existing person; each enrolled image is also saved into `people/<name>/` |
-| `GET`  | `/api/thumbs/{id}.jpg` | a person's face thumbnail (square face crop taken from their first enrolled photo) |
+| `GET`  | `/api/people/{name}/photos/{path}` | one of the person's enrolled photo files (from the people folder) |
+| `POST` | `/api/people/{name}/thumbnail` | regenerate the face thumbnail from a chosen enrolled photo — JSON `{"photo": "<path>"}` |
+| `GET`  | `/api/thumbs/{id}.jpg` | a person's face thumbnail (square face crop; `?v=` cache-buster follows the chosen photo) |
 | `DELETE` | `/api/people/{name}` | remove a person |
 | `POST` | `/api/enroll?force=true` | re-scan the `people/` folder (incremental unless `force`) |
 | `GET`/`POST` | `/api/config` | read/set the match threshold |
@@ -187,9 +189,11 @@ someone new, either:
 **Face thumbnails**: the first enrolled photo that yields a face also produces
 a square face-crop thumbnail, stored as a sidecar next to the database file
 (`data/thumbs/<person-id>.jpg`) and served at `/api/thumbs/<id>.jpg` — the web
-UI's people list shows it as the person's avatar. Thumbnails are written once
-(never overwritten by later photos) and datasets enrolled before this feature
-backfill automatically on the next rescan, without re-embedding.
+UI's people list shows it as the person's avatar. Click a person's avatar to
+open a chooser modal and pick which of their photos generates the thumbnail
+(applies immediately; the DB records the chosen photo). Datasets enrolled
+before thumbnails existed backfill automatically on the next rescan, without
+re-embedding.
 
 Photos with no detectable face are skipped with a warning, never silently
 poisoning the database.

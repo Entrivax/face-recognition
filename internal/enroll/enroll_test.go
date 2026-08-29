@@ -201,6 +201,10 @@ func TestEnrollBytesGeneratesThumbnail(t *testing.T) {
 	if p == nil || p.Thumb == "" {
 		t.Fatalf("expected thumbnail sidecar recorded, got %+v", p)
 	}
+	// Provenance: the thumbnail came from the saved upload (content-derived name).
+	if p.ThumbSrc != db.HashBytes(img)[:12]+".png" {
+		t.Fatalf("ThumbSrc = %q, want the saved upload basename", p.ThumbSrc)
+	}
 	thumbPath := filepath.Join(dbDir, "thumbs", p.Thumb)
 	raw, err := os.ReadFile(thumbPath)
 	if err != nil {
@@ -210,8 +214,8 @@ func TestEnrollBytesGeneratesThumbnail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sidecar is not a decodable JPEG: %v", err)
 	}
-	if b := decoded.Bounds(); b.Dx() != thumbSize || b.Dy() != thumbSize {
-		t.Fatalf("thumbnail %dx%d, want %dx%d", b.Dx(), b.Dy(), thumbSize, thumbSize)
+	if b := decoded.Bounds(); b.Dx() != ThumbSize || b.Dy() != ThumbSize {
+		t.Fatalf("thumbnail %dx%d, want %dx%d", b.Dx(), b.Dy(), ThumbSize, ThumbSize)
 	}
 
 	// A second upload must not overwrite the existing thumbnail.
@@ -257,6 +261,9 @@ func TestScanBackfillsThumbnail(t *testing.T) {
 	p := database.Get("Carol")
 	if p == nil || p.Thumb == "" {
 		t.Fatalf("thumbnail not backfilled, got %+v", p)
+	}
+	if p.ThumbSrc != "c.jpg" {
+		t.Fatalf("ThumbSrc = %q, want c.jpg", p.ThumbSrc)
 	}
 	if _, err := os.Stat(filepath.Join(dbDir, "thumbs", p.Thumb)); err != nil {
 		t.Fatalf("sidecar missing: %v", err)

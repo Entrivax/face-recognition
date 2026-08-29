@@ -124,6 +124,29 @@
   </div>
 </div>
 
+<!-- Thumbnail modal: choose which enrolled photo generates the face avatar -->
+<div id="thumbModal" class="modal" hidden>
+  <div class="modal-backdrop" data-close></div>
+  <div class="modal-card" id="thumbCard" role="dialog" aria-modal="true" aria-labelledby="thumbTitle">
+    <header class="modal-head">
+      <div>
+        <p class="modal-eyebrow">thumbnail</p>
+        <h2 id="thumbTitle">Choose thumbnail</h2>
+      </div>
+      <button class="modal-close" type="button" data-close aria-label="Close">×</button>
+    </header>
+
+    <div class="modal-body">
+      <p class="field-hint" id="thumbHint">Loading photos…</p>
+      <ul id="thumbGrid" class="thumb-grid"></ul>
+
+      <footer class="modal-foot">
+        <button type="button" class="btn btn-ghost" data-close>Close</button>
+      </footer>
+    </div>
+  </div>
+</div>
+
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
 <script src="/app.js"></script>

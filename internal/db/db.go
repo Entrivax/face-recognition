@@ -28,10 +28,11 @@ type Photo struct {
 
 // Person is one enrolled identity.
 type Person struct {
-	ID     string  `json:"id"`
-	Name   string  `json:"name"`
-	Photos []Photo `json:"photos"`
-	Thumb  string  `json:"thumb,omitempty"` // face thumbnail sidecar file name in ThumbDir
+	ID       string  `json:"id"`
+	Name     string  `json:"name"`
+	Photos   []Photo `json:"photos"`
+	Thumb    string  `json:"thumb,omitempty"`     // face thumbnail sidecar file name in ThumbDir
+	ThumbSrc string  `json:"thumb_src,omitempty"` // enrolled photo the thumbnail was generated from
 }
 
 // DB is the on-disk face database. The zero value is not ready; use Open.
@@ -190,10 +191,12 @@ func (d *DB) ThumbDir() string {
 }
 
 // SetThumbnail stores jpg as the person's face thumbnail sidecar
-// (<personID>.jpg under ThumbDir) and records the file name on the person.
-// Meant to be called once, at first enrollment: if the person already has a
-// thumbnail, it is a no-op. Callers find the person ID via Get/People.
-func (d *DB) SetThumbnail(personID string, jpg []byte) error {
+// (<personID>.jpg under ThumbDir) and records the file name on the person
+// along with the enrolled photo path it was generated from (srcPhotoPath).
+// Any previous thumbnail is replaced; enrollment callers pass a photo only
+// when the person has none (first-wins), while the API's thumbnail-chooser
+// calls it explicitly to re-select.
+func (d *DB) SetThumbnail(personID string, jpg []byte, srcPhotoPath string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	var p *Person
@@ -206,9 +209,6 @@ func (d *DB) SetThumbnail(personID string, jpg []byte) error {
 	if p == nil {
 		return fmt.Errorf("person %q not found", personID)
 	}
-	if p.Thumb != "" {
-		return nil // already has one; first enrollment wins
-	}
 	dir := d.ThumbDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create thumbnail dir: %w", err)
@@ -218,6 +218,7 @@ func (d *DB) SetThumbnail(personID string, jpg []byte) error {
 		return fmt.Errorf("write thumbnail: %w", err)
 	}
 	p.Thumb = fileName
+	p.ThumbSrc = srcPhotoPath
 	return d.saveLocked()
 }
 

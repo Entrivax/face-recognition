@@ -105,22 +105,22 @@ func Scan(eng FaceEngine, database *db.DB, opts Options) (Result, error) {
 	return res, nil
 }
 
-// thumbSize is the pixel size (square) of the generated face thumbnails.
-const thumbSize = 160
+// ThumbSize is the pixel size (square) of the generated face thumbnails.
+const ThumbSize = 160
 
 // saveThumb stores a face thumbnail for the person if they do not have one
 // yet (first enrollment wins). Best-effort: thumbnail problems must never
 // fail an enrollment.
-func saveThumb(database *db.DB, name string, imgBytes []byte, f engine.Face) {
+func saveThumb(database *db.DB, name, photoPath string, imgBytes []byte, f engine.Face) {
 	p := database.Get(name)
 	if p == nil || p.Thumb != "" {
 		return // person unknown, or thumbnail already set
 	}
-	jpg, err := engine.FaceThumb(imgBytes, f, thumbSize)
+	jpg, err := engine.FaceThumb(imgBytes, f, ThumbSize)
 	if err != nil {
 		return // best-effort
 	}
-	_ = database.SetThumbnail(p.ID, jpg)
+	_ = database.SetThumbnail(p.ID, jpg, photoPath)
 }
 
 // thumbPending reports whether the named person exists but has no face
@@ -164,7 +164,7 @@ func enrollOne(eng FaceEngine, database *db.DB, name, folder, file string, force
 	if unchanged {
 		// The photo is unchanged, but the person still lacks a thumbnail:
 		// crop only — no re-embedding, no DB write.
-		saveThumb(database, name, b, best)
+		saveThumb(database, name, file, b, best)
 		return false, "", nil
 	}
 	emb, err := eng.EmbedFace(b, best)
@@ -174,7 +174,7 @@ func enrollOne(eng FaceEngine, database *db.DB, name, folder, file string, force
 	if err := database.AddPhotoHashed(name, file, h, emb); err != nil {
 		return false, "", err
 	}
-	saveThumb(database, name, b, best)
+	saveThumb(database, name, file, b, best)
 	return true, "", nil
 }
 
@@ -234,7 +234,7 @@ func EnrollBytes(eng FaceEngine, database *db.DB, peopleDir, name, fileName stri
 		// enroll it, so the dataset self-heals.
 		return "", err
 	}
-	saveThumb(database, name, imgBytes, best)
+	saveThumb(database, name, fileName, imgBytes, best)
 	return filepath.Join(folder, fileName), nil
 }
 

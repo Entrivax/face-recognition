@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"recogn/internal/config"
@@ -130,7 +132,7 @@ func (s *Server) handlePeople(w http.ResponseWriter, r *http.Request) {
 	for _, p := range people {
 		var thumb string
 		if p.Thumb != "" {
-			thumb = "/api/thumbs/" + p.ID + ".jpg"
+			thumb = thumbURL(p.ID, p.ThumbSrc)
 		}
 		out = append(out, summary{
 			ID: p.ID, Name: p.Name,
@@ -153,6 +155,14 @@ func (s *Server) handlePersonSubroutes(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(parts) == 2 && parts[1] == "enroll" {
 		s.handleEnrollPerson(w, r, name)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "thumbnail" {
+		s.handleSelectThumb(w, r, name)
+		return
+	}
+	if len(parts) == 2 && strings.HasPrefix(parts[1], "photos/") {
+		s.handlePersonPhoto(w, r, name, strings.TrimPrefix(parts[1], "photos/"))
 		return
 	}
 	switch r.Method {
@@ -181,8 +191,136 @@ func (s *Server) handleGetPerson(w http.ResponseWriter, r *http.Request, name st
 		photos = append(photos, photo{Path: ph.Path, Hash: ph.Hash})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id": p.ID, "name": p.Name, "photos": photos,
+		"id": p.ID, "name": p.Name, "thumb_src": p.ThumbSrc, "photos": photos,
 	})
+}
+
+// handlePersonPhoto serves one of a person's enrolled photo files from the
+// people folder, for the thumbnail chooser modal. The requested path must be
+// one of the person's enrolled photos and resolve inside their folder.
+func (s *Server) handlePersonPhoto(w http.ResponseWriter, r *http.Request, name, photoPath string) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "GET required")
+		return
+	}
+	if err := enroll.CheckName(name); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	p := s.db.Get(name)
+	if p == nil {
+		writeErr(w, http.StatusNotFound, "person not found")
+		return
+	}
+	full := personPhotoPath(s.cfg.PeopleDir, p, photoPath)
+	if full == "" {
+		writeErr(w, http.StatusNotFound, "photo not found")
+		return
+	}
+	http.ServeFile(w, r, full)
+}
+
+// handleSelectThumb regenerates a person's face thumbnail from one of their
+// enrolled photos, chosen via the UI's thumbnail modal. Body: {"photo": path}.
+func (s *Server) handleSelectThumb(w http.ResponseWriter, r *http.Request, name string) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	if err := enroll.CheckName(name); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var body struct {
+		Photo string `json:"photo"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	p := s.db.Get(name)
+	if p == nil {
+		writeErr(w, http.StatusNotFound, "person not found")
+		return
+	}
+	full := personPhotoPath(s.cfg.PeopleDir, p, body.Photo)
+	if full == "" {
+		writeErr(w, http.StatusNotFound, "photo not found")
+		return
+	}
+	b, err := os.ReadFile(full)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "photo file is missing from the people folder")
+		return
+	}
+	faces, err := s.eng.Detect(b)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "detect failed: "+err.Error())
+		return
+	}
+	if len(faces) == 0 {
+		writeErr(w, http.StatusUnprocessableEntity, "no face detected in that photo")
+		return
+	}
+	// Use the largest face, mirroring enrollment.
+	best := faces[0]
+	bestArea := best.BBox[2] * best.BBox[3]
+	for _, f := range faces[1:] {
+		if a := f.BBox[2] * f.BBox[3]; a > bestArea {
+			best, bestArea = f, a
+		}
+	}
+	jpg, err := engine.FaceThumb(b, best, enroll.ThumbSize)
+	if err != nil {
+		writeErr(w, http.StatusUnprocessableEntity, "could not crop face: "+err.Error())
+		return
+	}
+	if err := s.db.SetThumbnail(p.ID, jpg, body.Photo); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"person": p.Name,
+		"thumb":  thumbURL(p.ID, body.Photo),
+	})
+}
+
+// enrolledPhoto reports whether photoPath is one of the person's stored
+// photos and is a safe relative path (no absolute, no escaping).
+func enrolledPhoto(p *db.Person, photoPath string) bool {
+	if photoPath == "" || filepath.IsAbs(photoPath) {
+		return false
+	}
+	for _, ph := range p.Photos {
+		if ph.Path == photoPath {
+			return true
+		}
+	}
+	return false
+}
+
+// personPhotoPath resolves an enrolled photo path to a file under the
+// person's folder in the people dir, or "" when the path is unsafe.
+func personPhotoPath(peopleDir string, p *db.Person, photoPath string) string {
+	if !enrolledPhoto(p, photoPath) {
+		return ""
+	}
+	dir := filepath.Join(peopleDir, p.Name)
+	full := filepath.Join(dir, filepath.FromSlash(photoPath))
+	if !strings.HasPrefix(full, dir+string(os.PathSeparator)) {
+		return ""
+	}
+	return full
+}
+
+// thumbURL builds the thumbnail URL with a cache-buster derived from the
+// source photo, so browsers refetch after a re-selection.
+func thumbURL(personID, srcPhoto string) string {
+	u := "/api/thumbs/" + personID + ".jpg"
+	if srcPhoto != "" {
+		u += "?v=" + db.HashBytes([]byte(srcPhoto))[:8]
+	}
+	return u
 }
 
 func (s *Server) handleDeletePerson(w http.ResponseWriter, r *http.Request, name string) {
@@ -314,8 +452,8 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	// Thumbnails are written once at first enrollment, so they can be cached.
-	w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
+	// Thumbnails can be re-selected by the user, so cache briefly only.
+	w.Header().Set("Cache-Control", "public, max-age=3600")
 	http.ServeFile(w, r, path)
 }
 

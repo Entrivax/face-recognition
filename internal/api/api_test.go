@@ -372,13 +372,14 @@ func slicesContain(list []string, want string) bool {
 }
 
 // pngBytes renders a deterministic w x h gradient as PNG bytes (real,
-// decodable image content, needed for thumbnail generation).
-func pngBytes(t *testing.T, w, h int) []byte {
+// decodable image content, needed for thumbnail generation). seed shifts the
+// gradient so different calls produce different pixels.
+func pngBytes(t *testing.T, w, h, seed int) []byte {
 	t.Helper()
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
-			img.Set(x, y, color.RGBA{uint8(x % 256), uint8(y % 256), 128, 255})
+			img.Set(x, y, color.RGBA{uint8((x + seed) % 256), uint8((y + seed) % 256), 128, 255})
 		}
 	}
 	var buf bytes.Buffer
@@ -394,7 +395,7 @@ func TestPeopleThumbServing(t *testing.T) {
 
 	// Alice: real image → thumbnail generated. Bob: fake bytes → crop fails,
 	// enrollment still succeeds but without a thumbnail (best-effort).
-	rec := enrollPerson(t, s, "Alice", map[string][]byte{"a.png": pngBytes(t, 120, 120)})
+	rec := enrollPerson(t, s, "Alice", map[string][]byte{"a.png": pngBytes(t, 120, 120, 0)})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("alice enroll: got %d (%s)", rec.Code, rec.Body.String())
 	}
@@ -425,8 +426,8 @@ func TestPeopleThumbServing(t *testing.T) {
 	for _, p := range resp.People {
 		thumbs[p.ID] = p.Thumb
 	}
-	if thumbs["alice"] != "/api/thumbs/alice.jpg" {
-		t.Errorf("alice thumb = %q", thumbs["alice"])
+	if !strings.HasPrefix(thumbs["alice"], "/api/thumbs/alice.jpg?v=") {
+		t.Errorf("alice thumb = %q, want a cache-busted URL", thumbs["alice"])
 	}
 	if thumbs["bob"] != "" {
 		t.Errorf("bob should have no thumb, got %q", thumbs["bob"])
@@ -459,5 +460,174 @@ func TestPeopleThumbServing(t *testing.T) {
 	s.Handler().ServeHTTP(r2, req)
 	if r2.Code != http.StatusMethodNotAllowed {
 		t.Errorf("POST thumb: got %d, want 405", r2.Code)
+	}
+}
+
+// postJSON sends a JSON body to the server and returns the recorder.
+func postJSON(t *testing.T, s *Server, path string, body any) *httptest.ResponseRecorder {
+	t.Helper()
+	b, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
+func getJSON(t *testing.T, s *Server, path string, out any) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if out != nil {
+		if err := json.NewDecoder(rec.Body).Decode(out); err != nil {
+			t.Fatalf("decode %s: %v", path, err)
+		}
+	}
+	return rec
+}
+
+// TestThumbChooser covers serving enrolled photos and regenerating the
+// thumbnail from a chosen photo.
+func TestThumbChooser(t *testing.T) {
+	eng := &stubEngine{faces: []engine.Face{{BBox: [4]float64{10, 10, 40, 40}}}}
+	s, database := newTestServer(t, eng)
+	imgA, imgB := pngBytes(t, 120, 120, 0), pngBytes(t, 160, 90, 100)
+	photoA := db.HashBytes(imgA)[:12] + ".png"
+	photoB := db.HashBytes(imgB)[:12] + ".png"
+
+	// One upload per request so the thumbnail source is deterministic.
+	if rec := enrollPerson(t, s, "Alice", map[string][]byte{"a1.png": imgA}); rec.Code != http.StatusOK {
+		t.Fatalf("upload a1: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if rec := enrollPerson(t, s, "Alice", map[string][]byte{"a2.png": imgB}); rec.Code != http.StatusOK {
+		t.Fatalf("upload a2: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	p := database.Get("Alice")
+	if p.ThumbSrc != photoA {
+		t.Fatalf("initial ThumbSrc = %q, want %q (first upload wins)", p.ThumbSrc, photoA)
+	}
+	thumbPath := filepath.Join(database.ThumbDir(), p.Thumb)
+	thumbBefore, err := os.ReadFile(thumbPath)
+	if err != nil {
+		t.Fatalf("read sidecar: %v", err)
+	}
+
+	// Serving an enrolled photo returns the stored bytes as image/png.
+	r := getJSON(t, s, "/api/people/Alice/photos/"+photoB, nil)
+	if r.Code != http.StatusOK {
+		t.Fatalf("photo serve: got %d", r.Code)
+	}
+	if ct := r.Header().Get("Content-Type"); !strings.HasPrefix(ct, "image/png") {
+		t.Errorf("photo content type %q, want image/png", ct)
+	}
+	if !bytes.Equal(r.Body.Bytes(), imgB) {
+		t.Errorf("served photo bytes differ from the stored upload")
+	}
+
+	// Choose photo B as the thumbnail source.
+	type thumbResp struct {
+		Person string `json:"person"`
+		Thumb  string `json:"thumb"`
+	}
+	r = postJSON(t, s, "/api/people/Alice/thumbnail", map[string]string{"photo": photoB})
+	if r.Code != http.StatusOK {
+		t.Fatalf("select thumb: got %d (%s)", r.Code, r.Body.String())
+	}
+	var tr thumbResp
+	if err := json.NewDecoder(r.Body).Decode(&tr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	wantURL := "/api/thumbs/alice.jpg?v=" + db.HashBytes([]byte(photoB))[:8]
+	if tr.Thumb != wantURL {
+		t.Errorf("thumb URL = %q, want %q", tr.Thumb, wantURL)
+	}
+	p = database.Get("Alice")
+	if p.ThumbSrc != photoB {
+		t.Errorf("ThumbSrc = %q, want %q", p.ThumbSrc, photoB)
+	}
+	thumbAfter, _ := os.ReadFile(thumbPath)
+	if bytes.Equal(thumbBefore, thumbAfter) {
+		t.Errorf("sidecar was not regenerated from the chosen photo")
+	}
+	// People list carries the updated cache-busted URL.
+	var people struct {
+		People []struct {
+			ID    string `json:"id"`
+			Thumb string `json:"thumb"`
+		} `json:"people"`
+	}
+	getJSON(t, s, "/api/people", &people)
+	for _, pp := range people.People {
+		if pp.ID == "alice" && pp.Thumb != wantURL {
+			t.Errorf("people list thumb = %q, want %q", pp.Thumb, wantURL)
+		}
+	}
+
+	// Errors: unknown photo, unenrolled/unsafe path, missing file, unknown
+	// person, bad name, wrong methods.
+	if code := getJSON(t, s, "/api/people/Alice/photos/nope.png", nil).Code; code != http.StatusNotFound {
+		t.Errorf("unknown photo: got %d, want 404", code)
+	}
+	if code := getJSON(t, s, "/api/people/Nobody/photos/"+photoB, nil).Code; code != http.StatusNotFound {
+		t.Errorf("unknown person photo: got %d, want 404", code)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/people/Alice/photos/"+photoB, nil)
+	r3 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(r3, req)
+	if r3.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST photo: got %d, want 405", r3.Code)
+	}
+	if code := postJSON(t, s, "/api/people/Alice/thumbnail", map[string]string{"photo": "nope.png"}).Code; code != http.StatusNotFound {
+		t.Errorf("unknown photo select: got %d, want 404", code)
+	}
+	if code := postJSON(t, s, "/api/people/Alice/thumbnail", map[string]string{"photo": "../../etc/passwd"}).Code; code != http.StatusNotFound {
+		t.Errorf("unsafe path select: got %d, want 404", code)
+	}
+	// Enrolled in the DB but the file is gone from disk.
+	if err := database.AddPhoto("Alice", "ghost.jpg", imgA, []float32{1}); err != nil {
+		t.Fatal(err)
+	}
+	if code := postJSON(t, s, "/api/people/Alice/thumbnail", map[string]string{"photo": "ghost.jpg"}).Code; code != http.StatusNotFound {
+		t.Errorf("missing file select: got %d, want 404", code)
+	}
+	if code := postJSON(t, s, "/api/people/Nobody/thumbnail", map[string]string{"photo": "x.jpg"}).Code; code != http.StatusNotFound {
+		t.Errorf("unknown person select: got %d, want 404", code)
+	}
+	if code := postJSON(t, s, `/api/people/a\b/thumbnail`, map[string]string{"photo": "x.jpg"}).Code; code != http.StatusBadRequest {
+		t.Errorf("bad name select: got %d, want 400", code)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/people/Alice/thumbnail", nil)
+	r4 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(r4, req)
+	if r4.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET select: got %d, want 405", r4.Code)
+	}
+}
+
+// TestThumbChooserNoFace checks that a photo without a detectable face is
+// rejected and leaves the current thumbnail untouched.
+func TestThumbChooserNoFace(t *testing.T) {
+	s, database := newTestServer(t, &stubEngine{faces: nil})
+	img := pngBytes(t, 60, 60, 0)
+	if err := database.AddPhoto("Bob", "b.png", img, []float32{1}); err != nil {
+		t.Fatal(err)
+	}
+	// The photo file must exist on disk; only detection fails.
+	if err := os.MkdirAll(filepath.Join(s.cfg.PeopleDir, "Bob"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.cfg.PeopleDir, "Bob", "b.png"), img, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := postJSON(t, s, "/api/people/Bob/thumbnail", map[string]string{"photo": "b.png"})
+	if r.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("no-face select: got %d (%s), want 422", r.Code, r.Body.String())
+	}
+	if p := database.Get("Bob"); p.Thumb != "" {
+		t.Errorf("failed selection must not create a thumbnail")
 	}
 }
