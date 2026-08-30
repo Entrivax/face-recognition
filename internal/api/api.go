@@ -162,7 +162,18 @@ func (s *Server) handlePersonSubroutes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(parts) == 2 && strings.HasPrefix(parts[1], "photos/") {
-		s.handlePersonPhoto(w, r, name, strings.TrimPrefix(parts[1], "photos/"))
+		photoPath := strings.TrimPrefix(parts[1], "photos/")
+		// /photos/{path}/detect inspects the stored photo's faces; basenames
+		// cannot contain "/", so the suffix is unambiguous.
+		if strings.HasSuffix(photoPath, "/detect") {
+			s.handlePersonPhotoDetect(w, r, name, strings.TrimSuffix(photoPath, "/detect"))
+			return
+		}
+		if r.Method == http.MethodDelete {
+			s.handleDeletePhoto(w, r, name, photoPath)
+			return
+		}
+		s.handlePersonPhoto(w, r, name, photoPath)
 		return
 	}
 	switch r.Method {
@@ -218,6 +229,134 @@ func (s *Server) handlePersonPhoto(w http.ResponseWriter, r *http.Request, name,
 		return
 	}
 	http.ServeFile(w, r, full)
+}
+
+// handlePersonPhotoDetect runs recognition on one of a person's enrolled
+// photos and returns the detected faces (with identity matches), so the UI
+// can draw them over the image and the user can judge the photo's quality.
+func (s *Server) handlePersonPhotoDetect(w http.ResponseWriter, r *http.Request, name, photoPath string) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "GET required")
+		return
+	}
+	if err := enroll.CheckName(name); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	p := s.db.Get(name)
+	if p == nil {
+		writeErr(w, http.StatusNotFound, "person not found")
+		return
+	}
+	full := personPhotoPath(s.cfg.PeopleDir, p, photoPath)
+	if full == "" {
+		writeErr(w, http.StatusNotFound, "photo not found")
+		return
+	}
+	b, err := os.ReadFile(full)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "photo file is missing from the people folder")
+		return
+	}
+	faces, err := s.eng.Recognize(b)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "recognition failed: "+err.Error())
+		return
+	}
+	for i := range faces {
+		faces[i].Embedding = nil
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"photo": photoPath,
+		"count": len(faces),
+		"faces": faces,
+	})
+}
+
+// handleDeletePhoto removes one photo from a person: the DB entry and, when
+// present, the image file in the people folder. If the deleted photo was the
+// thumbnail source, the avatar is regenerated from another photo (or cleared
+// when none remain). Body-less; photo path comes from the URL.
+func (s *Server) handleDeletePhoto(w http.ResponseWriter, r *http.Request, name, photoPath string) {
+	if r.Method != http.MethodDelete {
+		writeErr(w, http.StatusMethodNotAllowed, "DELETE required")
+		return
+	}
+	if err := enroll.CheckName(name); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	p := s.db.Get(name)
+	if p == nil {
+		writeErr(w, http.StatusNotFound, "person not found")
+		return
+	}
+	full := personPhotoPath(s.cfg.PeopleDir, p, photoPath)
+	if full == "" {
+		writeErr(w, http.StatusNotFound, "photo not found")
+		return
+	}
+	removed, err := s.db.RemovePhoto(name, photoPath)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !removed {
+		writeErr(w, http.StatusNotFound, "photo not found")
+		return
+	}
+	// Best-effort: a missing file must not block the DB cleanup.
+	_ = os.Remove(full)
+	s.regenerateThumbAfterDelete(p, photoPath)
+	s.reload()
+	remaining := s.db.Get(name)
+	count := 0
+	if remaining != nil {
+		count = len(remaining.Photos)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"removed": photoPath,
+		"photos":  count,
+	})
+}
+
+// regenerateThumbAfterDelete repairs the thumbnail sidecar when the deleted
+// photo was its source: the next remaining photo that still detects a face
+// becomes the new source; when none does (or no photos remain), the
+// thumbnail is cleared. Best-effort throughout — never fails the delete.
+func (s *Server) regenerateThumbAfterDelete(p *db.Person, deletedPhoto string) {
+	if p.ThumbSrc != deletedPhoto {
+		return // thumbnail not based on the removed photo
+	}
+	for _, ph := range p.Photos {
+		full := personPhotoPath(s.cfg.PeopleDir, p, ph.Path)
+		if full == "" {
+			continue
+		}
+		b, err := os.ReadFile(full)
+		if err != nil {
+			continue
+		}
+		faces, err := s.eng.Detect(b)
+		if err != nil || len(faces) == 0 {
+			continue
+		}
+		best := faces[0]
+		bestArea := best.BBox[2] * best.BBox[3]
+		for _, f := range faces[1:] {
+			if a := f.BBox[2] * f.BBox[3]; a > bestArea {
+				best, bestArea = f, a
+			}
+		}
+		jpg, err := engine.FaceThumb(b, best, enroll.ThumbSize)
+		if err != nil {
+			continue
+		}
+		if err := s.db.SetThumbnail(p.ID, jpg, ph.Path); err == nil {
+			return // regenerated from the first usable photo
+		}
+	}
+	_ = s.db.ClearThumbnail(p.ID) // no usable source left
 }
 
 // handleSelectThumb regenerates a person's face thumbnail from one of their

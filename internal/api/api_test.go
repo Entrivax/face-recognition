@@ -478,6 +478,169 @@ func TestPeopleThumbServing(t *testing.T) {
 	}
 }
 
+// TestPhotoDetect covers inspecting an enrolled photo's detected faces via
+// the /detect subroute (used by the photos manager modal).
+func TestPhotoDetect(t *testing.T) {
+	eng := &stubEngine{faces: []engine.Face{
+		{BBox: [4]float64{10, 10, 40, 40}, Name: "Alice", PersonID: "alice", Confidence: 0.9},
+	}}
+	s, database := newTestServer(t, eng)
+	img := pngBytes(t, 120, 120, 0)
+	photo := db.HashBytes(img)[:12] + ".png"
+	if rec := enrollPerson(t, s, "Alice", map[string][]byte{"a.png": img}); rec.Code != http.StatusOK {
+		t.Fatalf("enroll: got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	r := getJSON(t, s, "/api/people/Alice/photos/"+photo+"/detect", nil)
+	if r.Code != http.StatusOK {
+		t.Fatalf("detect: got %d (%s)", r.Code, r.Body.String())
+	}
+	var resp struct {
+		Photo string        `json:"photo"`
+		Count int           `json:"count"`
+		Faces []engine.Face `json:"faces"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Photo != photo || resp.Count != 1 || len(resp.Faces) != 1 {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+	if resp.Faces[0].Name != "Alice" {
+		t.Errorf("face identity = %q, want Alice", resp.Faces[0].Name)
+	}
+	if strings.Contains(r.Body.String(), "embedding") {
+		t.Errorf("detect response must not leak embeddings")
+	}
+
+	// Unknown photo / missing file / unknown person / bad method.
+	if code := getJSON(t, s, "/api/people/Alice/photos/nope.png/detect", nil).Code; code != http.StatusNotFound {
+		t.Errorf("unknown photo: got %d, want 404", code)
+	}
+	// Enrolled in the DB but the file is gone from disk.
+	if err := database.AddPhoto("Alice", "ghost.jpg", img, []float32{1}); err != nil {
+		t.Fatal(err)
+	}
+	if code := getJSON(t, s, "/api/people/Alice/photos/ghost.jpg/detect", nil).Code; code != http.StatusNotFound {
+		t.Errorf("missing file: got %d, want 404", code)
+	}
+	if code := getJSON(t, s, "/api/people/Nobody/photos/"+photo+"/detect", nil).Code; code != http.StatusNotFound {
+		t.Errorf("unknown person: got %d, want 404", code)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/people/Alice/photos/"+photo+"/detect", nil)
+	r2 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(r2, req)
+	if r2.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST detect: got %d, want 405", r2.Code)
+	}
+}
+
+// TestPhotoDelete covers removing a single photo: DB entry and file are gone,
+// the other photo survives, and errors match the rest of the photo routes.
+func TestPhotoDelete(t *testing.T) {
+	eng := &stubEngine{faces: []engine.Face{{BBox: [4]float64{10, 10, 40, 40}}}}
+	s, database := newTestServer(t, eng)
+	imgA, imgB := pngBytes(t, 120, 120, 0), pngBytes(t, 120, 120, 7)
+	if rec := enrollPerson(t, s, "Alice", map[string][]byte{"a1.png": imgA}); rec.Code != http.StatusOK {
+		t.Fatalf("enroll a1: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if rec := enrollPerson(t, s, "Alice", map[string][]byte{"a2.png": imgB}); rec.Code != http.StatusOK {
+		t.Fatalf("enroll a2: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	photoA := db.HashBytes(imgA)[:12] + ".png"
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/people/Alice/photos/"+photoA, nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Removed string `json:"removed"`
+		Photos  int    `json:"photos"`
+	}
+	json.NewDecoder(rec.Body).Decode(&resp)
+	if resp.Removed != photoA || resp.Photos != 1 {
+		t.Errorf("unexpected delete response: %+v", resp)
+	}
+	p := database.Get("Alice")
+	if p == nil || len(p.Photos) != 1 {
+		t.Fatalf("expected Alice with 1 remaining photo, got %+v", p)
+	}
+	if _, err := os.Stat(filepath.Join(s.cfg.PeopleDir, "Alice", photoA)); !os.IsNotExist(err) {
+		t.Errorf("photo file should be gone from the people folder, err=%v", err)
+	}
+
+	if code := req2(t, s, http.MethodDelete, "/api/people/Alice/photos/nope.png").Code; code != http.StatusNotFound {
+		t.Errorf("unknown photo delete: got %d, want 404", code)
+	}
+	if code := req2(t, s, http.MethodPost, "/api/people/Alice/photos/"+photoA).Code; code != http.StatusMethodNotAllowed {
+		t.Errorf("POST to delete route: got %d, want 405", code)
+	}
+}
+
+// TestPhotoDeleteThumbnail checks that deleting the thumbnail source photo
+// regenerates the avatar from another photo, and clearing the last photo
+// removes the thumbnail entirely while the person survives.
+func TestPhotoDeleteThumbnail(t *testing.T) {
+	eng := &stubEngine{faces: []engine.Face{{BBox: [4]float64{10, 10, 40, 40}}}}
+	s, database := newTestServer(t, eng)
+	imgA, imgB := pngBytes(t, 120, 120, 0), pngBytes(t, 160, 90, 100)
+
+	// One upload per request so the thumbnail source is deterministic.
+	if rec := enrollPerson(t, s, "Alice", map[string][]byte{"a1.png": imgA}); rec.Code != http.StatusOK {
+		t.Fatalf("enroll a1: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if rec := enrollPerson(t, s, "Alice", map[string][]byte{"a2.png": imgB}); rec.Code != http.StatusOK {
+		t.Fatalf("enroll a2: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	photoA := db.HashBytes(imgA)[:12] + ".png"
+	photoB := db.HashBytes(imgB)[:12] + ".png"
+	p := database.Get("Alice")
+	if p.ThumbSrc != photoA {
+		t.Fatalf("ThumbSrc = %q, want %q", p.ThumbSrc, photoA)
+	}
+
+	// Delete the thumbnail source: avatar regenerates from the other photo.
+	if code := req2(t, s, http.MethodDelete, "/api/people/Alice/photos/"+photoA).Code; code != http.StatusOK {
+		t.Fatalf("delete thumb-src photo: got %d", code)
+	}
+	p = database.Get("Alice")
+	if p.ThumbSrc != photoB {
+		t.Errorf("ThumbSrc = %q, want %q (regenerated from the remaining photo)", p.ThumbSrc, photoB)
+	}
+	if p.Thumb == "" {
+		t.Errorf("thumbnail sidecar should have been regenerated, not cleared")
+	}
+	if _, err := os.Stat(filepath.Join(database.ThumbDir(), p.Thumb)); err != nil {
+		t.Errorf("regenerated sidecar missing: %v", err)
+	}
+
+	// Delete the last photo: thumbnail cleared, person stays enrolled.
+	if code := req2(t, s, http.MethodDelete, "/api/people/Alice/photos/"+photoB).Code; code != http.StatusOK {
+		t.Fatalf("delete last photo: got %d", code)
+	}
+	p = database.Get("Alice")
+	if p == nil {
+		t.Fatalf("person should remain after removing their last photo")
+	}
+	if p.Thumb != "" || p.ThumbSrc != "" {
+		t.Errorf("thumbnail should be cleared, got thumb=%q src=%q", p.Thumb, p.ThumbSrc)
+	}
+	if _, err := os.Stat(filepath.Join(database.ThumbDir(), "alice.jpg")); !os.IsNotExist(err) {
+		t.Errorf("sidecar file should be removed, err=%v", err)
+	}
+}
+
+// req2 sends a request with the given method and returns the recorder.
+func req2(t *testing.T, s *Server, method, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
 // postJSON sends a JSON body to the server and returns the recorder.
 func postJSON(t *testing.T, s *Server, path string, body any) *httptest.ResponseRecorder {
 	t.Helper()

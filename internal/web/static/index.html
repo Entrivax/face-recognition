@@ -124,24 +124,76 @@
   </div>
 </div>
 
-<!-- Thumbnail modal: choose which enrolled photo generates the face avatar -->
-<div id="thumbModal" class="modal" hidden>
+<!-- Photos modal: manage a person's photos — add, remove, and inspect the
+     detected face(s) on each one before judging its quality -->
+<div id="photoModal" class="modal" hidden>
   <div class="modal-backdrop" data-close></div>
-  <div class="modal-card" id="thumbCard" role="dialog" aria-modal="true" aria-labelledby="thumbTitle">
+  <div class="modal-card wide" id="photoCard" role="dialog" aria-modal="true" aria-labelledby="photoTitle">
     <header class="modal-head">
       <div>
-        <p class="modal-eyebrow">thumbnail</p>
-        <h2 id="thumbTitle">Choose thumbnail</h2>
+        <p class="modal-eyebrow">photos</p>
+        <h2 id="photoTitle">Photos</h2>
       </div>
       <button class="modal-close" type="button" data-close aria-label="Close">×</button>
     </header>
 
     <div class="modal-body">
-      <p class="field-hint" id="thumbHint">Loading photos…</p>
-      <ul id="thumbGrid" class="thumb-grid"></ul>
+      <p class="field-hint" id="photoHint">Loading photos…</p>
+
+      <!-- grid view -->
+      <div id="photoGridView">
+        <ul id="photoGrid" class="photo-grid"></ul>
+        <div id="photoAdd" class="photo-add" tabindex="0" role="button"
+             aria-label="Add photos — drag and drop, paste, or press Enter to browse">
+          <p class="pa-primary">Drag &amp; drop, paste, or <span class="pa-browse">browse</span> to add photos</p>
+          <p class="pa-hint">Photos upload immediately and become part of this person's dataset</p>
+          <input id="photoFiles" type="file" accept="image/*" multiple hidden>
+        </div>
+      </div>
+
+      <!-- detail view: photo with detected faces drawn over it -->
+      <div id="photoDetailView" hidden>
+        <button type="button" class="photo-back" id="photoBackBtn">← All photos</button>
+        <div class="canvas-wrap photo-canvas">
+          <img id="photoDetailImg" alt="Enrolled photo">
+          <canvas id="photoOverlay"></canvas>
+        </div>
+        <p class="photo-verdict" id="photoVerdict" aria-live="polite"></p>
+        <div class="photo-actions">
+          <button type="button" class="btn btn-ghost" id="photoThumbBtn">Set as avatar</button>
+          <button type="button" class="btn btn-ghost photo-remove" id="photoDelBtn">Remove photo</button>
+        </div>
+      </div>
 
       <footer class="modal-foot">
         <button type="button" class="btn btn-ghost" data-close>Close</button>
+      </footer>
+    </div>
+  </div>
+</div>
+
+<!-- Face-check viewer: enlarged preview with detected faces, used by the
+     enroll modal to inspect pending photos before they are sent -->
+<div id="checkModal" class="modal overlay-modal" hidden>
+  <div class="modal-backdrop" data-close></div>
+  <div class="modal-card" id="checkCard" role="dialog" aria-modal="true" aria-labelledby="checkTitle">
+    <header class="modal-head">
+      <div>
+        <p class="modal-eyebrow">face check</p>
+        <h2 id="checkTitle">Detected faces</h2>
+      </div>
+      <button class="modal-close" type="button" data-close aria-label="Close">×</button>
+    </header>
+
+    <div class="modal-body">
+      <div class="canvas-wrap photo-canvas">
+        <img id="checkImg" alt="Photo under review">
+        <canvas id="checkOverlay"></canvas>
+      </div>
+      <p class="photo-verdict" id="checkVerdict" aria-live="polite"></p>
+
+      <footer class="modal-foot">
+        <button type="button" class="btn btn-ghost" data-close>Back</button>
       </footer>
     </div>
   </div>

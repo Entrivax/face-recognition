@@ -235,6 +235,26 @@ func (d *DB) ThumbFile(personID string) string {
 	return ""
 }
 
+// ClearThumbnail removes the person's face thumbnail sidecar and clears the
+// recorded Thumb/ThumbSrc fields. The sidecar file removal is best-effort.
+// Used when the thumbnail's source photo is deleted from the person and no
+// other photo can regenerate it.
+func (d *DB) ClearThumbnail(personID string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, p := range d.data.People {
+		if p.ID == personID {
+			if p.Thumb != "" {
+				_ = os.Remove(filepath.Join(d.ThumbDir(), p.Thumb)) // best-effort
+			}
+			p.Thumb = ""
+			p.ThumbSrc = ""
+			return d.saveLocked()
+		}
+	}
+	return fmt.Errorf("person id %q not found", personID)
+}
+
 // RemovePhoto deletes a single photo from a person.
 func (d *DB) RemovePhoto(name, relPath string) (bool, error) {
 	d.mu.Lock()

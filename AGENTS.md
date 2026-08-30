@@ -185,6 +185,14 @@ command hits a permission error.
   fail an enrollment. Missing thumbnails are backfilled by rescans without
   re-embedding. Thumbnail URLs carry a `?v=` cache-buster derived from
   `ThumbSrc`.
+- **Per-photo management** (photos-manager modal): `GET
+  /api/people/{name}/photos/{path}/detect` recognizes an enrolled photo's
+  faces for the UI's quality check (embeddings stripped, same rule as
+  `/api/recognize`); `DELETE /api/people/{name}/photos/{path}` removes the DB
+  entry + the file from `people/<Name>/`, and when the deleted photo was
+  `ThumbSrc`, regenerates the thumbnail from the first remaining photo that
+  still detects a face — or clears it (`db.ClearThumbnail`) when none does.
+  Deleting a person's last photo leaves the person enrolled with 0 photos.
 - **onnxrt memory discipline**: every `OrtValue`/buffer allocated in the C shim
   is freed (tensor data via `ort_free`, sessions via `ort_close`). If you extend
   the shim, keep the ownership rules in `onnxrt.h` accurate and re-run the
