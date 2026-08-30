@@ -53,7 +53,23 @@ internal/
   db/db.go               JSON face DB (data/embeddings.json), CRUD, atomic saves
   enroll/enroll.go       scan people/ → embeddings (incremental by content hash)
   api/api.go             REST handlers; depends on an Engine INTERFACE (testable)
-  web/web.go + static/   embedded single-page UI (go:embed, no build step)
+  web/web.go             serves the embedded UI (go:embed static, no build step)
+  web/static/index.html  single page; loads /js/main.js as an ES module
+  web/static/style.css   all styling
+  web/static/app.js      1-line compat shim (import "/js/main.js") for the old URL
+  web/static/js/         the front-end, native ES modules (no bundler):
+    main.js              entry: health, rescan, Escape stack, Tab traps, boot
+    dom.js               every getElementById lookup, exported as one `el` object
+    util.js              showToast, escapeHtml, fmtSize, initials
+    api.js               fetch wrappers for /api/* (422-on-enroll not thrown)
+    state.js             the one cross-module value (peopleNames)
+    overlay.js           shared drawFaces canvas renderer (corner brackets)
+    recognize.js         main stage: dropzone, results list, overlay
+    people.js            enrolled-people list + remove
+    photos.js            photos-manager modal (grid + detail, add/delete/avatar)
+    enroll.js            enroll modal + pre-submit face-check chain
+    facecheck.js         enlarged face-check viewer (read-only)
+    paste.js             clipboard routing (enroll → photos → stage)
 third_party/onnxruntime/ ORT C header + libonnxruntime.so (via `make ort`)
 models/                  det_10g.onnx, w600k_r50.onnx  (gitignored; downloaded)
 people/<Name>/*.jpg      the dataset — 11 people, 38 photos
@@ -161,6 +177,14 @@ command hits a permission error.
 
 - **Minimal Go deps** — stdlib + `x/image` only. Image crop/resize/warp are
   hand-rolled in `engine.go`; reuse them.
+- **Front-end stays build-free** — native ES modules under `web/static/js/`,
+  no bundler/transpiler/npm. `index.html` loads `/js/main.js` as
+  `<script type="module">`; the rest are plain `import`/`export`. Keep the
+  module graph acyclic: `people`/`photos`/`enroll` never import each other —
+  cross-module refreshes go through `on*Change` callbacks wired in `main.js`,
+  and `facecheck` learns whether another modal is open via an injected
+  `onAnyModalOpen` callback. `/app.js` is a 1-line compat shim — don't delete
+  it (`TestIndexServed` still GETs it).
 - The engine is safe for concurrent use; a **single mutex** serialises CGO
   inference (matches ORT CPU single-stream semantics). Don't run sessions
   concurrently without checking ORT thread-safety.
