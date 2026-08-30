@@ -11,192 +11,192 @@
 </head>
 <body>
 <header class="topbar">
-  <div class="brand">
-    <span class="brand-mark" aria-hidden="true"></span>
-    <span class="brand-word">recogn</span>
-    <span class="brand-sub">face review console</span>
-  </div>
-  <div class="status" id="status">
-    <span class="status-dot" id="statusDot"></span>
-    <span id="statusText">connecting…</span>
-  </div>
+	<div class="brand">
+		<span class="brand-mark" aria-hidden="true"></span>
+		<span class="brand-word">recogn</span>
+		<span class="brand-sub">face review console</span>
+	</div>
+	<div class="status" id="status">
+		<span class="status-dot" id="statusDot"></span>
+		<span id="statusText">connecting…</span>
+	</div>
 </header>
 
 <main class="layout">
-  <!-- Left: capture / review -->
-  <section class="panel stage" aria-labelledby="stageTitle">
-    <div class="panel-head">
-      <h1 id="stageTitle">Inspect a photo</h1>
-      <p class="lede">Drop or paste an image to detect every face and match each against the enrolled people.</p>
-    </div>
+	<!-- Left: capture / review -->
+	<section class="panel stage" aria-labelledby="stageTitle">
+		<div class="panel-head">
+			<h1 id="stageTitle">Inspect a photo</h1>
+			<p class="lede">Drop or paste an image to detect every face and match each against the enrolled people.</p>
+		</div>
 
-    <div id="dropzone" class="dropzone" tabindex="0" role="button"
-         aria-label="Upload a photo to recognize faces">
-      <input id="fileInput" type="file" accept="image/*" hidden>
-      <div class="dz-empty" id="dzEmpty">
-        <svg viewBox="0 0 48 48" class="dz-icon" aria-hidden="true">
-          <rect x="6" y="10" width="36" height="28" rx="3" fill="none" stroke="currentColor" stroke-width="2"/>
-          <circle cx="19" cy="21" r="4" fill="none" stroke="currentColor" stroke-width="2"/>
-          <path d="M6 34l10-9 8 7 8-6 10 8" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
-        </svg>
-        <p class="dz-primary">Drop a photo here, or <span class="dz-browse">browse</span></p>
-        <p class="dz-hint">JPG, PNG, WebP or BMP — or paste from the clipboard (Ctrl+V)</p>
-      </div>
-      <div class="dz-preview" id="dzPreview" hidden>
-        <div class="canvas-wrap">
-          <img id="previewImg" alt="Uploaded photo preview">
-          <canvas id="overlay"></canvas>
-        </div>
-      </div>
-    </div>
+		<div id="dropzone" class="dropzone" tabindex="0" role="button"
+				 aria-label="Upload a photo to recognize faces">
+			<input id="fileInput" type="file" accept="image/*" hidden>
+			<div class="dz-empty" id="dzEmpty">
+				<svg viewBox="0 0 48 48" class="dz-icon" aria-hidden="true">
+					<rect x="6" y="10" width="36" height="28" rx="3" fill="none" stroke="currentColor" stroke-width="2"/>
+					<circle cx="19" cy="21" r="4" fill="none" stroke="currentColor" stroke-width="2"/>
+					<path d="M6 34l10-9 8 7 8-6 10 8" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+				</svg>
+				<p class="dz-primary">Drop a photo here, or <span class="dz-browse">browse</span></p>
+				<p class="dz-hint">JPG, PNG, WebP or BMP — or paste from the clipboard (Ctrl+V)</p>
+			</div>
+			<div class="dz-preview" id="dzPreview" hidden>
+				<div class="canvas-wrap">
+					<img id="previewImg" alt="Uploaded photo preview">
+					<canvas id="overlay"></canvas>
+				</div>
+			</div>
+		</div>
 
-    <div class="stage-actions">
-      <button id="clearBtn" class="btn btn-ghost" hidden>Clear</button>
-      <button id="againBtn" class="btn btn-ghost" hidden>Choose another</button>
-      <span class="stage-meta" id="stageMeta"></span>
-    </div>
+		<div class="stage-actions">
+			<button id="clearBtn" class="btn btn-ghost" hidden>Clear</button>
+			<button id="againBtn" class="btn btn-ghost" hidden>Choose another</button>
+			<span class="stage-meta" id="stageMeta"></span>
+		</div>
 
-    <div id="results" class="results" hidden>
-      <h2 class="results-title"><span id="resultCount">0</span> face(s) found</h2>
-      <ul id="faceList" class="face-list"></ul>
-    </div>
-  </section>
+		<div id="results" class="results" hidden>
+			<h2 class="results-title"><span id="resultCount">0</span> face(s) found</h2>
+			<ul id="faceList" class="face-list"></ul>
+		</div>
+	</section>
 
-  <!-- Right: enrolled people -->
-  <aside class="panel people" aria-labelledby="peopleTitle">
-    <div class="panel-head">
-      <h2 id="peopleTitle">Enrolled people</h2>
-      <p class="lede" id="peopleCount">Loading…</p>
-    </div>
+	<!-- Right: enrolled people -->
+	<aside class="panel people" aria-labelledby="peopleTitle">
+		<div class="panel-head">
+			<h2 id="peopleTitle">Enrolled people</h2>
+			<p class="lede" id="peopleCount">Loading…</p>
+		</div>
 
-    <div class="people-actions">
-      <button id="enrollBtn" class="btn btn-accent" aria-haspopup="dialog">Enroll new person</button>
-    </div>
+		<div class="people-actions">
+			<button id="enrollBtn" class="btn btn-accent" aria-haspopup="dialog">Enroll new person</button>
+		</div>
 
-    <ul id="peopleList" class="people-list"></ul>
+		<ul id="peopleList" class="people-list"></ul>
 
-    <div class="people-footer">
-      <button id="rescanBtn" class="btn btn-ghost" title="Re-scan the people/ folder on the server">
-        Rescan people folder
-      </button>
-    </div>
-  </aside>
+		<div class="people-footer">
+			<button id="rescanBtn" class="btn btn-ghost" title="Re-scan the people/ folder on the server">
+				Rescan people folder
+			</button>
+		</div>
+	</aside>
 </main>
 
 <!-- Enroll modal: pick a name, review the selected photos, then upload -->
 <div id="enrollModal" class="modal" hidden>
-  <div class="modal-backdrop" data-close></div>
-  <div class="modal-card" id="enrollCard" role="dialog" aria-modal="true" aria-labelledby="enrollTitle">
-    <header class="modal-head">
-      <div>
-        <p class="modal-eyebrow">enrollment</p>
-        <h2 id="enrollTitle">Enroll a new person</h2>
-      </div>
-      <button class="modal-close" type="button" data-close aria-label="Close">×</button>
-    </header>
+	<div class="modal-backdrop" data-close></div>
+	<div class="modal-card" id="enrollCard" role="dialog" aria-modal="true" aria-labelledby="enrollTitle">
+		<header class="modal-head">
+			<div>
+				<p class="modal-eyebrow">enrollment</p>
+				<h2 id="enrollTitle">Enroll a new person</h2>
+			</div>
+			<button class="modal-close" type="button" data-close aria-label="Close">×</button>
+		</header>
 
-    <form id="enrollForm" class="modal-body" novalidate>
-      <label class="field-label" for="enrollName">Name</label>
-      <input id="enrollName" type="text" placeholder="Person's name" autocomplete="off" spellcheck="false">
-      <p class="field-hint" id="enrollNameHint">Shown as the identity when their face is recognized.</p>
+		<form id="enrollForm" class="modal-body" novalidate>
+			<label class="field-label" for="enrollName">Name</label>
+			<input id="enrollName" type="text" placeholder="Person's name" autocomplete="off" spellcheck="false">
+			<p class="field-hint" id="enrollNameHint">Shown as the identity when their face is recognized.</p>
 
-      <div id="enrollDrop" class="enroll-drop" tabindex="0" role="button"
-           aria-label="Add photos — drag and drop, paste, or press Enter to browse">
-        <svg viewBox="0 0 48 48" class="edz-icon" aria-hidden="true">
-          <path d="M15 8h-5a2 2 0 0 0-2 2v5M33 8h5a2 2 0 0 1 2 2v5M15 40h-5a2 2 0 0 1-2-2v-5M33 40h5a2 2 0 0 0 2-2v-5"
-                fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
-          <circle cx="24" cy="21" r="5" fill="none" stroke="currentColor" stroke-width="2"/>
-          <path d="M15 36c2-4.5 5.4-6 9-6s7 1.6 9 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-        </svg>
-        <p class="edz-primary">Drag &amp; drop, paste, or <span class="edz-browse">browse</span></p>
-        <p class="edz-hint">Nothing uploads until you review and confirm</p>
-        <input id="enrollPhotos" type="file" accept="image/*" multiple hidden>
-      </div>
+			<div id="enrollDrop" class="enroll-drop" tabindex="0" role="button"
+					 aria-label="Add photos — drag and drop, paste, or press Enter to browse">
+				<svg viewBox="0 0 48 48" class="edz-icon" aria-hidden="true">
+					<path d="M15 8h-5a2 2 0 0 0-2 2v5M33 8h5a2 2 0 0 1 2 2v5M15 40h-5a2 2 0 0 1-2-2v-5M33 40h5a2 2 0 0 0 2-2v-5"
+								fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+					<circle cx="24" cy="21" r="5" fill="none" stroke="currentColor" stroke-width="2"/>
+					<path d="M15 36c2-4.5 5.4-6 9-6s7 1.6 9 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+				</svg>
+				<p class="edz-primary">Drag &amp; drop, paste, or <span class="edz-browse">browse</span></p>
+				<p class="edz-hint">Nothing uploads until you review and confirm</p>
+				<input id="enrollPhotos" type="file" accept="image/*" multiple hidden>
+			</div>
 
-      <ul id="enrollThumbs" class="enroll-thumbs" hidden></ul>
-      <p class="enroll-meta" id="enrollMeta">No photos selected yet.</p>
+			<ul id="enrollThumbs" class="enroll-thumbs" hidden></ul>
+			<p class="enroll-meta" id="enrollMeta">No photos selected yet.</p>
 
-      <footer class="modal-foot">
-        <button type="button" class="btn btn-ghost" data-close>Cancel</button>
-        <button type="submit" id="enrollSubmit" class="btn btn-accent" disabled>Enroll photos</button>
-      </footer>
-    </form>
-  </div>
+			<footer class="modal-foot">
+				<button type="button" class="btn btn-ghost" data-close>Cancel</button>
+				<button type="submit" id="enrollSubmit" class="btn btn-accent" disabled>Enroll photos</button>
+			</footer>
+		</form>
+	</div>
 </div>
 
 <!-- Photos modal: manage a person's photos — add, remove, and inspect the
-     detected face(s) on each one before judging its quality -->
+		 detected face(s) on each one before judging its quality -->
 <div id="photoModal" class="modal" hidden>
-  <div class="modal-backdrop" data-close></div>
-  <div class="modal-card wide" id="photoCard" role="dialog" aria-modal="true" aria-labelledby="photoTitle">
-    <header class="modal-head">
-      <div>
-        <p class="modal-eyebrow">photos</p>
-        <h2 id="photoTitle">Photos</h2>
-      </div>
-      <button class="modal-close" type="button" data-close aria-label="Close">×</button>
-    </header>
+	<div class="modal-backdrop" data-close></div>
+	<div class="modal-card wide" id="photoCard" role="dialog" aria-modal="true" aria-labelledby="photoTitle">
+		<header class="modal-head">
+			<div>
+				<p class="modal-eyebrow">photos</p>
+				<h2 id="photoTitle">Photos</h2>
+			</div>
+			<button class="modal-close" type="button" data-close aria-label="Close">×</button>
+		</header>
 
-    <div class="modal-body">
-      <p class="field-hint" id="photoHint">Loading photos…</p>
+		<div class="modal-body">
+			<p class="field-hint" id="photoHint">Loading photos…</p>
 
-      <!-- grid view -->
-      <div id="photoGridView">
-        <ul id="photoGrid" class="photo-grid"></ul>
-        <div id="photoAdd" class="photo-add" tabindex="0" role="button"
-             aria-label="Add photos — drag and drop, paste, or press Enter to browse">
-          <p class="pa-primary">Drag &amp; drop, paste, or <span class="pa-browse">browse</span> to add photos</p>
-          <p class="pa-hint">Photos upload immediately and become part of this person's dataset</p>
-          <input id="photoFiles" type="file" accept="image/*" multiple hidden>
-        </div>
-      </div>
+			<!-- grid view -->
+			<div id="photoGridView">
+				<ul id="photoGrid" class="photo-grid"></ul>
+				<div id="photoAdd" class="photo-add" tabindex="0" role="button"
+						 aria-label="Add photos — drag and drop, paste, or press Enter to browse">
+					<p class="pa-primary">Drag &amp; drop, paste, or <span class="pa-browse">browse</span> to add photos</p>
+					<p class="pa-hint">Photos upload immediately and become part of this person's dataset</p>
+					<input id="photoFiles" type="file" accept="image/*" multiple hidden>
+				</div>
+			</div>
 
-      <!-- detail view: photo with detected faces drawn over it -->
-      <div id="photoDetailView" hidden>
-        <button type="button" class="photo-back" id="photoBackBtn">← All photos</button>
-        <div class="canvas-wrap photo-canvas">
-          <img id="photoDetailImg" alt="Enrolled photo">
-          <canvas id="photoOverlay"></canvas>
-        </div>
-        <p class="photo-verdict" id="photoVerdict" aria-live="polite"></p>
-        <div class="photo-actions">
-          <button type="button" class="btn btn-ghost" id="photoThumbBtn">Set as avatar</button>
-          <button type="button" class="btn btn-ghost photo-remove" id="photoDelBtn">Remove photo</button>
-        </div>
-      </div>
+			<!-- detail view: photo with detected faces drawn over it -->
+			<div id="photoDetailView" hidden>
+				<button type="button" class="photo-back" id="photoBackBtn">← All photos</button>
+				<div class="canvas-wrap photo-canvas">
+					<img id="photoDetailImg" alt="Enrolled photo">
+					<canvas id="photoOverlay"></canvas>
+				</div>
+				<p class="photo-verdict" id="photoVerdict" aria-live="polite"></p>
+				<div class="photo-actions">
+					<button type="button" class="btn btn-ghost" id="photoThumbBtn">Set as avatar</button>
+					<button type="button" class="btn btn-ghost photo-remove" id="photoDelBtn">Remove photo</button>
+				</div>
+			</div>
 
-      <footer class="modal-foot">
-        <button type="button" class="btn btn-ghost" data-close>Close</button>
-      </footer>
-    </div>
-  </div>
+			<footer class="modal-foot">
+				<button type="button" class="btn btn-ghost" data-close>Close</button>
+			</footer>
+		</div>
+	</div>
 </div>
 
 <!-- Face-check viewer: enlarged preview with detected faces, used by the
-     enroll modal to inspect pending photos before they are sent -->
+		 enroll modal to inspect pending photos before they are sent -->
 <div id="checkModal" class="modal overlay-modal" hidden>
-  <div class="modal-backdrop" data-close></div>
-  <div class="modal-card" id="checkCard" role="dialog" aria-modal="true" aria-labelledby="checkTitle">
-    <header class="modal-head">
-      <div>
-        <p class="modal-eyebrow">face check</p>
-        <h2 id="checkTitle">Detected faces</h2>
-      </div>
-      <button class="modal-close" type="button" data-close aria-label="Close">×</button>
-    </header>
+	<div class="modal-backdrop" data-close></div>
+	<div class="modal-card" id="checkCard" role="dialog" aria-modal="true" aria-labelledby="checkTitle">
+		<header class="modal-head">
+			<div>
+				<p class="modal-eyebrow">face check</p>
+				<h2 id="checkTitle">Detected faces</h2>
+			</div>
+			<button class="modal-close" type="button" data-close aria-label="Close">×</button>
+		</header>
 
-    <div class="modal-body">
-      <div class="canvas-wrap photo-canvas">
-        <img id="checkImg" alt="Photo under review">
-        <canvas id="checkOverlay"></canvas>
-      </div>
-      <p class="photo-verdict" id="checkVerdict" aria-live="polite"></p>
+		<div class="modal-body">
+			<div class="canvas-wrap photo-canvas">
+				<img id="checkImg" alt="Photo under review">
+				<canvas id="checkOverlay"></canvas>
+			</div>
+			<p class="photo-verdict" id="checkVerdict" aria-live="polite"></p>
 
-      <footer class="modal-foot">
-        <button type="button" class="btn btn-ghost" data-close>Back</button>
-      </footer>
-    </div>
-  </div>
+			<footer class="modal-foot">
+				<button type="button" class="btn btn-ghost" data-close>Back</button>
+			</footer>
+		</div>
+	</div>
 </div>
 
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
