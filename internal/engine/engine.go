@@ -14,6 +14,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 
 	_ "golang.org/x/image/bmp"
 	_ "golang.org/x/image/webp"
@@ -31,13 +32,17 @@ type Face struct {
 	Name       string  `json:"name"`       // matched identity, or "unknown"
 	PersonID   string  `json:"person_id"`  // matched person's ID, or ""
 	Confidence float64 `json:"confidence"` // best cosine similarity 0..1
+	// Matches lists every enrolled person whose best similarity cleared the
+	// threshold, ranked best-first. Useful for spotting near-tied identities
+	// (possible duplicate people). Empty when nothing matched.
+	Matches []Match `json:"matches,omitempty"`
 }
 
 // Match describes one candidate identity for a face.
 type Match struct {
-	PersonID string
-	Name     string
-	Score    float64
+	PersonID string  `json:"person_id"`
+	Name     string  `json:"name"`
+	Score    float64 `json:"score"`
 }
 
 // KnownPerson is the engine-facing view of an enrolled identity.
@@ -133,19 +138,55 @@ func (e *Engine) EmbedFace(imgBytes []byte, f Face) ([]float32, error) {
 // enrolled embedding of every person.
 func (e *Engine) MatchEmbedding(emb []float32) (Match, bool) {
 	best := Match{Score: -1}
-	for _, p := range e.known {
-		for _, pe := range p.Embeddings {
-			s := Cosine(emb, pe)
-			if s > best.Score {
-				best = Match{PersonID: p.ID, Name: p.Name, Score: s}
-			}
+	for _, m := range e.bestPerPerson(emb) {
+		if m.Score > best.Score {
+			best = m
 		}
 	}
 	return best, best.Score >= e.thresh
 }
 
+// bestPerPerson computes every known person's best cosine similarity to emb
+// (one entry per person, regardless of threshold).
+func (e *Engine) bestPerPerson(emb []float32) map[string]Match {
+	best := make(map[string]Match, len(e.known))
+	for _, p := range e.known {
+		m := Match{PersonID: p.ID, Name: p.Name, Score: -1}
+		for _, pe := range p.Embeddings {
+			if s := Cosine(emb, pe); s > m.Score {
+				m.Score = s
+			}
+		}
+		best[p.ID] = m
+	}
+	return best
+}
+
+// MatchAll returns every enrolled person whose best cosine similarity to emb
+// clears the threshold, ranked best-first (ties broken by name). One entry
+// per person: a person with several enrolled photos contributes only their
+// best-scoring embedding.
+func (e *Engine) MatchAll(emb []float32) []Match {
+	all := e.bestPerPerson(emb)
+	out := make([]Match, 0, len(all))
+	for _, m := range all {
+		if m.Score >= e.thresh {
+			out = append(out, m)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Score != out[j].Score {
+			return out[i].Score > out[j].Score
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
 // Recognize runs the full pipeline on one image: detect every face, embed and
-// match each, and annotate the returned faces with identities.
+// match each, and annotate the returned faces with identities. Each face also
+// carries Matches: every enrolled person above the threshold, ranked — useful
+// for spotting near-tied identities (possible duplicate people).
 func (e *Engine) Recognize(imgBytes []byte) ([]Face, error) {
 	faces, err := e.inf.detect(imgBytes)
 	if err != nil {
@@ -159,12 +200,22 @@ func (e *Engine) Recognize(imgBytes []byte) ([]Face, error) {
 			continue
 		}
 		faces[i].Embedding = emb
-		m, ok := e.MatchEmbedding(emb)
-		faces[i].Confidence = math.Max(0, m.Score)
-		if ok {
-			faces[i].Name = m.Name
-			faces[i].PersonID = m.PersonID
+		matches := e.MatchAll(emb)
+		faces[i].Matches = matches
+		if len(matches) > 0 {
+			faces[i].Confidence = math.Max(0, matches[0].Score)
+			faces[i].Name = matches[0].Name
+			faces[i].PersonID = matches[0].PersonID
 		} else {
+			// Nothing cleared the threshold; keep the near-miss score as the
+			// displayed confidence hint.
+			best := -1.0
+			for _, m := range e.bestPerPerson(emb) {
+				if m.Score > best {
+					best = m.Score
+				}
+			}
+			faces[i].Confidence = math.Max(0, best)
 			faces[i].Name = "unknown"
 		}
 	}

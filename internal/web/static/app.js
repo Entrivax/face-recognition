@@ -148,10 +148,27 @@
       const li = document.createElement("li");
       li.className = "face-row" + (f.name === "unknown" ? " unknown" : "");
       const conf = Math.round((f.confidence || 0) * 100);
+      // All identities above the threshold, ranked — two near-tied entries
+      // hint at duplicate people in the database.
+      const matches = f.matches || [];
+      let matchesHtml = "";
+      if (matches.length >= 2) {
+        const near = matches[0].score - matches[1].score <= 0.05;
+        matchesHtml = `
+          <ul class="face-matches${near ? " ambiguous" : ""}">
+            ${matches.map((m, idx) => `
+              <li class="${idx === 0 ? "top" : ""}">
+                <span class="fm-name">${escapeHtml(m.name)}</span>
+                <span class="fm-score">${Math.round((m.score || 0) * 100)}%</span>
+              </li>`).join("")}
+          </ul>
+          ${near ? `<p class="face-dup-hint">scores nearly tied — possible duplicate people?</p>` : ""}`;
+      }
       li.innerHTML = `
         <span class="face-index">${String(i + 1).padStart(2, "0")}</span>
         <div>
           <div class="face-name">${escapeHtml(f.name)}</div>
+          ${matchesHtml}
         </div>
         <div class="face-right">
           <span class="face-conf">${conf}%</span>

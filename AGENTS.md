@@ -172,6 +172,10 @@ command hits a permission error.
   a warning, never stored. DB photo paths are **basenames relative to the
   person's folder** (folder scans and API uploads both derive the same name);
   API uploads additionally persist the image bytes into `people/<Name>/`.
+  `Recognize` also fills `Face.Matches`: every person above the threshold,
+  ranked best-first (one entry per person, per-person best) — the UI lists
+  them to help spot duplicate people; the single best match still drives
+  `Name`/`PersonID`/`Confidence`.
 - **Face thumbnails** are a DB sidecar: `thumbs/<personID>.jpg` next to
   `embeddings.json` (see `db.SetThumbnail`/`ThumbFile`, crop via
   `engine.FaceThumb`). Auto-generated at first enrollment only (enrollment

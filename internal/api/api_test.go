@@ -96,7 +96,11 @@ func TestHealth(t *testing.T) {
 
 func TestRecognizeMultiFace(t *testing.T) {
 	eng := &stubEngine{faces: []engine.Face{
-		{BBox: [4]float64{10, 10, 50, 60}, Name: "Alice", PersonID: "alice", Confidence: 0.9, Score: 0.8},
+		{BBox: [4]float64{10, 10, 50, 60}, Name: "Alice", PersonID: "alice", Confidence: 0.9, Score: 0.8,
+			Matches: []engine.Match{
+				{PersonID: "alice", Name: "Alice", Score: 0.9},
+				{PersonID: "bob", Name: "Bob", Score: 0.55},
+			}},
 		{BBox: [4]float64{100, 100, 40, 50}, Name: "unknown", Confidence: 0.3, Score: 0.7},
 	}}
 	s, _ := newTestServer(t, eng)
@@ -122,6 +126,17 @@ func TestRecognizeMultiFace(t *testing.T) {
 	}
 	if resp.Faces[0].Name != "Alice" || resp.Faces[1].Name != "unknown" {
 		t.Errorf("unexpected faces: %+v", resp.Faces)
+	}
+	// Ranked candidate list passes through; embeddings never do.
+	if len(resp.Faces[0].Matches) != 2 || resp.Faces[0].Matches[0].Name != "Alice" ||
+		resp.Faces[0].Matches[1].Name != "Bob" {
+		t.Errorf("unexpected matches: %+v", resp.Faces[0].Matches)
+	}
+	if len(resp.Faces[1].Matches) != 0 {
+		t.Errorf("unknown face should have no matches, got %+v", resp.Faces[1].Matches)
+	}
+	if strings.Contains(rec.Body.String(), "embedding") {
+		t.Errorf("response must not leak embeddings")
 	}
 }
 

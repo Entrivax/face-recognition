@@ -155,7 +155,7 @@ re-scan the `people/` folder.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/api/recognize` | multipart `image` → `{count, faces:[{bbox,name,person_id,confidence,score,landmarks}]}` |
+| `POST` | `/api/recognize` | multipart `image` → `{count, faces:[{bbox,name,person_id,confidence,score,landmarks,matches}]}` — `matches` ranks every identity above the threshold (best per person); near-tied top scores hint at duplicate people |
 | `GET`  | `/api/people` | list enrolled people + photo counts (incl. `thumb` URL when a face thumbnail exists) |
 | `GET`  | `/api/people/{name}` | one person's enrolled photos (`thumb_src` = photo the avatar comes from) |
 | `POST` | `/api/people/{name}/enroll` | add photo(s) (field `images`) for a new/existing person; each enrolled image is also saved into `people/<name>/` |
@@ -204,6 +204,11 @@ poisoning the database.
   positives, more `unknown`s), lower it to be more permissive. On this dataset
   held-out photos of the right person score ~0.47–0.80 while other people
   score <0.20, so `0.45` has comfortable margin.
+- **Spotting duplicate people** — recognition returns *all* identities above
+  the threshold per face (the web UI lists them under the face's name). If two
+  different people score nearly the same on a photo, they are probably the
+  same person enrolled twice; the UI flags near-ties (within 0.05) with a
+  hint.
 - **Multiple photos per person** improve robustness — enrollment keeps every
   photo's embedding and matches against the best.
 - **Concurrency** — inference is serialized through a single mutex around the
