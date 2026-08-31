@@ -21,9 +21,10 @@ executing the two ONNX models, done in-process through `libonnxruntime` via a
 small CGO wrapper. **There is no Python and no sidecar** (both were removed after
 the CGO backend proved output-parity).
 
-- **Go**: CLI, HTTP API, web UI, the JSON face DB, enrollment orchestration,
-  face alignment (Umeyama), matching (cosine), AND the detector's
-  pre/post-processing (letterbox, CHW tensor build, SCRFD decode, NMS).
+- **Go**: CLI, HTTP API, web UI, the face DB (bbolt + JSON interchange),
+  enrollment orchestration, face alignment (Umeyama), matching (cosine), AND
+  the detector's pre/post-processing (letterbox, CHW tensor build, SCRFD
+  decode, NMS).
 - **CGO** (`internal/onnxrt`): a thin shim over the ORT C API — open a session,
   run one float tensor, read output tensors. All `OrtApi` calls live in
   `onnxrt.c`; the Go side sees plain `[]float32`.
@@ -42,7 +43,7 @@ landmarks onto the ArcFace 112×112 reference template (`engine.go`).
 ## Layout
 
 ```
-main.go                  CLI entry: enroll | recognize | people | serve
+main.go                  CLI entry: enroll | recognize | people | export | serve
 internal/
   config/config.go       paths, threshold; settings via RECOGN_* env vars
   onnxrt/onnxrt.{c,h,go} CGO binding to the ONNX Runtime C API
@@ -50,7 +51,8 @@ internal/
   engine/preprocess.go   image → CHW float tensor (letterbox + normalise)
   engine/scrfd.go        SCRFD output decode + NMS (pure Go)
   engine/cgo_backend.go  inferencer impl using onnxrt (mutex-serialised)
-  db/db.go               JSON face DB (data/embeddings.json), CRUD, atomic saves
+  db/db.go               face DB: bbolt store (data/faces.db) + JSON
+                         interchange import/export (embeddings.json), CRUD
   enroll/enroll.go       scan people/ → embeddings (incremental by content hash)
   api/api.go             REST handlers; depends on an Engine INTERFACE (testable)
   web/web.go             serves the embedded UI (go:embed static, no build step)
@@ -73,7 +75,9 @@ internal/
 third_party/onnxruntime/ ORT C header + libonnxruntime.so (via `make ort`)
 models/                  det_10g.onnx, w600k_r50.onnx  (gitignored; downloaded)
 people/<Name>/*.jpg      the dataset — 11 people, 38 photos
-data/embeddings.json     generated face DB (gitignored)
+data/faces.db            generated face DB (bbolt, gitignored)
+data/embeddings.json     JSON interchange copy (gitignored): auto-imported when
+                         the store is empty; written by `recogn export`
 data/thumbs/             face thumbnail sidecars, one per person (gitignored)
 Dockerfile, docker-compose.yml, .dockerignore
 Makefile, README.md, scripts/dataset-test.sh
@@ -115,10 +119,10 @@ export GOPATH=$PWD/.gopath GOMODCACHE=$PWD/.gomodcache GOCACHE=$PWD/.gocache \
   network once). The Go `#cgo` directive bakes an rpath of
   `$ORIGIN/third_party/onnxruntime/lib`, so the binary runs in place; keep
   `third_party/` next to the binary.
-- `GOPROXY=off` works because the single Go module dep (`golang.org/x/image`)
-  is vendored in the local module cache; adding a new Go dep needs network
-  (`GOPROXY=https://proxy.golang.org,direct`) + in-workspace `GOPATH` so the
-  checksum db is writable.
+- `GOPROXY=off` works because the Go module deps (`golang.org/x/image`,
+  `go.etcd.io/bbolt`) are in the local module cache; adding a new Go dep needs
+  network (`GOPROXY=https://proxy.golang.org,direct`) + in-workspace `GOPATH`
+  so the checksum db is writable.
 - Flags are **per-subcommand** (`flag.NewFlagSet`) and Go stops flag parsing at
   the first positional arg: `./recogn recognize --json img.jpg` ✓, `... img.jpg --json` ✗.
 - Not a git repo yet — `git init` if you want history.
@@ -175,8 +179,8 @@ command hits a permission error.
 
 ## Conventions to keep
 
-- **Minimal Go deps** — stdlib + `x/image` only. Image crop/resize/warp are
-  hand-rolled in `engine.go`; reuse them.
+- **Minimal Go deps** — stdlib + `x/image` + `bbolt` (DB) only. Image
+  crop/resize/warp are hand-rolled in `engine.go`; reuse them.
 - **Front-end stays build-free** — native ES modules under `web/static/js/`,
   no bundler/transpiler/npm. `index.html` loads `/js/main.js` as
   `<script type="module">`; the rest are plain `import`/`export`. Keep the
@@ -188,7 +192,19 @@ command hits a permission error.
 - The engine is safe for concurrent use; a **single mutex** serialises CGO
   inference (matches ORT CPU single-stream semantics). Don't run sessions
   concurrently without checking ORT thread-safety.
-- DB writes are atomic (temp file + rename) and mutex-guarded — preserve this.
+- **DB storage is bbolt** (`data/faces.db`, dep `go.etcd.io/bbolt`) with an
+  in-memory mirror behind the DB RWMutex — reads never touch the file. Every
+  mutating method commits a targeted `bolt.Update` FIRST, then updates the
+  cache, so a failed write leaves memory and disk consistent. The bbolt file
+  holds an exclusive lock: a second `recogn` process on the same DB fails at
+  `Open` (tests must `Close()` before reopening the same path — same-process
+  double-open deadlocks). **JSON interchange** (`embeddings.json` next to the
+  DB): imported once per empty store (parse failure fails `Open` loudly;
+  the file is never renamed, so deleting `faces.db` re-imports it — the JSON
+  can be stale relative to the store, hence the stderr hint) and written by
+  `db.Export`/`recogn export` (people name-sorted for byte-stable diffs).
+  Photo records on disk: `uvarint hashLen + hash + uvarint dim + dim×float32
+  LE` (`encodePhoto`/`decodePhoto`; decode rejects size mismatches).
 - Embeddings are stripped from API/CLI JSON output (`Face.Embedding` is `json:"-"`
   or nil-ed) — don't leak 512-float arrays to clients.
 - Enrollment stores **one embedding per photo** (largest face) and matches
@@ -201,7 +217,7 @@ command hits a permission error.
   them to help spot duplicate people; the single best match still drives
   `Name`/`PersonID`/`Confidence`.
 - **Face thumbnails** are a DB sidecar: `thumbs/<personID>.jpg` next to
-  `embeddings.json` (see `db.SetThumbnail`/`ThumbFile`, crop via
+  the DB file (`data/thumbs/`; see `db.SetThumbnail`/`ThumbFile`, crop via
   `engine.FaceThumb`). Auto-generated at first enrollment only (enrollment
   callers skip when one exists); the API's `POST /api/people/{name}/thumbnail`
   re-selects the source photo, which **overwrites** the sidecar and records it

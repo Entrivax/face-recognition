@@ -14,7 +14,7 @@ type Config struct {
 	PeopleDir string  // root of per-person photo folders
 	ModelsDir string  // directory holding the ONNX models
 	DataDir   string  // directory for the generated face database
-	DBPath    string  // path to embeddings.json
+	DBPath    string  // path to the bbolt face database file (faces.db)
 	DetModel  string  // SCRFD detector ONNX filename (inside ModelsDir)
 	EmbModel  string  // ArcFace embedder ONNX filename (inside ModelsDir)
 	Threshold float64 // cosine-similarity threshold for a positive match
@@ -34,7 +34,7 @@ func Default() Config {
 		Threshold: envFloat("RECOGN_THRESHOLD", 0.45),
 		Addr:      envOr("RECOGN_ADDR", ":8080"),
 	}
-	cfg.DBPath = filepath.Join(cfg.DataDir, "embeddings.json")
+	cfg.DBPath = filepath.Join(cfg.DataDir, "faces.db")
 	return cfg
 }
 

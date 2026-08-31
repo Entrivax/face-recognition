@@ -25,7 +25,7 @@ shared library. Everything runs on CPU.
 
 ```
 recogn                 the single binary (built)
-main.go                CLI entry: enroll | recognize | people | serve
+main.go                CLI entry: enroll | recognize | people | export | serve
 internal/
   config/              paths, threshold, env/flags
   onnxrt/              minimal CGO binding to the ONNX Runtime C API
@@ -33,7 +33,7 @@ internal/
     preprocess.go        image → CHW float tensor (SCRFD + ArcFace)
     scrfd.go             SCRFD output decode + NMS
     cgo_backend.go       in-process inference backend (onnxrt)
-  db/                  JSON face database (data/embeddings.json)
+  db/                  face database: bbolt store (data/faces.db) + JSON import/export
   enroll/              people/ folder scanning + embedding
   api/                 REST API handlers
   web/                 embedded web UI (static/)
@@ -41,7 +41,9 @@ third_party/onnxruntime/  ORT C header + libonnxruntime (via `make ort`)
 third_party/onnxruntime-win/  Windows ORT C header + onnxruntime.dll (via `make ort-win`)
 models/                det_10g.onnx, w600k_r50.onnx  (downloaded)
 people/                <Person Name>/*.jpg ...       (your dataset)
-data/embeddings.json   generated face DB
+data/faces.db          generated face DB (bbolt, single file)
+data/embeddings.json   JSON interchange copy — auto-imported when the DB is
+                       empty, written by `recogn export`
 ```
 
 ## Run with Docker (easiest)
@@ -188,8 +190,7 @@ curl -F "image=@photo.jpg" http://localhost:8080/api/recognize
 
 ## Expanding the database
 
-The database is a single editable JSON file, `data/embeddings.json`. To add
-someone new, either:
+To add someone new, either:
 
 1. **Drop a folder** `people/<Their Name>/` with a few photos and run
    `./recogn enroll` (or `POST /api/enroll`), **or**
@@ -198,6 +199,17 @@ someone new, either:
    (content-derived name, so re-uploading the same photo is idempotent) and
    its DB entry points at that file — a later `POST /api/enroll` rescan
    recognizes it as already enrolled.
+
+**Storage**: the database lives in a single bbolt file, `data/faces.db` —
+writes touch only the changed person/photo record (no whole-file rewrite),
+startup loads it directly, and a file lock refuses two `recogn` processes on
+the same DB. For humans and backups there is a JSON interchange file,
+`data/embeddings.json`: it is **imported automatically whenever the store is
+empty** (so deleting `faces.db` and restarting restores the last exported
+snapshot — the JSON is never renamed or consumed), and `./recogn export
+[--out path]` **writes** the current database to it. The JSON is not kept in
+sync by day-to-day enrollment; run `recogn export` to refresh it. Corrupt
+JSON fails startup loudly rather than silently starting empty.
 
 **Face thumbnails**: the first enrolled photo that yields a face also produces
 a square face-crop thumbnail, stored as a sidecar next to the database file

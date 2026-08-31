@@ -94,7 +94,7 @@ ort:
 dataset-test: ort
 	./scripts/dataset-test.sh
 
-# Build, then enroll the people/ dataset into data/embeddings.json.
+# Build, then enroll the people/ dataset into data/faces.db.
 enroll: build
 	./$(BINARY) enroll
 

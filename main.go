@@ -7,6 +7,7 @@
 //	recogn enroll [--force]            build/rebuild the face DB from people/
 //	recogn recognize <image...>        identify faces in photos
 //	recogn people                      list enrolled identities
+//	recogn export [--out path]         write the face database as JSON
 //	recogn serve [--addr :8080]        start the REST API + web UI
 package main
 
@@ -60,6 +61,11 @@ func main() {
 		jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 		cfg, _ := parseFlags(fs, rest)
 		must(runPeople(cfg, *jsonOut))
+	case "export":
+		fs := newFlagSet("export")
+		out := fs.String("out", "", "output path for the JSON export (default: embeddings.json next to the database)")
+		cfg, _ := parseFlags(fs, rest)
+		must(runExport(cfg, *out))
 	case "serve":
 		fs := newFlagSet("serve")
 		cfg, set := parseFlags(fs, rest)
@@ -105,13 +111,14 @@ Usage:
                                        (--draw: write annotated copies — a .jpg path for a
                                        single image, or a directory for one copy per image)
   recogn people [--json]               list enrolled identities
+  recogn export [--out path]           write the face database as JSON (embeddings.json)
   recogn serve [--addr :8080]          start the REST API and web UI
 
 Shared flags (per subcommand):
   -addr string        listen address for serve (default ":8080")
   -threshold float    cosine-similarity threshold 0..1 (default 0.45)
   -people string      people dataset directory (default ./people)
-  -db string          face database path (default ./data/embeddings.json)
+  -db string          face database path (default ./data/faces.db)
 
 Dataset layout:
   people/<Person Name>/*.{jpg,jpeg,png,webp,bmp}
@@ -171,6 +178,7 @@ func runEnroll(cfg config.Config, force, prune, thresholdSet bool) error {
 		return err
 	}
 	defer eng.Close()
+	defer database.Close()
 
 	fmt.Printf("Enrolling from %s (model warmup may take a moment)...\n", cfg.PeopleDir)
 	if err := eng.Ping(); err != nil {
@@ -218,6 +226,7 @@ func runRecognize(cfg config.Config, images []string, jsonOut bool, drawArg stri
 		return err
 	}
 	defer eng.Close()
+	defer database.Close()
 	if len(database.People()) == 0 {
 		fmt.Fprintln(os.Stderr, "warning: face database is empty — run 'recogn enroll' first")
 	}
@@ -344,6 +353,7 @@ func runPeople(cfg config.Config, jsonOut bool) error {
 	if err != nil {
 		return err
 	}
+	defer database.Close()
 	people := database.People()
 	if jsonOut {
 		enc := json.NewEncoder(os.Stdout)
@@ -361,12 +371,28 @@ func runPeople(cfg config.Config, jsonOut bool) error {
 	return nil
 }
 
+func runExport(cfg config.Config, out string) error {
+	database, err := db.Open(cfg.DBPath)
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+	path, err := database.ExportTo(out)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Exported %d people (%d embeddings) → %s\n",
+		len(database.People()), countEmbeddings(database), path)
+	return nil
+}
+
 func runServe(cfg config.Config, thresholdSet bool) error {
 	eng, database, err := openEngine(cfg, thresholdSet)
 	if err != nil {
 		return err
 	}
 	defer eng.Close()
+	defer database.Close()
 
 	// Auto-enroll from people/ if the DB is empty so the server is useful on
 	// first run without a separate enroll step.
