@@ -2,6 +2,7 @@ package db
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -102,6 +103,109 @@ func TestRemovePersonAndPhoto(t *testing.T) {
 	ok, _ = d.RemovePerson("A")
 	if ok {
 		t.Errorf("expected ok=false removing missing person")
+	}
+}
+
+func TestRenamePerson(t *testing.T) {
+	d := openTemp(t)
+	_ = d.AddPhoto("Alice", "a/1.jpg", []byte("img"), []float32{1})
+	_ = d.AddPhoto("Bob", "b/1.jpg", []byte("img2"), []float32{2})
+	p := d.Get("Alice")
+	jpg := []byte("fake-jpeg-bytes")
+	if err := d.SetThumbnail(p.ID, jpg, "a/1.jpg"); err != nil {
+		t.Fatalf("SetThumbnail: %v", err)
+	}
+	oldThumb := filepath.Join(d.ThumbDir(), "alice.jpg")
+
+	// Happy path: name, ID and thumbnail sidecar all follow the rename.
+	upd, err := d.RenamePerson("alice", "Alicia") // old lookup is case-insensitive
+	if err != nil {
+		t.Fatalf("RenamePerson: %v", err)
+	}
+	if upd.ID != "alicia" || upd.Name != "Alicia" {
+		t.Errorf("updated person = %q/%q, want Alicia/alicia", upd.Name, upd.ID)
+	}
+	if d.Get("Alice") != nil || d.Get("ALICIA") == nil {
+		t.Errorf("old name should be gone, new name resolvable case-insensitively")
+	}
+	newThumb := filepath.Join(d.ThumbDir(), "alicia.jpg")
+	if got := d.ThumbFile("alicia"); got != newThumb {
+		t.Errorf("ThumbFile = %q, want %q", got, newThumb)
+	}
+	if b, err := os.ReadFile(newThumb); err != nil || !bytes.Equal(b, jpg) {
+		t.Errorf("renamed sidecar mismatch: err=%v len=%d", err, len(b))
+	}
+	if _, err := os.Stat(oldThumb); !os.IsNotExist(err) {
+		t.Errorf("old sidecar should be gone, err=%v", err)
+	}
+	upd = d.Get("Alicia")
+	if upd.Thumb != "alicia.jpg" || upd.ThumbSrc != "a/1.jpg" || len(upd.Photos) != 1 {
+		t.Errorf("unexpected person after rename: %+v", upd)
+	}
+
+	// Renaming onto another person's name is rejected.
+	if _, err := d.RenamePerson("Alicia", "BOB"); !errors.Is(err, ErrNameTaken) {
+		t.Errorf("expected ErrNameTaken, got %v", err)
+	}
+	if d.Get("Alicia") == nil || d.Get("Bob") == nil {
+		t.Errorf("failed rename must not change anyone")
+	}
+
+	// A name whose derived ID collides with another person is rejected too:
+	// "Bob!" slugifies to Bob's ID even though the names differ.
+	_ = d.AddPhoto("Cara", "c/1.jpg", []byte("img3"), []float32{3})
+	if _, err := d.RenamePerson("Cara", "Bob!"); !errors.Is(err, ErrNameTaken) {
+		t.Errorf("id collision should be ErrNameTaken, got %v", err)
+	}
+
+	// Unknown person.
+	if _, err := d.RenamePerson("Nobody", "X"); !errors.Is(err, ErrPersonNotFound) {
+		t.Errorf("expected ErrPersonNotFound, got %v", err)
+	}
+	// Empty name.
+	if _, err := d.RenamePerson("Alicia", "   "); err == nil {
+		t.Errorf("expected error for empty name")
+	}
+
+	// Case-only rename: same ID, sidecar untouched, display name updated.
+	if _, err := d.RenamePerson("alicia", "ALICIA"); err != nil {
+		t.Fatalf("case-only rename: %v", err)
+	}
+	if p := d.Get("alicia"); p == nil || p.Name != "ALICIA" || p.ID != "alicia" {
+		t.Errorf("case-only rename failed: %+v", p)
+	}
+	if _, err := os.Stat(newThumb); err != nil {
+		t.Errorf("sidecar should be untouched by a case-only rename: %v", err)
+	}
+
+	// The rename survives a reopen.
+	d2, err := Open(d.path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if p := d2.Get("ALICIA"); p == nil || p.ID != "alicia" || p.Thumb != "alicia.jpg" {
+		t.Errorf("rename not persisted: %+v", p)
+	}
+}
+
+func TestRenamePersonMissingSidecarClearsRecord(t *testing.T) {
+	d := openTemp(t)
+	_ = d.AddPhoto("Alice", "a/1.jpg", []byte("img"), []float32{1})
+	p := d.Get("Alice")
+	if err := d.SetThumbnail(p.ID, []byte("jpg"), "a/1.jpg"); err != nil {
+		t.Fatal(err)
+	}
+	// The sidecar file disappears (outside interference); rename must still
+	// succeed and leave the record clean so a rescan backfills a new thumb.
+	if err := os.Remove(filepath.Join(d.ThumbDir(), "alice.jpg")); err != nil {
+		t.Fatal(err)
+	}
+	upd, err := d.RenamePerson("Alice", "Alicia")
+	if err != nil {
+		t.Fatalf("RenamePerson: %v", err)
+	}
+	if upd.Thumb != "" || upd.ThumbSrc != "" {
+		t.Errorf("stale sidecar record should be cleared, got thumb=%q src=%q", upd.Thumb, upd.ThumbSrc)
 	}
 }
 

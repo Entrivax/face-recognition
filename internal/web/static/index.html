@@ -133,8 +133,18 @@
 			<div>
 				<p class="modal-eyebrow">photos</p>
 				<h2 id="photoTitle">Photos</h2>
+				<!-- inline rename editor for this person -->
+				<form id="photoRenameForm" class="rename-row" hidden>
+					<input id="photoRenameInput" type="text" maxlength="120"
+								 autocomplete="off" spellcheck="false" aria-label="New name">
+					<button type="submit" class="btn btn-accent btn-sm" id="photoRenameSave">Save</button>
+					<button type="button" class="btn btn-ghost btn-sm" id="photoRenameCancel">Cancel</button>
+				</form>
 			</div>
-			<button class="modal-close" type="button" data-close aria-label="Close">×</button>
+			<div class="modal-head-actions">
+				<button type="button" class="btn btn-ghost btn-sm" id="photoRenameBtn">Rename</button>
+				<button class="modal-close" type="button" data-close aria-label="Close">×</button>
+			</div>
 		</header>
 
 		<div class="modal-body">

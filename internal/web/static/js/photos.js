@@ -12,6 +12,7 @@ import { drawWhenReady } from "./overlay.js";
 let photoPerson = null;   // name of the person being managed
 let photoDetail = null;   // { path } currently shown in the detail view
 let photoBusy = false;
+let renaming = false;     // inline rename editor open in the modal head
 let photoLastFocus = null;
 
 // Called whenever photos are added/removed or the avatar changes, so main.js
@@ -20,6 +21,7 @@ let onChange = () => {};
 export function onPhotosChange(fn) { onChange = fn; }
 
 export function isOpen() { return !el.thumbModal.hidden; }
+export function isRenaming() { return renaming; }
 
 export async function openPhotosModal(name) {
 	photoLastFocus = document.activeElement;
@@ -36,6 +38,7 @@ export async function openPhotosModal(name) {
 
 export function closePhotosModal() {
 	if (photoBusy) return; // locked while a request is in flight
+	cancelRename();
 	el.thumbModal.hidden = true;
 	document.body.classList.remove("modal-open");
 	el.photoGrid.innerHTML = "";
@@ -43,6 +46,68 @@ export function closePhotosModal() {
 	photoDetail = null;
 	if (photoLastFocus && photoLastFocus.focus) photoLastFocus.focus();
 }
+
+// ---- rename ----
+// The header's Rename button swaps the person's name for an inline editor.
+// Saving renames everything server-side: the people/ folder, the person's
+// ID, the thumbnail sidecar and the DB record.
+
+function openRename() {
+	if (photoBusy || renaming || !photoPerson) return;
+	renaming = true;
+	el.photoRenameInput.value = photoPerson;
+	el.photoTitle.hidden = true;
+	el.photoRenameBtn.hidden = true;
+	el.photoRenameForm.hidden = false;
+	el.photoRenameInput.focus();
+	el.photoRenameInput.select();
+}
+
+function cancelRename() {
+	if (!renaming) return;
+	renaming = false;
+	el.photoRenameForm.hidden = true;
+	el.photoTitle.hidden = false;
+	el.photoRenameBtn.hidden = false;
+}
+
+async function submitRename(e) {
+	e.preventDefault();
+	if (photoBusy || !renaming || !photoPerson) return;
+	const oldName = photoPerson;
+	const newName = el.photoRenameInput.value.trim();
+	if (!newName) { showToast("Enter the person's new name.", "err"); el.photoRenameInput.focus(); return; }
+	if (newName === oldName) { cancelRename(); return; }
+
+	photoBusy = true;
+	el.thumbModal.classList.add("locked");
+	el.photoRenameSave.disabled = true;
+	el.photoRenameInput.disabled = true;
+	try {
+		const j = await api.renamePerson(oldName, newName);
+		photoPerson = j.name || newName; // DB-canonical name
+		el.photoTitle.textContent = photoPerson;
+		cancelRename();
+		// Photo URLs embed the person's name: drop any open detail view and
+		// reload the grid under the new name.
+		photoDetail = null;
+		showPhotoGrid();
+		loadPhotoGrid(photoPerson);
+		showToast(`Renamed to ${photoPerson}.`, "ok");
+		onChange(); // refresh people list + health (main.js)
+	} catch (err) {
+		showToast(err.message || "Could not rename.", "err");
+	} finally {
+		photoBusy = false;
+		el.photoRenameSave.disabled = false;
+		el.photoRenameInput.disabled = false;
+		el.thumbModal.classList.remove("locked");
+	}
+}
+
+el.photoRenameBtn.addEventListener("click", openRename);
+el.photoRenameCancel.addEventListener("click", cancelRename);
+el.photoRenameForm.addEventListener("submit", submitRename);
 
 function showPhotoDetail(state) {
 	el.photoDetailView.hidden = !state;

@@ -42,6 +42,12 @@ type DB struct {
 	data fileFormat
 }
 
+// Sentinel errors returned by RenamePerson; test with errors.Is.
+var (
+	ErrPersonNotFound = errors.New("person not found")
+	ErrNameTaken      = errors.New("person name already in use")
+)
+
 // fileFormat is the JSON document schema (versioned for future migrations).
 type fileFormat struct {
 	Version int       `json:"version"`
@@ -188,6 +194,62 @@ func (d *DB) RemovePerson(name string) (bool, error) {
 // next to the database file (data/thumbs for a DB at data/embeddings.json).
 func (d *DB) ThumbDir() string {
 	return filepath.Join(filepath.Dir(d.path), "thumbs")
+}
+
+// RenamePerson renames a person (oldName matched case-insensitively) and
+// re-derives their ID from the new name, keeping every derived artifact
+// consistent: the thumbnail sidecar file is renamed <newID>.jpg and the
+// Thumb field updated. Photo paths and ThumbSrc are folder-relative
+// basenames, so they are unaffected by a rename. Returns the updated person.
+//
+// Errors: ErrPersonNotFound, ErrNameTaken (another person already uses the
+// new name, or the derived ID), or a wrapped filesystem/persistence failure.
+func (d *DB) RenamePerson(oldName, newName string) (*Person, error) {
+	newName = strings.TrimSpace(newName)
+	if newName == "" {
+		return nil, errors.New("person name is empty")
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	p := d.findLocked(oldName)
+	if p == nil {
+		return nil, ErrPersonNotFound
+	}
+	id := newID(newName)
+	for _, cand := range d.data.People {
+		if cand == p {
+			continue
+		}
+		if strings.EqualFold(cand.Name, newName) || cand.ID == id {
+			return nil, fmt.Errorf("%w: %q", ErrNameTaken, newName)
+		}
+	}
+	// Move the thumbnail sidecar with the ID change (a case-only rename
+	// keeps the ID, so nothing to do there).
+	if id != p.ID && p.Thumb != "" {
+		oldThumb := filepath.Join(d.ThumbDir(), p.Thumb)
+		if _, err := os.Stat(oldThumb); err == nil {
+			if err := os.MkdirAll(d.ThumbDir(), 0o755); err != nil {
+				return nil, fmt.Errorf("create thumbnail dir: %w", err)
+			}
+			if err := os.Rename(oldThumb, filepath.Join(d.ThumbDir(), id+".jpg")); err != nil {
+				return nil, fmt.Errorf("rename thumbnail: %w", err)
+			}
+			p.Thumb = id + ".jpg"
+		} else {
+			// Sidecar already gone: clear the stale record so the next
+			// rescan backfills a thumbnail under the new ID.
+			p.Thumb = ""
+			p.ThumbSrc = ""
+		}
+	}
+	p.ID = id
+	p.Name = newName
+	updated := *p
+	if err := d.saveLocked(); err != nil {
+		return nil, err
+	}
+	return &updated, nil
 }
 
 // SetThumbnail stores jpg as the person's face thumbnail sidecar

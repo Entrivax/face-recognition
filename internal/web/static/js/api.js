@@ -40,6 +40,19 @@ export async function deletePerson(name) {
 	return j;
 }
 
+// Rename a person: server-side this moves their people/<name> folder,
+// re-derives their ID, renames the thumbnail sidecar and updates the DB.
+export async function renamePerson(oldName, newName) {
+	const r = await fetch(`/api/people/${encodeURIComponent(oldName)}/rename`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ name: newName }),
+	});
+	const j = await parse(r);
+	if (!r.ok) throw new Error(j.error || "rename failed");
+	return j;
+}
+
 export function photoURL(name, path) {
 	return `/api/people/${encodeURIComponent(name)}/photos/${encodeURIComponent(path)}`;
 }

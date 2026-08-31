@@ -87,11 +87,15 @@ el.enrollCard.addEventListener("keydown", (e) => {
 	else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
 });
 
-// Escape closes the topmost open dialog only.
+// Escape closes the topmost open dialog only; while the photos modal's
+// inline rename editor is open, Escape cancels the edit instead.
 document.addEventListener("keydown", (e) => {
 	if (e.key !== "Escape") return;
 	if (facecheck.isOpen()) { facecheck.closeCheckModal(); return; }
-	if (photos.isOpen()) photos.closePhotosModal();
+	if (photos.isOpen()) {
+		if (photos.isRenaming()) photos.cancelRename();
+		else photos.closePhotosModal();
+	}
 	else if (enroll.isOpen()) enroll.closeEnroll();
 });
 

@@ -408,6 +408,8 @@ body.modal-open { overflow: hidden; }
 	padding: 4px 8px; border-radius: 6px; flex-shrink: 0;
 }
 .modal-close:hover { color: var(--ink); background: var(--bg-panel); }
+.modal-head-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.btn-sm { padding: 5px 11px; font-size: 12px; border-radius: 7px; }
 .modal-body { padding: 16px 22px 22px; }
 .field-label {
 	display: block; margin: 0 0 6px;
@@ -425,6 +427,21 @@ body.modal-open { overflow: hidden; }
 #enrollName:disabled { opacity: 0.6; }
 .field-hint { margin: 7px 0 0; font-family: var(--mono); font-size: 11px; color: var(--ink-faint); }
 .field-hint.warn { color: var(--unknown); }
+
+/* inline rename editor in the photos-modal head */
+.rename-row {
+	display: flex; align-items: center; gap: 8px;
+	margin-top: 8px;
+}
+.rename-row[hidden] { display: none; }
+.rename-row input {
+	flex: 1; min-width: 0;
+	background: var(--bg-raise); border: 1px solid var(--line);
+	border-radius: 8px; color: var(--ink);
+	padding: 8px 12px; font-family: var(--display); font-size: 13.5px;
+}
+.rename-row input:focus { outline: none; border-color: var(--accent); }
+.rename-row input:disabled { opacity: 0.6; }
 
 /* review dropzone — compact sibling of the main stage dropzone */
 .enroll-drop {

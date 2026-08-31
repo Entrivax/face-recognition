@@ -217,6 +217,16 @@ command hits a permission error.
   `ThumbSrc`, regenerates the thumbnail from the first remaining photo that
   still detects a face — or clears it (`db.ClearThumbnail`) when none does.
   Deleting a person's last photo leaves the person enrolled with 0 photos.
+- **Renaming a person** (Rename button in the photos-manager modal →
+  `POST /api/people/{name}/rename`, body `{"name": ...}`): one transaction
+  across disk and DB — `os.Rename` of `people/<Old>/` → `people/<New>/` (a
+  409 refuses to clobber a different existing folder; `os.SameFile` lets
+  case-only renames work on case-insensitive filesystems), then
+  `db.RenamePerson` re-derives the ID from the name (`db.newID`), renames the
+  thumbnail sidecar to `<newID>.jpg` and persists. A DB failure after the
+  folder move rolls the folder back. Photo paths and `ThumbSrc` are
+  folder-relative basenames, so they need no rewrite; the engine identity set
+  reloads via `s.reload()` afterwards.
 - **onnxrt memory discipline**: every `OrtValue`/buffer allocated in the C shim
   is freed (tensor data via `ort_free`, sessions via `ort_close`). If you extend
   the shim, keep the ownership rules in `onnxrt.h` accurate and re-run the

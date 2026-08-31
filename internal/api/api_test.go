@@ -668,6 +668,149 @@ func getJSON(t *testing.T, s *Server, path string, out any) *httptest.ResponseRe
 	return rec
 }
 
+// TestPersonRename covers POST /api/people/{name}/rename: the DB record, the
+// people/<Name> folder and the thumbnail sidecar all move together, and the
+// old name/id stop resolving.
+func TestPersonRename(t *testing.T) {
+	eng := &stubEngine{faces: []engine.Face{{BBox: [4]float64{10, 10, 40, 40}}}}
+	s, database := newTestServer(t, eng)
+	img := pngBytes(t, 120, 120, 0)
+	photo := db.HashBytes(img)[:12] + ".png"
+	if rec := enrollPerson(t, s, "Alice", map[string][]byte{"a.png": img}); rec.Code != http.StatusOK {
+		t.Fatalf("enroll: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	// Bob is enrolled too (DB-only), so renaming Alice→Bob must conflict.
+	_ = database.AddPhoto("Bob", "b.png", img, []float32{1})
+	reloadCount := 0
+	s.refresh = func(Engine, *db.DB) { reloadCount++ }
+
+	r := postJSON(t, s, "/api/people/Alice/rename", map[string]string{"name": "Alicia"})
+	if r.Code != http.StatusOK {
+		t.Fatalf("rename: got %d (%s)", r.Code, r.Body.String())
+	}
+	var resp struct {
+		Renamed bool   `json:"renamed"`
+		OldName string `json:"old_name"`
+		Name    string `json:"name"`
+		ID      string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.Renamed || resp.OldName != "Alice" || resp.Name != "Alicia" || resp.ID != "alicia" {
+		t.Errorf("unexpected rename response: %+v", resp)
+	}
+	if reloadCount != 1 {
+		t.Errorf("engine should be reloaded after a rename, got %d reloads", reloadCount)
+	}
+
+	// DB: old name gone, new name resolves, photos intact.
+	if database.Get("Alice") != nil {
+		t.Errorf("old name should be gone from the DB")
+	}
+	p := database.Get("Alicia")
+	if p == nil || p.ID != "alicia" || len(p.Photos) != 1 || p.Photos[0].Path != photo {
+		t.Fatalf("unexpected DB person: %+v", p)
+	}
+
+	// Disk: folder renamed, sidecar renamed, photo file still inside.
+	if _, err := os.Stat(filepath.Join(s.cfg.PeopleDir, "Alice")); !os.IsNotExist(err) {
+		t.Errorf("old folder should be gone, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(s.cfg.PeopleDir, "Alicia", photo)); err != nil {
+		t.Errorf("photo file should be under the new folder: %v", err)
+	}
+	oldThumb := filepath.Join(database.ThumbDir(), "alice.jpg")
+	newThumb := filepath.Join(database.ThumbDir(), "alicia.jpg")
+	if _, err := os.Stat(oldThumb); !os.IsNotExist(err) {
+		t.Errorf("old sidecar should be gone, err=%v", err)
+	}
+	if _, err := os.Stat(newThumb); err != nil {
+		t.Errorf("renamed sidecar missing: %v", err)
+	}
+
+	// Routes follow the new identity; the old ones 404.
+	if code := getJSON(t, s, "/api/people/Alicia", nil).Code; code != http.StatusOK {
+		t.Errorf("GET new name: got %d, want 200", code)
+	}
+	if code := getJSON(t, s, "/api/people/Alice", nil).Code; code != http.StatusNotFound {
+		t.Errorf("GET old name: got %d, want 404", code)
+	}
+	if code := getJSON(t, s, "/api/thumbs/alicia.jpg", nil).Code; code != http.StatusOK {
+		t.Errorf("GET new thumb: got %d, want 200", code)
+	}
+	if code := getJSON(t, s, "/api/thumbs/alice.jpg", nil).Code; code != http.StatusNotFound {
+		t.Errorf("GET old thumb: got %d, want 404", code)
+	}
+	if code := getJSON(t, s, "/api/people/Alicia/photos/"+photo, nil).Code; code != http.StatusOK {
+		t.Errorf("photo under new name: got %d, want 200", code)
+	}
+
+	// Errors: collision with an enrolled person, invalid/empty/unchanged
+	// name, unknown person, method.
+	if code := postJSON(t, s, "/api/people/Alicia/rename", map[string]string{"name": "Bob"}).Code; code != http.StatusConflict {
+		t.Errorf("name collision: got %d, want 409", code)
+	}
+	if code := postJSON(t, s, `/api/people/Alicia/rename`, map[string]string{"name": `a\b`}).Code; code != http.StatusBadRequest {
+		t.Errorf("path-like name: got %d, want 400", code)
+	}
+	if code := postJSON(t, s, "/api/people/Alicia/rename", map[string]string{"name": "   "}).Code; code != http.StatusBadRequest {
+		t.Errorf("empty name: got %d, want 400", code)
+	}
+	if code := postJSON(t, s, "/api/people/Alicia/rename", map[string]string{"name": "Alicia"}).Code; code != http.StatusBadRequest {
+		t.Errorf("unchanged name: got %d, want 400", code)
+	}
+	if code := postJSON(t, s, "/api/people/Nobody/rename", map[string]string{"name": "X"}).Code; code != http.StatusNotFound {
+		t.Errorf("unknown person: got %d, want 404", code)
+	}
+	if code := req2(t, s, http.MethodGet, "/api/people/Alicia/rename").Code; code != http.StatusMethodNotAllowed {
+		t.Errorf("GET rename: got %d, want 405", code)
+	}
+
+	// A folder on disk without a DB entry blocks the rename (409), and a
+	// failed rename leaves the person untouched.
+	if err := os.MkdirAll(filepath.Join(s.cfg.PeopleDir, "Carol"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if code := postJSON(t, s, "/api/people/Alicia/rename", map[string]string{"name": "Carol"}).Code; code != http.StatusConflict {
+		t.Errorf("folder collision: got %d, want 409", code)
+	}
+	if database.Get("Carol") != nil || database.Get("Alicia") == nil {
+		t.Errorf("rejected rename must not change anything")
+	}
+
+	// Case-only rename works and keeps the ID.
+	if r = postJSON(t, s, "/api/people/Alicia/rename", map[string]string{"name": "ALICIA"}); r.Code != http.StatusOK {
+		t.Fatalf("case-only rename: got %d (%s), want 200", r.Code, r.Body.String())
+	}
+	if p := database.Get("alicia"); p == nil || p.Name != "ALICIA" || p.ID != "alicia" {
+		t.Errorf("unexpected person after case-only rename: %+v", p)
+	}
+	if _, err := os.Stat(newThumb); err != nil {
+		t.Errorf("sidecar should be untouched by a case-only rename: %v", err)
+	}
+}
+
+// TestPersonRenameWithoutFolder covers a DB-only person (no dataset folder):
+// the rename still succeeds, touching just the DB and thumbnail bookkeeping.
+func TestPersonRenameWithoutFolder(t *testing.T) {
+	s, database := newTestServer(t, &stubEngine{})
+	if err := database.AddPhoto("Ghost", "g.png", []byte("img"), []float32{1}); err != nil {
+		t.Fatal(err)
+	}
+	r := postJSON(t, s, "/api/people/Ghost/rename", map[string]string{"name": "Spirit"})
+	if r.Code != http.StatusOK {
+		t.Fatalf("rename: got %d (%s)", r.Code, r.Body.String())
+	}
+	if p := database.Get("Ghost"); p != nil {
+		t.Errorf("old name should be gone")
+	}
+	p := database.Get("Spirit")
+	if p == nil || p.ID != "spirit" || len(p.Photos) != 1 {
+		t.Fatalf("unexpected renamed person: %+v", p)
+	}
+}
+
 // TestThumbChooser covers serving enrolled photos and regenerating the
 // thumbnail from a chosen photo.
 func TestThumbChooser(t *testing.T) {
