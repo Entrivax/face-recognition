@@ -262,6 +262,53 @@ func TestConfigThresholdPersists(t *testing.T) {
 	}
 }
 
+// TestRecognizeDraw checks ?draw=1: the response is the annotated JPEG image.
+func TestRecognizeDraw(t *testing.T) {
+	eng := &stubEngine{faces: []engine.Face{
+		{BBox: [4]float64{10, 10, 50, 60}, Name: "Alice", Confidence: 0.9},
+	}}
+	s, _ := newTestServer(t, eng)
+
+	// Real decodable image content — Annotate must decode it.
+	img := image.NewRGBA(image.Rect(0, 0, 160, 120))
+	for i := range img.Pix {
+		img.Pix[i] = 60
+	}
+	var pngBuf bytes.Buffer
+	if err := png.Encode(&pngBuf, img); err != nil {
+		t.Fatal(err)
+	}
+	body, ct := multipartBody(t, "image", "photo.png", pngBuf.Bytes())
+	req := httptest.NewRequest(http.MethodPost, "/api/recognize?draw=1", body)
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("draw recognize: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "image/jpeg" {
+		t.Fatalf("content type = %q, want image/jpeg", got)
+	}
+	gotImg, format, err := image.Decode(bytes.NewReader(rec.Body.Bytes()))
+	if err != nil {
+		t.Fatalf("response is not a decodable image: %v", err)
+	}
+	if format != "jpeg" || gotImg.Bounds().Dx() != 160 || gotImg.Bounds().Dy() != 120 {
+		t.Fatalf("unexpected image %v format=%q", gotImg.Bounds(), format)
+	}
+
+	// Without the flag the JSON shape is unchanged.
+	body, ct = multipartBody(t, "image", "photo.png", pngBuf.Bytes())
+	req = httptest.NewRequest(http.MethodPost, "/api/recognize", body)
+	req.Header.Set("Content-Type", ct)
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("plain recognize content type = %q, want application/json", got)
+	}
+}
+
 func TestIndexServed(t *testing.T) {
 	s, _ := newTestServer(t, &stubEngine{})
 	for _, path := range []string{"/", "/app.js", "/style.css"} {

@@ -136,6 +136,12 @@ Unzip on a Windows machine, open a terminal in the folder, and use
 # (flags go before the image paths)
 ./recogn recognize --json photo.jpg group.jpg
 
+# The same, plus an annotated copy with numbered boxes + labels drawn on it:
+# single image  -> --draw takes an output .jpg path
+# several files -> --draw takes a directory (one <name>.annotated.jpg each)
+./recogn recognize --draw annotated.jpg photo.jpg
+./recogn recognize --draw out/ photo1.jpg photo2.jpg
+
 # List enrolled identities
 ./recogn people
 ```
@@ -158,7 +164,7 @@ people panel has a filter box and a threshold slider (persisted server-side).
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/api/recognize` | multipart `image` → `{count, faces:[{bbox,name,person_id,confidence,score,landmarks,matches}]}` — `matches` ranks every identity above the threshold (best per person); near-tied top scores hint at duplicate people |
+| `POST` | `/api/recognize` | multipart `image` → `{count, faces:[{bbox,name,person_id,confidence,score,landmarks,matches}]}` — `matches` ranks every identity above the threshold (best per person); near-tied top scores hint at duplicate people. `?draw=1` responds with the annotated JPEG (numbered boxes + labels) instead of JSON |
 | `GET`  | `/api/people` | list enrolled people + photo counts (incl. `thumb` URL when a face thumbnail exists) |
 | `GET`  | `/api/people/{name}` | one person's enrolled photos (`thumb_src` = photo the avatar comes from) |
 | `POST` | `/api/people/{name}/enroll` | add photo(s) (field `images`) for a new/existing person; each enrolled image is also saved into `people/<name>/` |

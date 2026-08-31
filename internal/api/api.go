@@ -144,6 +144,19 @@ func (s *Server) handleRecognize(w http.ResponseWriter, r *http.Request) {
 	for i := range faces {
 		faces[i].Embedding = nil
 	}
+	// ?draw=1: respond with the annotated image (boxes + labels) instead of
+	// the JSON report.
+	if r.URL.Query().Get("draw") == "1" {
+		out, err := engine.Annotate(img, faces)
+		if err != nil {
+			writeErr(w, http.StatusBadGateway, "annotate failed: "+err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(out)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"count": len(faces),
 		"faces": faces,

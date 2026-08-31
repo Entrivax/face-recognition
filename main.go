@@ -48,12 +48,13 @@ func main() {
 	case "recognize":
 		fs := newFlagSet("recognize")
 		jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
+		drawOut := fs.String("draw", "", "also write an annotated copy (boxes + labels): a .jpg/.jpeg path for a single image, or a directory for one copy per image")
 		cfg, set := parseFlags(fs, rest)
 		if fs.NArg() == 0 {
 			fmt.Fprintln(os.Stderr, "recognize: provide at least one image path")
 			os.Exit(2)
 		}
-		must(runRecognize(cfg, fs.Args(), *jsonOut, set["threshold"]))
+		must(runRecognize(cfg, fs.Args(), *jsonOut, *drawOut, set["threshold"]))
 	case "people":
 		fs := newFlagSet("people")
 		jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
@@ -99,7 +100,10 @@ func usage() {
 
 Usage:
   recogn enroll [--force] [--prune]      build or update the face DB from the people folder
-  recogn recognize [--json] <image...> detect & identify every face in the given photos
+  recogn recognize [--json] [--draw out] <image...>
+                                       detect & identify every face in the given photos
+                                       (--draw: write annotated copies — a .jpg path for a
+                                       single image, or a directory for one copy per image)
   recogn people [--json]               list enrolled identities
   recogn serve [--addr :8080]          start the REST API and web UI
 
@@ -199,7 +203,16 @@ func runEnroll(cfg config.Config, force, prune, thresholdSet bool) error {
 	return nil
 }
 
-func runRecognize(cfg config.Config, images []string, jsonOut, thresholdSet bool) error {
+// fileResult is the per-image recognition outcome (also the --json record).
+// raw keeps the original bytes for --draw; encoding/json skips it.
+type fileResultT struct {
+	Image string        `json:"image"`
+	Faces []engine.Face `json:"faces"`
+	Error string        `json:"error,omitempty"`
+	raw   []byte
+}
+
+func runRecognize(cfg config.Config, images []string, jsonOut bool, drawArg string, thresholdSet bool) error {
 	eng, database, err := openEngine(cfg, thresholdSet)
 	if err != nil {
 		return err
@@ -212,16 +225,11 @@ func runRecognize(cfg config.Config, images []string, jsonOut, thresholdSet bool
 		return fmt.Errorf("inference sidecar failed to start: %w", err)
 	}
 
-	type fileResult struct {
-		Image string         `json:"image"`
-		Faces []engine.Face  `json:"faces"`
-		Error string         `json:"error,omitempty"`
-	}
-	var all []fileResult
+	var all []fileResultT
 	hadErr := false
 
 	for _, imgPath := range images {
-		fr := fileResult{Image: imgPath}
+		fr := fileResultT{Image: imgPath}
 		b, err := os.ReadFile(imgPath)
 		if err != nil {
 			fr.Error = err.Error()
@@ -241,7 +249,14 @@ func runRecognize(cfg config.Config, images []string, jsonOut, thresholdSet bool
 			faces[i].Embedding = nil
 		}
 		fr.Faces = faces
+		fr.raw = b
 		all = append(all, fr)
+	}
+
+	if drawArg != "" {
+		if err := writeAnnotated(drawArg, all, jsonOut); err != nil {
+			return err
+		}
 	}
 
 	if jsonOut {
@@ -273,6 +288,55 @@ func runRecognize(cfg config.Config, images []string, jsonOut, thresholdSet bool
 		return fmt.Errorf("one or more images failed")
 	}
 	return nil
+}
+
+// writeAnnotated writes annotated copies (boxes + labels) of the successfully
+// recognized images. drawArg is either an image path (single input, written
+// verbatim) or a directory (one <base>.annotated.jpg per input). Progress
+// lines go to stdout in normal mode, stderr in --json mode so the JSON on
+// stdout stays machine-readable.
+func writeAnnotated(drawArg string, results []fileResultT, jsonOut bool) error {
+	var ok []fileResultT
+	for _, fr := range results {
+		if fr.Error == "" && fr.raw != nil {
+			ok = append(ok, fr)
+		}
+	}
+	if len(ok) == 0 {
+		return fmt.Errorf("no successfully recognized image to annotate")
+	}
+	var outPath func(base string) string
+	if len(ok) == 1 && isJPGExt(filepath.Ext(drawArg)) {
+		outPath = func(string) string { return drawArg }
+	} else {
+		if err := os.MkdirAll(drawArg, 0o755); err != nil {
+			return fmt.Errorf("create draw directory: %w", err)
+		}
+		outPath = func(base string) string {
+			return filepath.Join(drawArg, strings.TrimSuffix(base, filepath.Ext(base))+".annotated.jpg")
+		}
+	}
+	out := os.Stdout
+	if jsonOut {
+		out = os.Stderr
+	}
+	for _, fr := range ok {
+		annotated, err := engine.Annotate(fr.raw, fr.Faces)
+		if err != nil {
+			return fmt.Errorf("annotate %s: %w", fr.Image, err)
+		}
+		dst := outPath(filepath.Base(fr.Image))
+		if err := os.WriteFile(dst, annotated, 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", dst, err)
+		}
+		fmt.Fprintf(out, "annotated → %s\n", dst)
+	}
+	return nil
+}
+
+func isJPGExt(ext string) bool {
+	e := strings.ToLower(ext)
+	return e == ".jpg" || e == ".jpeg"
 }
 
 func runPeople(cfg config.Config, jsonOut bool) error {
