@@ -212,6 +212,18 @@ html, body {
 	font-family: var(--mono); font-size: 10.5px; color: var(--unknown);
 }
 
+/* "name this face" inline form on unknown result rows */
+.face-enroll { display: flex; align-items: center; gap: 8px; margin-top: 9px; }
+.face-enroll-input {
+	flex: 1; min-width: 0; max-width: 230px;
+	background: var(--bg-raise); border: 1px solid var(--line);
+	border-radius: 7px; color: var(--ink);
+	padding: 6px 10px; font-family: var(--display); font-size: 12.5px;
+}
+.face-enroll-input:focus { outline: none; border-color: var(--accent); }
+.face-enroll-input::placeholder { color: var(--ink-faint); }
+.face-enroll-input:disabled { opacity: 0.55; }
+
 /* ---------- people panel ---------- */
 .people-actions { margin-top: 16px; }
 .people-actions .btn { width: 100%; }

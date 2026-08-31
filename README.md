@@ -149,7 +149,10 @@ Unzip on a Windows machine, open a terminal in the folder, and use
 
 The web UI lets you drag-and-drop a photo to see every detected face boxed and
 labelled, browse the enrolled people, add a new person by uploading photos, and
-re-scan the `people/` folder.
+re-scan the `people/` folder. Unknown faces can be named right in the results
+list ("Enroll" under an unknown face enrolls that specific face — matched by
+its row number, which the canvas overlay also shows next to the name). The
+people panel has a filter box and a threshold slider (persisted server-side).
 
 #### REST API
 
@@ -159,6 +162,7 @@ re-scan the `people/` folder.
 | `GET`  | `/api/people` | list enrolled people + photo counts (incl. `thumb` URL when a face thumbnail exists) |
 | `GET`  | `/api/people/{name}` | one person's enrolled photos (`thumb_src` = photo the avatar comes from) |
 | `POST` | `/api/people/{name}/enroll` | add photo(s) (field `images`) for a new/existing person; each enrolled image is also saved into `people/<name>/` |
+| `POST` | `/api/people/{name}/enroll-face` | enroll one specific face of an uploaded photo: multipart `image` + `face_index` (1-based, in the detection order `/api/recognize` reports) — used by the UI's "name this face" action on unknown results |
 | `GET`  | `/api/people/{name}/photos/{path}` | one of the person's enrolled photo files (from the people folder) |
 | `GET`  | `/api/people/{name}/photos/{path}/detect` | detect + recognize faces on an enrolled photo (for the photos-manager quality check) |
 | `DELETE` | `/api/people/{name}/photos/{path}` | remove one photo: DB entry + file in `people/<name>/`; the avatar is regenerated from another photo (or cleared) if it was the thumbnail source |
@@ -166,8 +170,8 @@ re-scan the `people/` folder.
 | `POST` | `/api/people/{name}/rename` | rename a person — JSON `{"name": "<new name>"}`; moves `people/<name>/`, re-derives the person ID, renames the thumbnail sidecar and updates the DB in one step |
 | `GET`  | `/api/thumbs/{id}.jpg` | a person's face thumbnail (square face crop; `?v=` cache-buster follows the chosen photo) |
 | `DELETE` | `/api/people/{name}` | remove a person |
-| `POST` | `/api/enroll?force=true` | re-scan the `people/` folder (incremental unless `force`) |
-| `GET`/`POST` | `/api/config` | read/set the match threshold |
+| `POST` | `/api/enroll?force=true` | re-scan the `people/` folder (incremental unless `force`); `?prune=true` also drops DB photo entries whose files are missing (CLI: `recogn enroll --prune`) |
+| `GET`/`POST` | `/api/config` | read/set the match threshold; POSTed values are persisted in the DB and survive restarts (an explicit `--threshold` flag still wins) |
 | `GET`  | `/api/health` | status, people count, threshold |
 
 Example:

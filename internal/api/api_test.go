@@ -274,6 +274,80 @@ func TestIndexServed(t *testing.T) {
 	}
 }
 
+// enrollFaceRequest POSTs a single image plus a face_index field to
+// /api/people/{name}/enroll-face.
+func enrollFaceRequest(t *testing.T, s *Server, name string, img []byte, idx string) *httptest.ResponseRecorder {
+	t.Helper()
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	fw, err := w.CreateFormFile("image", "photo.jpg")
+	if err != nil {
+		t.Fatalf("create form file: %v", err)
+	}
+	if _, err := fw.Write(img); err != nil {
+		t.Fatalf("write form file: %v", err)
+	}
+	if err := w.WriteField("face_index", idx); err != nil {
+		t.Fatalf("write field: %v", err)
+	}
+	w.Close()
+	req := httptest.NewRequest(http.MethodPost, "/api/people/"+name+"/enroll-face", &buf)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
+func TestEnrollFace(t *testing.T) {
+	eng := &stubEngine{faces: []engine.Face{
+		{BBox: [4]float64{0, 0, 10, 10}},
+		{BBox: [4]float64{20, 20, 12, 12}},
+	}}
+	s, database := newTestServer(t, eng)
+	img := []byte("fake-jpeg-bytes")
+
+	// Index 2 enrolls the second detected face (1-based, list-row order).
+	rec := enrollFaceRequest(t, s, "Alice", img, "2")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("enroll-face: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	p := database.Get("Alice")
+	if p == nil || len(p.Photos) != 1 {
+		t.Fatalf("person not enrolled: %+v", p)
+	}
+	// The uploaded image is saved into the person's people folder.
+	if _, err := os.Stat(filepath.Join(s.cfg.PeopleDir, "Alice", p.Photos[0].Path)); err != nil {
+		t.Fatalf("image not saved into the people folder: %v", err)
+	}
+
+	// Out-of-range index → 400, nothing enrolled.
+	rec = enrollFaceRequest(t, s, "Bob", img, "3")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for out-of-range index, got %d", rec.Code)
+	}
+	if database.Get("Bob") != nil {
+		t.Fatal("failed enroll must not create a person")
+	}
+	// Non-integer index → 400.
+	rec = enrollFaceRequest(t, s, "Bob", img, "x")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for non-integer index, got %d", rec.Code)
+	}
+	// Leading-dot name → 400. (Path-like names containing ".." never reach
+	// the handler: http.ServeMux redirects them during path cleaning.)
+	rec = enrollFaceRequest(t, s, ".hidden", img, "1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for bad name, got %d", rec.Code)
+	}
+
+	// No faces at all → 422.
+	empty, _ := newTestServer(t, &stubEngine{})
+	rec = enrollFaceRequest(t, empty, "Carol", img, "1")
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 when no face is detected, got %d", rec.Code)
+	}
+}
+
 // enrollPerson POSTs files to /api/people/{name}/enroll.
 func enrollPerson(t *testing.T, s *Server, name string, files map[string][]byte) *httptest.ResponseRecorder {
 	t.Helper()

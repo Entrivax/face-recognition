@@ -9,7 +9,7 @@ import * as enroll from "./enroll.js";
 import { loadPeople, onPeopleChange } from "./people.js";
 import { onPhotosChange } from "./photos.js";
 import { onEnrollChange } from "./enroll.js";
-import "./recognize.js"; // stage wires its own listeners on import
+import { onFaceEnrolled } from "./recognize.js"; // stage wires its own listeners on import
 import "./paste.js";     // clipboard routing wires itself on import
 
 // ---------- health ----------
@@ -33,6 +33,7 @@ function refreshAll() {
 onPeopleChange(refreshAll);
 onPhotosChange(refreshAll);
 onEnrollChange(refreshAll);
+onFaceEnrolled(refreshAll); // a face enrolled from the results list adds a person
 
 // facecheck needs to know whether another modal is still open underneath it
 // (to keep the body's modal-open class) without importing the other modals.

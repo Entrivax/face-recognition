@@ -14,7 +14,7 @@ export function drawFaces(canvas, img, faces, opts = {}) {
 	ctx.clearRect(0, 0, w, h);
 	const scale = Math.max(w, h) / 900; // line width scales with image size
 
-	faces.forEach((f) => {
+	faces.forEach((f, i) => {
 		const [x, y, bw, bh] = f.bbox;
 		const known = f.name && f.name !== "unknown";
 		const col = known ? "#38e0c8" : "#f5b53f";
@@ -40,10 +40,13 @@ export function drawFaces(canvas, img, faces, opts = {}) {
 
 		if (!opts || !opts.labels) return;
 
-		// label
+		// label — prefixed with the 1-based row number so each box ties to
+		// its entry in the results list (every caller lists faces in this
+		// same detection order).
 		ctx.shadowBlur = 0;
 		const conf = Math.round((f.confidence || f.score || 0) * 100);
-		const label = known ? `${f.name} ${conf}%` : `unknown ${conf}%`;
+		const who = known ? `${f.name} ${conf}%` : `unknown ${conf}%`;
+		const label = `${String(i + 1).padStart(2, "0")} · ${who}`;
 		const fs = Math.max(12, 15 * scale);
 		ctx.font = `600 ${fs}px "Space Grotesk", sans-serif`;
 		const tw = ctx.measureText(label).width;

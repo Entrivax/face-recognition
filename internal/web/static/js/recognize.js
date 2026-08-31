@@ -2,7 +2,7 @@
 
 import { el } from "./dom.js";
 import { showToast, escapeHtml } from "./util.js";
-import { recognize } from "./api.js";
+import { recognize, enrollFace as apiEnrollFace } from "./api.js";
 import { drawWhenReady } from "./overlay.js";
 
 function openPicker() { el.fileInput.click(); }
@@ -10,6 +10,10 @@ function openPicker() { el.fileInput.click(); }
 // Object URL of the current stage preview. Revoked when replaced or cleared —
 // otherwise every inspected photo would stay pinned in memory for the session.
 let stageURL = null;
+// The File currently under inspection — kept so an unknown face row can be
+// enrolled via /api/people/{name}/enroll-face with the exact same bytes
+// (detection order is deterministic, so face_index matches the list row).
+let currentFile = null;
 
 el.dropzone.addEventListener("click", (e) => {
 	if (el.dzPreview.hidden) openPicker();
@@ -52,6 +56,7 @@ function resetStage() {
 	el.results.hidden = true;
 	el.stageMeta.textContent = "";
 	if (stageURL) { URL.revokeObjectURL(stageURL); stageURL = null; }
+	currentFile = null;
 	el.previewImg.src = "";
 	el.dropzone.style.cursor = "pointer";
 }
@@ -61,6 +66,7 @@ export async function handleFile(file) {
 		showToast("That file isn't an image.", "err");
 		return;
 	}
+	currentFile = file;
 	// Show preview immediately.
 	const url = URL.createObjectURL(file);
 	if (stageURL) URL.revokeObjectURL(stageURL);
@@ -84,6 +90,11 @@ export async function handleFile(file) {
 		showToast(e.message || "Recognition failed.", "err");
 	}
 }
+
+// Called after an unknown face is enrolled from the results, so main.js can
+// refresh the people list and health without this module importing them.
+let onEnrolled = () => {};
+export function onFaceEnrolled(fn) { onEnrolled = fn; }
 
 function renderResults(faces) {
 	el.results.hidden = false;
@@ -109,11 +120,21 @@ function renderResults(faces) {
 				</ul>
 				${near ? `<p class="face-dup-hint">scores nearly tied — possible duplicate people?</p>` : ""}`;
 		}
+		// Unknown faces can be enrolled right here: name them and the same
+		// uploaded file is re-sent with this row's 1-based index.
+		const enrollForm = f.name === "unknown" && currentFile
+			? `<form class="face-enroll">
+					<input type="text" class="face-enroll-input" placeholder="Name this person…" maxlength="120"
+								 autocomplete="off" spellcheck="false" aria-label="Enroll this face as">
+					<button type="submit" class="btn btn-accent btn-sm">Enroll</button>
+				</form>`
+			: "";
 		li.innerHTML = `
 			<span class="face-index">${String(i + 1).padStart(2, "0")}</span>
 			<div>
 				<div class="face-name">${escapeHtml(f.name)}</div>
 				${matchesHtml}
+				${enrollForm}
 			</div>
 			<div class="face-right">
 				<span class="face-conf">${conf}%</span>
@@ -121,9 +142,39 @@ function renderResults(faces) {
 					<span style="width:${conf}%"></span>
 				</div>
 			</div>`;
+		const form = li.querySelector(".face-enroll");
+		if (form) wireEnrollForm(form, li, i + 1);
 		el.faceList.appendChild(li);
 	});
 	drawOverlay(faces);
+}
+
+// Submit handler for an unknown row's "name this face" form: enrolls the
+// given 1-based face of the current photo under the typed name.
+function wireEnrollForm(form, li, faceIndex) {
+	form.addEventListener("submit", async (e) => {
+		e.preventDefault();
+		if (!currentFile) return;
+		const input = form.querySelector(".face-enroll-input");
+		const btn = form.querySelector("button");
+		const person = input.value.trim();
+		if (!person) { input.focus(); return; }
+		btn.disabled = true;
+		input.disabled = true;
+		try {
+			const j = await apiEnrollFace(person, currentFile, faceIndex);
+			showToast(`Enrolled ${person} (${j.saved}).`, "ok");
+			li.classList.remove("unknown");
+			li.querySelector(".face-name").textContent = person;
+			form.remove();
+			onEnrolled();
+		} catch (err) {
+			showToast(err.message || "Enrollment failed.", "err");
+			btn.disabled = false;
+			input.disabled = false;
+			input.focus();
+		}
+	});
 }
 
 // Draw corner-bracket boxes + labels over the preview, scaled to the image.

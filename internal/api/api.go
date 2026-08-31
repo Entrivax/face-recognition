@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -189,6 +190,10 @@ func (s *Server) handlePersonSubroutes(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(parts) == 2 && parts[1] == "enroll" {
 		s.handleEnrollPerson(w, r, name)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "enroll-face" {
+		s.handleEnrollFace(w, r, name)
 		return
 	}
 	if len(parts) == 2 && parts[1] == "thumbnail" {
@@ -655,6 +660,73 @@ func (s *Server) handleEnrollPerson(w http.ResponseWriter, r *http.Request, name
 		status = http.StatusUnprocessableEntity
 	}
 	writeJSON(w, status, resp)
+}
+
+// handleEnrollFace enrolls one specific face of an uploaded photo as (or
+// into) the named person. Body: multipart "image" plus "face_index" — a
+// 1-based index into the detection order /api/recognize reported for the same
+// bytes (detection is deterministic). The UI's "name this face" action on
+// unknown recognition results uses it.
+func (s *Server) handleEnrollFace(w http.ResponseWriter, r *http.Request, name string) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	if err := enroll.CheckName(name); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := r.ParseMultipartForm(maxUpload); err != nil {
+		writeErr(w, http.StatusBadRequest, "parse form: "+err.Error())
+		return
+	}
+	idx, err := strconv.Atoi(strings.TrimSpace(r.FormValue("face_index")))
+	if err != nil || idx < 1 {
+		writeErr(w, http.StatusBadRequest, "face_index must be a positive integer")
+		return
+	}
+	img, err := readMultipartFile(r, []string{"image", "file", "photo"})
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	saved, err := enroll.EnrollFace(s.eng, s.db, s.cfg.PeopleDir, name, "upload", img, idx)
+	if err != nil {
+		switch {
+		case errors.Is(err, enroll.ErrFaceIndex):
+			writeErr(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, enroll.ErrNoFace):
+			writeErr(w, http.StatusUnprocessableEntity, err.Error())
+		default:
+			writeErr(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	s.reload()
+	writeJSON(w, http.StatusOK, map[string]any{"person": name, "saved": saved})
+}
+
+// readMultipartFile returns the bytes of the first uploaded file under one of
+// the given multipart fields, capped at maxUpload.
+func readMultipartFile(r *http.Request, fields []string) ([]byte, error) {
+	if r.MultipartForm == nil {
+		return nil, errors.New("no file provided")
+	}
+	for _, field := range fields {
+		for _, fh := range r.MultipartForm.File[field] {
+			f, err := fh.Open()
+			if err != nil {
+				continue
+			}
+			b, err := io.ReadAll(io.LimitReader(f, maxUpload))
+			f.Close()
+			if err != nil {
+				continue
+			}
+			return b, nil
+		}
+	}
+	return nil, fmt.Errorf("no image file provided (field '%s')", fields[0])
 }
 
 // handleEnrollFolder rescans the people/ directory (incremental).

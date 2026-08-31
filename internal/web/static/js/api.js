@@ -114,6 +114,20 @@ export async function enrollPhotos(name, files) {
 	return j;
 }
 
+// Enroll one specific face of an uploaded photo (1-based index into the
+// detection order the results list showed) as a new or existing person.
+export async function enrollFace(name, file, faceIndex) {
+	const fd = new FormData();
+	fd.append("image", file, file.name || "photo.jpg");
+	fd.append("face_index", String(faceIndex));
+	const r = await fetch(`/api/people/${encodeURIComponent(name)}/enroll-face`, {
+		method: "POST", body: fd,
+	});
+	const j = await parse(r);
+	if (!r.ok) throw new Error(j.error || "enrollment failed");
+	return j;
+}
+
 export async function rescan() {
 	const r = await fetch("/api/enroll", { method: "POST" });
 	const j = await parse(r);

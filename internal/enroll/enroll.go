@@ -235,6 +235,39 @@ func enrollOne(eng FaceEngine, database *db.DB, name, folder, file string, force
 	return true, "", nil
 }
 
+// Sentinel errors for enrollment outcomes callers distinguish on (the API
+// maps them to specific HTTP statuses). Test with errors.Is.
+var (
+	// ErrNoFace is returned when no face is detected in an uploaded image.
+	ErrNoFace = errors.New("no face detected")
+	// ErrFaceIndex is returned when a requested face index is outside the
+	// detection order of the uploaded image.
+	ErrFaceIndex = errors.New("face index out of range")
+)
+
+// EnrollFace enrolls one specific face of an uploaded photo, chosen by a
+// 1-based index into the detection order (the same order /api/recognize
+// reports; detection is deterministic for the same bytes). The UI's
+// "name this face" action uses it to enroll one unknown face out of a
+// multi-person photo. See EnrollBytes for the file-naming and dataset
+// semantics.
+func EnrollFace(eng FaceEngine, database *db.DB, peopleDir, name, fileName string, imgBytes []byte, faceIndex int) (string, error) {
+	if err := CheckName(name); err != nil {
+		return "", err // fail before running inference
+	}
+	faces, err := eng.Detect(imgBytes)
+	if err != nil {
+		return "", fmt.Errorf("detect: %w", err)
+	}
+	if len(faces) == 0 {
+		return "", fmt.Errorf("%w in %s", ErrNoFace, fileName)
+	}
+	if faceIndex < 1 || faceIndex > len(faces) {
+		return "", fmt.Errorf("%w: %d (photo has %d face(s))", ErrFaceIndex, faceIndex, len(faces))
+	}
+	return saveEnrollment(eng, database, peopleDir, name, fileName, imgBytes, faces[faceIndex-1])
+}
+
 // EnrollBytes embeds a single uploaded image for a person, stores the
 // embedding in the database, and writes the original image bytes into the
 // people folder under the person's name, so runtime enrollments become part
@@ -250,10 +283,17 @@ func EnrollBytes(eng FaceEngine, database *db.DB, peopleDir, name, fileName stri
 		return "", fmt.Errorf("detect: %w", err)
 	}
 	if len(faces) == 0 {
-		return "", fmt.Errorf("no face detected in %s", fileName)
+		return "", fmt.Errorf("%w in %s", ErrNoFace, fileName)
 	}
 	best, _ := engine.LargestFace(faces)
-	emb, err := eng.EmbedFace(imgBytes, best)
+	return saveEnrollment(eng, database, peopleDir, name, fileName, imgBytes, best)
+}
+
+// saveEnrollment embeds the chosen face, writes the original image bytes into
+// the person's people folder under a content-derived name, and stores the
+// embedding in the database.
+func saveEnrollment(eng FaceEngine, database *db.DB, peopleDir, name, fileName string, imgBytes []byte, face engine.Face) (string, error) {
+	emb, err := eng.EmbedFace(imgBytes, face)
 	if err != nil {
 		return "", fmt.Errorf("embed: %w", err)
 	}
@@ -285,7 +325,7 @@ func EnrollBytes(eng FaceEngine, database *db.DB, peopleDir, name, fileName stri
 		// enroll it, so the dataset self-heals.
 		return "", err
 	}
-	saveThumb(database, name, fileName, imgBytes, best)
+	saveThumb(database, name, fileName, imgBytes, face)
 	return filepath.Join(folder, fileName), nil
 }
 
