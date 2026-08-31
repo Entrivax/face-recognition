@@ -269,3 +269,69 @@ func TestScanBackfillsThumbnail(t *testing.T) {
 		t.Fatalf("sidecar missing: %v", err)
 	}
 }
+
+// TestScanPrunesMissingPhotos checks that Prune drops DB photo entries whose
+// files vanished (one by one, or with the whole folder) and that a scan
+// without Prune leaves them untouched.
+func TestScanPrunesMissingPhotos(t *testing.T) {
+	peopleDir := t.TempDir()
+	database, err := db.Open(filepath.Join(t.TempDir(), "emb.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := &stubEngine{faces: testFace()}
+	b1 := pngBytes(t, 40, 40)
+	b2 := pngBytes(t, 41, 41)
+	name1 := db.HashBytes(b1)[:12] + ".png"
+	name2 := db.HashBytes(b2)[:12] + ".png"
+	if _, err := EnrollBytes(eng, database, peopleDir, "Bob", "a.png", b1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EnrollBytes(eng, database, peopleDir, "Bob", "b.png", b2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Without Prune, a deleted file is left alone in the DB.
+	if err := os.Remove(filepath.Join(peopleDir, "Bob", name2)); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Scan(eng, database, Options{PeopleDir: peopleDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.PhotosPruned != 0 {
+		t.Fatalf("prune without opt-in: pruned %d", res.PhotosPruned)
+	}
+	if p := database.Get("Bob"); p == nil || len(p.Photos) != 2 {
+		t.Fatalf("expected 2 photos without prune, got %+v", p)
+	}
+
+	// With Prune, the stale entry is dropped and the live one kept.
+	res, err = Scan(eng, database, Options{PeopleDir: peopleDir, Prune: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.PhotosPruned != 1 {
+		t.Fatalf("expected 1 pruned, got %+v", res)
+	}
+	p := database.Get("Bob")
+	if p == nil || len(p.Photos) != 1 || p.Photos[0].Path != name1 {
+		t.Fatalf("expected only %q to remain, got %+v", name1, p)
+	}
+
+	// A person whose folder vanished entirely loses all photo entries but
+	// stays enrolled (with zero photos).
+	if err := os.RemoveAll(filepath.Join(peopleDir, "Bob")); err != nil {
+		t.Fatal(err)
+	}
+	res, err = Scan(eng, database, Options{PeopleDir: peopleDir, Prune: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.PhotosPruned != 1 {
+		t.Fatalf("expected 1 pruned for the missing folder, got %+v", res)
+	}
+	if p := database.Get("Bob"); p == nil || len(p.Photos) != 0 {
+		t.Fatalf("person should remain enrolled with 0 photos, got %+v", p)
+	}
+}

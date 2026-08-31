@@ -54,6 +54,35 @@ el.rescanBtn.addEventListener("click", async () => {
 	}
 });
 
+// ---------- threshold ----------
+// The slider mirrors the server's persisted threshold; changing it POSTs to
+// /api/config, which also saves it for future restarts.
+async function loadThreshold() {
+	try {
+		const j = await api.getConfig();
+		el.thresholdSlider.value = String(j.threshold);
+		el.thresholdValue.textContent = Number(j.threshold).toFixed(2);
+	} catch (e) {
+		// Leave the slider at its default; the status pill shows the live value.
+	}
+}
+
+el.thresholdSlider.addEventListener("input", () => {
+	el.thresholdValue.textContent = Number(el.thresholdSlider.value).toFixed(2);
+});
+el.thresholdSlider.addEventListener("change", async () => {
+	const v = Number(el.thresholdSlider.value);
+	try {
+		const j = await api.setThreshold(v);
+		el.thresholdSlider.value = String(j.threshold);
+		el.thresholdValue.textContent = Number(j.threshold).toFixed(2);
+		showToast(`Threshold set to ${Number(j.threshold).toFixed(2)} (saved).`, "ok");
+		checkHealth();
+	} catch (e) {
+		showToast(e.message || "Could not set the threshold.", "err");
+	}
+});
+
 // ---------- keyboard ----------
 
 // keep Tab focus inside whichever dialog is on top
@@ -102,4 +131,5 @@ document.addEventListener("keydown", (e) => {
 // ---------- boot ----------
 checkHealth();
 loadPeople();
+loadThreshold();
 setInterval(checkHealth, 30000);

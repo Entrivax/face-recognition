@@ -232,6 +232,36 @@ func TestConfigThreshold(t *testing.T) {
 	}
 }
 
+// TestConfigThresholdPersists checks that POST /api/config writes the
+// threshold into the DB file so it survives a restart (openEngine restores it
+// unless an explicit --threshold flag overrides).
+func TestConfigThresholdPersists(t *testing.T) {
+	s, database := newTestServer(t, &stubEngine{threshold: 0.45})
+	req := httptest.NewRequest(http.MethodPost, "/api/config",
+		bytes.NewReader([]byte(`{"threshold":0.61}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set threshold: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if database.Threshold() == nil || *database.Threshold() != 0.61 {
+		t.Fatalf("threshold not persisted, db=%v", database.Threshold())
+	}
+	// An invalid value must not touch the stored setting.
+	req = httptest.NewRequest(http.MethodPost, "/api/config",
+		bytes.NewReader([]byte(`{"threshold":7}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+	if *database.Threshold() != 0.61 {
+		t.Fatalf("invalid request clobbered the stored threshold: %v", *database.Threshold())
+	}
+}
+
 func TestIndexServed(t *testing.T) {
 	s, _ := newTestServer(t, &stubEngine{})
 	for _, path := range []string{"/", "/app.js", "/style.css"} {

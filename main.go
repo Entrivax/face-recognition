@@ -11,12 +11,18 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 
 	"recogn/internal/api"
 	"recogn/internal/config"
@@ -36,26 +42,27 @@ func main() {
 	case "enroll":
 		fs := newFlagSet("enroll")
 		force := fs.Bool("force", false, "re-embed all photos, ignoring cached hashes")
-		cfg := parseFlags(fs, rest)
-		must(runEnroll(cfg, *force))
+		prune := fs.Bool("prune", false, "drop DB photo entries whose files are missing from the people folder")
+		cfg, set := parseFlags(fs, rest)
+		must(runEnroll(cfg, *force, *prune, set["threshold"]))
 	case "recognize":
 		fs := newFlagSet("recognize")
 		jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
-		cfg := parseFlags(fs, rest)
+		cfg, set := parseFlags(fs, rest)
 		if fs.NArg() == 0 {
 			fmt.Fprintln(os.Stderr, "recognize: provide at least one image path")
 			os.Exit(2)
 		}
-		must(runRecognize(cfg, fs.Args(), *jsonOut))
+		must(runRecognize(cfg, fs.Args(), *jsonOut, set["threshold"]))
 	case "people":
 		fs := newFlagSet("people")
 		jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
-		cfg := parseFlags(fs, rest)
+		cfg, _ := parseFlags(fs, rest)
 		must(runPeople(cfg, *jsonOut))
 	case "serve":
 		fs := newFlagSet("serve")
-		cfg := parseFlags(fs, rest)
-		must(runServe(cfg))
+		cfg, set := parseFlags(fs, rest)
+		must(runServe(cfg, set["threshold"]))
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -72,8 +79,9 @@ func newFlagSet(name string) *flag.FlagSet {
 }
 
 // parseFlags binds the shared config flags to fs, parses args, and returns the
-// resulting Config.
-func parseFlags(fs *flag.FlagSet, args []string) config.Config {
+// resulting Config plus the set of explicitly provided flags (used for the
+// threshold precedence: explicit flag > stored DB value > env/default).
+func parseFlags(fs *flag.FlagSet, args []string) (config.Config, map[string]bool) {
 	cfg := config.Default()
 	fs.StringVar(&cfg.Addr, "addr", cfg.Addr, "listen address (serve)")
 	fs.Float64Var(&cfg.Threshold, "threshold", cfg.Threshold,
@@ -81,14 +89,16 @@ func parseFlags(fs *flag.FlagSet, args []string) config.Config {
 	fs.StringVar(&cfg.PeopleDir, "people", cfg.PeopleDir, "people dataset directory")
 	fs.StringVar(&cfg.DBPath, "db", cfg.DBPath, "face database path")
 	_ = fs.Parse(args)
-	return cfg
+	set := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	return cfg, set
 }
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `recogn — face recognition (CLI + API + web UI)
 
 Usage:
-  recogn enroll [--force]              build or update the face DB from the people folder
+  recogn enroll [--force] [--prune]      build or update the face DB from the people folder
   recogn recognize [--json] <image...> detect & identify every face in the given photos
   recogn people [--json]               list enrolled identities
   recogn serve [--addr :8080]          start the REST API and web UI
@@ -109,7 +119,11 @@ To add someone new, drop a folder with their photos into people/ and run
 
 // openEngine builds the engine + DB and loads identities into the engine.
 // Inference runs in-process via CGO + the ONNX Runtime C API.
-func openEngine(cfg config.Config) (*engine.Engine, *db.DB, error) {
+//
+// Threshold precedence: an explicit --threshold flag wins; otherwise the value
+// persisted in the DB (set via POST /api/config or the UI slider); otherwise
+// the env/default in cfg.
+func openEngine(cfg config.Config, thresholdSet bool) (*engine.Engine, *db.DB, error) {
 	if err := engine.CheckModels(cfg.DetModelPath(), cfg.EmbModelPath()); err != nil {
 		return nil, nil, err
 	}
@@ -121,6 +135,11 @@ func openEngine(cfg config.Config) (*engine.Engine, *db.DB, error) {
 	if err != nil {
 		eng.Close()
 		return nil, nil, err
+	}
+	if !thresholdSet {
+		if t := database.Threshold(); t != nil {
+			eng.SetThreshold(*t)
+		}
 	}
 	refreshEngine(eng, database)
 	return eng, database, nil
@@ -142,8 +161,8 @@ func refreshEngine(eng *engine.Engine, database *db.DB) {
 	eng.SetKnown(known)
 }
 
-func runEnroll(cfg config.Config, force bool) error {
-	eng, database, err := openEngine(cfg)
+func runEnroll(cfg config.Config, force, prune, thresholdSet bool) error {
+	eng, database, err := openEngine(cfg, thresholdSet)
 	if err != nil {
 		return err
 	}
@@ -156,6 +175,7 @@ func runEnroll(cfg config.Config, force bool) error {
 	res, err := enroll.Scan(eng, database, enroll.Options{
 		PeopleDir: cfg.PeopleDir,
 		Force:     force,
+		Prune:     prune,
 		Progress: func(person, file string, idx, total int) {
 			fmt.Printf("\r  %-24s [%d/%d] %-40s", person, idx, total, truncate(file, 40))
 		},
@@ -166,8 +186,8 @@ func runEnroll(cfg config.Config, force bool) error {
 	}
 	refreshEngine(eng, database)
 
-	fmt.Printf("\nDone. people=%d  added=%d  kept=%d  failed=%d\n",
-		res.PeopleSeen, res.PhotosAdded, res.PhotosKept, res.PhotosFailed)
+	fmt.Printf("\nDone. people=%d  added=%d  kept=%d  failed=%d  pruned=%d\n",
+		res.PeopleSeen, res.PhotosAdded, res.PhotosKept, res.PhotosFailed, res.PhotosPruned)
 	if len(res.Skipped) > 0 {
 		fmt.Println("Skipped photos:")
 		for _, s := range res.Skipped {
@@ -179,8 +199,8 @@ func runEnroll(cfg config.Config, force bool) error {
 	return nil
 }
 
-func runRecognize(cfg config.Config, images []string, jsonOut bool) error {
-	eng, database, err := openEngine(cfg)
+func runRecognize(cfg config.Config, images []string, jsonOut, thresholdSet bool) error {
+	eng, database, err := openEngine(cfg, thresholdSet)
 	if err != nil {
 		return err
 	}
@@ -277,8 +297,8 @@ func runPeople(cfg config.Config, jsonOut bool) error {
 	return nil
 }
 
-func runServe(cfg config.Config) error {
-	eng, database, err := openEngine(cfg)
+func runServe(cfg config.Config, thresholdSet bool) error {
+	eng, database, err := openEngine(cfg, thresholdSet)
 	if err != nil {
 		return err
 	}
@@ -307,14 +327,45 @@ func runServe(cfg config.Config) error {
 		}
 	}
 
-	srv := api.New(cfg, eng, database, func(e api.Engine, d *db.DB) {
+	handler := api.New(cfg, eng, database, func(e api.Engine, d *db.DB) {
 		if ce, ok := e.(*engine.Engine); ok {
 			refreshEngine(ce, d)
 		}
-	})
+	}).Handler()
+
+	srv := &http.Server{
+		Addr:    cfg.Addr,
+		Handler: handler,
+		// Uploads are multipart images and inference is CPU-bound; keep the
+		// limits generous but bounded.
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       120 * time.Second,
+		WriteTimeout:      300 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	fmt.Printf("recogn serving on http://localhost%s  (people=%d, threshold=%.2f)\n",
-		normalizeAddr(cfg.Addr), len(database.People()), cfg.Threshold)
-	return srv.ListenAndServe()
+		normalizeAddr(cfg.Addr), len(database.People()), eng.Threshold())
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe() }()
+
+	// Graceful shutdown on Ctrl+C / SIGTERM: finish in-flight requests, then exit.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	select {
+	case err := <-errCh:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("shutdown: %w", err)
+	}
+	return nil
 }
 
 // helpers

@@ -22,6 +22,7 @@ export async function loadPeople() {
 		people.forEach((p) => {
 			const li = document.createElement("li");
 			li.className = "person-row";
+			li.dataset.name = p.name; // read by the search filter
 			const avatar = p.thumb
 				? `<img class="person-avatar person-avatar-img" src="${escapeHtml(p.thumb)}" alt="" data-initials="${escapeHtml(initials(p.name))}">`
 				: `<span class="person-avatar">${escapeHtml(initials(p.name))}</span>`;
@@ -51,10 +52,41 @@ export async function loadPeople() {
 			li.querySelector(".person-del").addEventListener("click", () => removePerson(p.name));
 			el.peopleList.appendChild(li);
 		});
+		applyFilter();
 	} catch (e) {
 		el.peopleCount.textContent = "Could not load people.";
 	}
 }
+
+// ---- search filter ----
+// Case-insensitive substring match over the rendered rows; the current filter
+// stays active across reloads. An all-filtered-out list shows a hint row.
+
+function applyFilter() {
+	const q = el.peopleSearch.value.trim().toLowerCase();
+	let visible = 0;
+	for (const li of el.peopleList.children) {
+		if (!(li instanceof HTMLLIElement) || !li.dataset.name) continue;
+		const hit = q === "" || li.dataset.name.toLowerCase().includes(q);
+		li.hidden = !hit;
+		if (hit) visible++;
+	}
+	// filter hint
+	let hint = el.peopleList.querySelector(".people-nomatch");
+	if (visible === 0 && q !== "" && el.peopleList.children.length > 0) {
+		if (!hint) {
+			hint = document.createElement("li");
+			hint.className = "people-nomatch";
+			el.peopleList.appendChild(hint);
+		}
+		hint.textContent = `No people match “${el.peopleSearch.value.trim()}”.`;
+		hint.hidden = false;
+	} else if (hint) {
+		hint.hidden = true;
+	}
+}
+
+el.peopleSearch.addEventListener("input", applyFilter);
 
 async function removePerson(name) {
 	if (!confirm(`Remove ${name} and all their photos from the database?`)) return;

@@ -183,19 +183,51 @@ func (e *Engine) MatchAll(emb []float32) []Match {
 	return out
 }
 
+// LargestFace returns the face with the largest bounding-box area and whether
+// any face was present. Enrollment and thumbnail selection both use the
+// largest face (the most reliable signal).
+func LargestFace(faces []Face) (Face, bool) {
+	if len(faces) == 0 {
+		return Face{}, false
+	}
+	best := faces[0]
+	bestArea := best.BBox[2] * best.BBox[3]
+	for _, f := range faces[1:] {
+		if a := f.BBox[2] * f.BBox[3]; a > bestArea {
+			best, bestArea = f, a
+		}
+	}
+	return best, true
+}
+
 // Recognize runs the full pipeline on one image: detect every face, embed and
 // match each, and annotate the returned faces with identities. Each face also
 // carries Matches: every enrolled person above the threshold, ranked — useful
 // for spotting near-tied identities (possible duplicate people).
+//
+// The image is decoded exactly once here and reused for every face's
+// alignment crop (detect decodes internally as well; per-face alignment used
+// to re-decode, which dominated CPU time on multi-face photos).
 func (e *Engine) Recognize(imgBytes []byte) ([]Face, error) {
 	faces, err := e.inf.detect(imgBytes)
 	if err != nil {
 		return nil, err
 	}
+	// Decode once for all alignments. detect() has already validated that the
+	// bytes decode, so this cannot fail in practice.
+	src, _, err := image.Decode(bytes.NewReader(imgBytes))
+	if err != nil {
+		return nil, fmt.Errorf("decode source image: %w", err)
+	}
 	for i := range faces {
-		emb, err := e.EmbedFace(imgBytes, faces[i])
+		aligned, err := alignFaceFromImage(src, faces[i])
 		if err != nil {
 			// A single bad crop shouldn't sink the whole photo.
+			faces[i].Name = "unknown"
+			continue
+		}
+		emb, err := e.inf.embedImage(aligned)
+		if err != nil {
 			faces[i].Name = "unknown"
 			continue
 		}
@@ -248,6 +280,12 @@ func alignFaceImage(imgBytes []byte, f Face) (*image.NRGBA, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode source image: %w", err)
 	}
+	return alignFaceFromImage(src, f)
+}
+
+// alignFaceFromImage is alignFaceImage for an already-decoded source image,
+// so callers that process many faces of one photo decode it only once.
+func alignFaceFromImage(src image.Image, f Face) (*image.NRGBA, error) {
 	if len(f.Landmarks) < 5 {
 		// Fall back to a plain bbox crop when landmarks are unavailable.
 		return cropBBoxImage(src, f.BBox)
@@ -261,20 +299,6 @@ func alignFaceImage(imgBytes []byte, f Face) (*image.NRGBA, error) {
 	// the inverse (dst->src) of the forward landmark transform.
 	inv := invertAffine(M)
 	return affineWarp(src, inv, 112, 112), nil
-}
-
-// alignFace is alignFaceImage but returns JPEG bytes (used by the sidecar
-// backend, which needs to ship the crop to a separate process).
-func alignFace(imgBytes []byte, f Face) ([]byte, error) {
-	dst, err := alignFaceImage(imgBytes, f)
-	if err != nil {
-		return nil, err
-	}
-	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 92}); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
 }
 
 // cropBBoxImage extracts a padded bounding-box crop (fallback when landmarks
@@ -294,19 +318,6 @@ func cropBBoxImage(src image.Image, bb [4]float64) (*image.NRGBA, error) {
 	}
 	cropped := cropImage(src, image.Rect(x0, y0, x1, y1))
 	return resizeBilinear(cropped, 112, 112), nil
-}
-
-// cropBBox is cropBBoxImage but returns JPEG bytes.
-func cropBBox(src image.Image, bb [4]float64) ([]byte, error) {
-	resized, err := cropBBoxImage(src, bb)
-	if err != nil {
-		return nil, err
-	}
-	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, resized, &jpeg.Options{Quality: 92}); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
 }
 
 // FaceThumb renders a square display thumbnail cropped around the face

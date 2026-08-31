@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"recogn/internal/config"
 	"recogn/internal/db"
@@ -64,12 +66,44 @@ func (s *Server) routes() {
 	s.mux = m
 }
 
-// Handler returns the root http.Handler (useful for httptest).
-func (s *Server) Handler() http.Handler { return s.mux }
+// Handler returns the root http.Handler (useful for httptest), wrapped in the
+// request logger.
+func (s *Server) Handler() http.Handler { return s.loggingMiddleware(s.mux) }
 
 // ListenAndServe starts the HTTP server on the configured address.
 func (s *Server) ListenAndServe() error {
-	return http.ListenAndServe(s.cfg.Addr, s.mux)
+	return http.ListenAndServe(s.cfg.Addr, s.Handler())
+}
+
+// loggingMiddleware logs one line per request: method, path, status, duration.
+func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		start := time.Now()
+		next.ServeHTTP(sw, r)
+		slog.Info("http",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", sw.status,
+			"duration", time.Since(start).Round(time.Millisecond).String(),
+		)
+	})
+}
+
+// statusWriter captures the response status code for logging while passing
+// every Write/WriteHeader through untouched.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+	wrote  bool
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	if !w.wrote {
+		w.status = code
+		w.wrote = true
+	}
+	w.ResponseWriter.WriteHeader(code)
 }
 
 // ---- handlers ----
@@ -345,13 +379,7 @@ func (s *Server) regenerateThumbAfterDelete(p *db.Person, deletedPhoto string) {
 		if err != nil || len(faces) == 0 {
 			continue
 		}
-		best := faces[0]
-		bestArea := best.BBox[2] * best.BBox[3]
-		for _, f := range faces[1:] {
-			if a := f.BBox[2] * f.BBox[3]; a > bestArea {
-				best, bestArea = f, a
-			}
-		}
+		best, _ := engine.LargestFace(faces)
 		jpg, err := engine.FaceThumb(b, best, enroll.ThumbSize)
 		if err != nil {
 			continue
@@ -406,13 +434,7 @@ func (s *Server) handleSelectThumb(w http.ResponseWriter, r *http.Request, name 
 		return
 	}
 	// Use the largest face, mirroring enrollment.
-	best := faces[0]
-	bestArea := best.BBox[2] * best.BBox[3]
-	for _, f := range faces[1:] {
-		if a := f.BBox[2] * f.BBox[3]; a > bestArea {
-			best, bestArea = f, a
-		}
-	}
+	best, _ := engine.LargestFace(faces)
 	jpg, err := engine.FaceThumb(b, best, enroll.ThumbSize)
 	if err != nil {
 		writeErr(w, http.StatusUnprocessableEntity, "could not crop face: "+err.Error())
@@ -642,9 +664,11 @@ func (s *Server) handleEnrollFolder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	force := r.URL.Query().Get("force") == "true"
+	prune := r.URL.Query().Get("prune") == "true"
 	res, err := enroll.Scan(s.eng, s.db, enroll.Options{
 		PeopleDir: s.cfg.PeopleDir,
 		Force:     force,
+		Prune:     prune,
 	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -656,6 +680,7 @@ func (s *Server) handleEnrollFolder(w http.ResponseWriter, r *http.Request) {
 		"added":         res.PhotosAdded,
 		"kept":          res.PhotosKept,
 		"failed":        res.PhotosFailed,
+		"pruned":        res.PhotosPruned,
 		"skipped_count": len(res.Skipped),
 	})
 }
@@ -715,6 +740,12 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.eng.SetThreshold(body.Threshold)
+		// Persist so the value survives restarts (restored in openEngine
+		// unless an explicit --threshold flag overrides it).
+		if err := s.db.SetThreshold(body.Threshold); err != nil {
+			writeErr(w, http.StatusInternalServerError, "persist threshold: "+err.Error())
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"threshold": s.eng.Threshold()})
 	default:
 		writeErr(w, http.StatusMethodNotAllowed, "unsupported method")

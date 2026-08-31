@@ -293,3 +293,36 @@ func TestConcurrentSave(t *testing.T) {
 		t.Errorf("expected some people after concurrent adds")
 	}
 }
+
+func TestThresholdPersistence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "emb.json")
+	d, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if d.Threshold() != nil {
+		t.Fatalf("fresh db should have no stored threshold, got %v", *d.Threshold())
+	}
+	if err := d.SetThreshold(0.62); err != nil {
+		t.Fatalf("SetThreshold: %v", err)
+	}
+	// Reopen: the value must survive.
+	d2, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if d2.Threshold() == nil || *d2.Threshold() != 0.62 {
+		t.Fatalf("stored threshold lost: %v", d2.Threshold())
+	}
+	// An explicitly stored 0 must survive too (pointer, not zero sentinel).
+	if err := d2.SetThreshold(0); err != nil {
+		t.Fatalf("SetThreshold(0): %v", err)
+	}
+	d3, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen 2: %v", err)
+	}
+	if d3.Threshold() == nil || *d3.Threshold() != 0 {
+		t.Fatalf("stored zero threshold lost: %v", d3.Threshold())
+	}
+}

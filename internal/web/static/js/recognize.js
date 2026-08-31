@@ -7,6 +7,10 @@ import { drawWhenReady } from "./overlay.js";
 
 function openPicker() { el.fileInput.click(); }
 
+// Object URL of the current stage preview. Revoked when replaced or cleared —
+// otherwise every inspected photo would stay pinned in memory for the session.
+let stageURL = null;
+
 el.dropzone.addEventListener("click", (e) => {
 	if (el.dzPreview.hidden) openPicker();
 });
@@ -47,6 +51,7 @@ function resetStage() {
 	el.againBtn.hidden = true;
 	el.results.hidden = true;
 	el.stageMeta.textContent = "";
+	if (stageURL) { URL.revokeObjectURL(stageURL); stageURL = null; }
 	el.previewImg.src = "";
 	el.dropzone.style.cursor = "pointer";
 }
@@ -58,6 +63,8 @@ export async function handleFile(file) {
 	}
 	// Show preview immediately.
 	const url = URL.createObjectURL(file);
+	if (stageURL) URL.revokeObjectURL(stageURL);
+	stageURL = url;
 	el.previewImg.src = url;
 	el.dzEmpty.hidden = true;
 	el.dzPreview.hidden = false;

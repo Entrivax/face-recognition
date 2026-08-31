@@ -49,9 +49,12 @@ var (
 )
 
 // fileFormat is the JSON document schema (versioned for future migrations).
+// Threshold is an additive, optional setting: nil when never set (older files
+// and fresh databases), and a pointer so an explicitly stored 0 survives.
 type fileFormat struct {
-	Version int       `json:"version"`
-	People  []*Person `json:"people"`
+	Version   int       `json:"version"`
+	People    []*Person `json:"people"`
+	Threshold *float64  `json:"threshold,omitempty"`
 }
 
 // Open loads the database from path, creating an empty one if it doesn't
@@ -77,6 +80,24 @@ func Open(path string) (*DB, error) {
 
 // Path returns the backing file path.
 func (d *DB) Path() string { return d.path }
+
+// Threshold returns the persisted match threshold, or nil when none was ever
+// stored. Callers fall back to the environment/default when nil.
+func (d *DB) Threshold() *float64 {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.data.Threshold
+}
+
+// SetThreshold persists the match threshold in the database file. The engine's
+// in-memory threshold is updated separately by the caller.
+func (d *DB) SetThreshold(t float64) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	v := t
+	d.data.Threshold = &v
+	return d.saveLocked()
+}
 
 // People returns a copy of all people, sorted by name.
 func (d *DB) People() []Person {

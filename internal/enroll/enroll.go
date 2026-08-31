@@ -7,6 +7,7 @@ package enroll
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"image"
 	"os"
@@ -24,6 +25,9 @@ type Result struct {
 	PhotosAdded  int
 	PhotosKept   int
 	PhotosFailed int
+	// PhotosPruned counts DB photo entries dropped because their file was
+	// missing from the people folder (only when Options.Prune is set).
+	PhotosPruned int
 	Skipped      []SkippedPhoto
 }
 
@@ -43,7 +47,12 @@ var imageExts = map[string]bool{
 type Options struct {
 	PeopleDir string
 	Force     bool // re-embed everything, ignoring content hashes
-	Progress  func(person, file string, idx, total int)
+	// Prune drops DB photo entries whose file no longer exists in the
+	// person's folder (and, when a person's folder disappeared entirely,
+	// all of their photo entries). Opt-in: datasets may be temporarily
+	// unmounted, so staleness is never cleaned up automatically.
+	Prune    bool
+	Progress func(person, file string, idx, total int)
 }
 
 // FaceEngine is the subset of the recognition engine that enrollment needs.
@@ -81,6 +90,9 @@ func Scan(eng FaceEngine, database *db.DB, opts Options) (Result, error) {
 			continue
 		}
 		res.PeopleSeen++
+		if opts.Prune {
+			res.PhotosPruned += pruneMissing(database, name, files)
+		}
 		for i, f := range files {
 			if opts.Progress != nil {
 				opts.Progress(name, f, i+1, len(files))
@@ -102,7 +114,58 @@ func Scan(eng FaceEngine, database *db.DB, opts Options) (Result, error) {
 			}
 		}
 	}
+	if opts.Prune {
+		// People whose dataset folder disappeared entirely never appear in
+		// the loop above; drop their photo entries too (the person stays
+		// enrolled, with zero photos).
+		res.PhotosPruned += pruneMissingPeople(database, opts.PeopleDir)
+	}
 	return res, nil
+}
+
+// pruneMissing removes DB photo entries of the named person whose file is not
+// among the folder's listed images. Returns how many entries were removed.
+func pruneMissing(database *db.DB, name string, files []string) int {
+	p := database.Get(name)
+	if p == nil || len(p.Photos) == 0 {
+		return 0
+	}
+	present := make(map[string]bool, len(files))
+	for _, f := range files {
+		present[f] = true
+	}
+	n := 0
+	// Snapshot the paths: RemovePhoto mutates the person's photo slice.
+	paths := make([]string, 0, len(p.Photos))
+	for _, ph := range p.Photos {
+		paths = append(paths, ph.Path)
+	}
+	for _, path := range paths {
+		if !present[path] {
+			if removed, err := database.RemovePhoto(name, path); err == nil && removed {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// pruneMissingPeople removes every DB photo entry for people whose folder is
+// entirely gone from the people dir. Returns the number of removed entries.
+func pruneMissingPeople(database *db.DB, peopleDir string) int {
+	n := 0
+	for _, p := range database.People() {
+		folder := filepath.Join(peopleDir, p.Name)
+		if _, err := os.Stat(folder); !errors.Is(err, os.ErrNotExist) {
+			continue // folder exists (or stat failed) — leave it alone
+		}
+		for _, ph := range p.Photos {
+			if removed, err := database.RemovePhoto(p.Name, ph.Path); err == nil && removed {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // ThumbSize is the pixel size (square) of the generated face thumbnails.
@@ -154,13 +217,7 @@ func enrollOne(eng FaceEngine, database *db.DB, name, folder, file string, force
 		return false, "no face detected", nil
 	}
 	// Use the largest face for enrollment (most reliable signal).
-	best := faces[0]
-	bestArea := area(best.BBox)
-	for _, f := range faces[1:] {
-		if a := area(f.BBox); a > bestArea {
-			best, bestArea = f, a
-		}
-	}
+	best, _ := engine.LargestFace(faces)
 	if unchanged {
 		// The photo is unchanged, but the person still lacks a thumbnail:
 		// crop only — no re-embedding, no DB write.
@@ -195,13 +252,7 @@ func EnrollBytes(eng FaceEngine, database *db.DB, peopleDir, name, fileName stri
 	if len(faces) == 0 {
 		return "", fmt.Errorf("no face detected in %s", fileName)
 	}
-	best := faces[0]
-	bestArea := area(best.BBox)
-	for _, f := range faces[1:] {
-		if a := area(f.BBox); a > bestArea {
-			best, bestArea = f, a
-		}
-	}
+	best, _ := engine.LargestFace(faces)
 	emb, err := eng.EmbedFace(imgBytes, best)
 	if err != nil {
 		return "", fmt.Errorf("embed: %w", err)
@@ -262,8 +313,6 @@ func CheckName(name string) error {
 	}
 	return nil
 }
-
-func area(bb [4]float64) float64 { return bb[2] * bb[3] }
 
 // imageExt returns the file extension for imgBytes' actual format (decided by
 // sniffing the decoded header, not by the upload's original name, so the saved

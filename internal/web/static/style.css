@@ -216,7 +216,45 @@ html, body {
 .people-actions { margin-top: 16px; }
 .people-actions .btn { width: 100%; }
 
-.people-list { list-style: none; margin: 18px 0 0; padding: 0; display: grid; gap: 8px; max-height: 52vh; overflow: auto; }
+/* threshold slider — POSTs to /api/config, which persists it server-side */
+.threshold-row {
+	display: flex; align-items: center; gap: 10px;
+	margin-top: 14px;
+	padding: 10px 12px;
+	border: 1px solid var(--line-soft); border-radius: 8px;
+	background: var(--bg-raise);
+}
+.threshold-label {
+	font-family: var(--mono); font-size: 10.5px; font-weight: 500;
+	text-transform: uppercase; letter-spacing: 1.2px;
+	color: var(--ink-faint); flex-shrink: 0;
+}
+.threshold-row input[type="range"] {
+	flex: 1; min-width: 0; accent-color: var(--accent);
+}
+.threshold-value {
+	font-family: var(--mono); font-size: 12px; color: var(--match);
+	min-width: 40px; text-align: right;
+}
+
+/* search filter above the people list */
+.people-search { margin-top: 12px; }
+.people-search input {
+	width: 100%;
+	background: var(--bg-raise); border: 1px solid var(--line);
+	border-radius: 8px; color: var(--ink);
+	padding: 8px 12px; font-family: var(--display); font-size: 13px;
+}
+.people-search input:focus { outline: none; border-color: var(--accent); }
+.people-search input::placeholder { color: var(--ink-faint); }
+
+.people-list { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 8px; max-height: 52vh; overflow: auto; }
+/* `hidden` must beat .person-row's display:flex */
+.person-row[hidden] { display: none; }
+.people-nomatch {
+	padding: 10px 12px; border: 1px dashed var(--line); border-radius: 8px;
+	font-family: var(--mono); font-size: 11px; color: var(--ink-faint);
+}
 .person-row {
 	display: flex; align-items: center; gap: 12px;
 	padding: 10px 12px;

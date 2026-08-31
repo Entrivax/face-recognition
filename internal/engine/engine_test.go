@@ -92,3 +92,24 @@ func TestCheckModels(t *testing.T) {
 		t.Errorf("expected error for missing models")
 	}
 }
+
+func TestLargestFace(t *testing.T) {
+	faces := []Face{
+		{BBox: [4]float64{0, 0, 10, 10}}, // 100
+		{BBox: [4]float64{5, 5, 40, 30}}, // 1200 — largest
+		{BBox: [4]float64{1, 1, 20, 20}}, // 400
+	}
+	best, ok := LargestFace(faces)
+	if !ok || best.BBox != faces[1].BBox {
+		t.Fatalf("LargestFace = %+v ok=%v, want %+v", best, ok, faces[1])
+	}
+	// Single face.
+	best, ok = LargestFace(faces[:1])
+	if !ok || best.BBox != faces[0].BBox {
+		t.Fatalf("single face: got %+v ok=%v", best, ok)
+	}
+	// Empty set.
+	if _, ok := LargestFace(nil); ok {
+		t.Fatal("empty set should report ok=false")
+	}
+}

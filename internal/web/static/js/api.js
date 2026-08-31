@@ -17,6 +17,25 @@ export async function getPeople() {
 	return parse(r);
 }
 
+export async function getConfig() {
+	const r = await fetch("/api/config");
+	const j = await parse(r);
+	if (!r.ok) throw new Error(j.error || "could not read config");
+	return j;
+}
+
+// Persist the match threshold server-side (survives restarts).
+export async function setThreshold(value) {
+	const r = await fetch("/api/config", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ threshold: value }),
+	});
+	const j = await parse(r);
+	if (!r.ok) throw new Error(j.error || "could not set the threshold");
+	return j;
+}
+
 export async function getPerson(name) {
 	const r = await fetch(`/api/people/${encodeURIComponent(name)}`);
 	const j = await parse(r);

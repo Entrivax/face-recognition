@@ -69,8 +69,19 @@
 			<p class="lede" id="peopleCount">Loading…</p>
 		</div>
 
+		<div class="threshold-row">
+			<label class="threshold-label" for="thresholdSlider" title="Minimum cosine similarity for a positive match — higher means fewer false positives">Threshold</label>
+			<input id="thresholdSlider" type="range" min="0.30" max="0.70" step="0.01" value="0.45"
+						 aria-label="Match threshold">
+			<span class="threshold-value" id="thresholdValue">0.45</span>
+		</div>
+
 		<div class="people-actions">
 			<button id="enrollBtn" class="btn btn-accent" aria-haspopup="dialog">Enroll new person</button>
+		</div>
+
+		<div class="people-search">
+			<input id="peopleSearch" type="search" placeholder="Filter people…" autocomplete="off" spellcheck="false" aria-label="Filter people by name">
 		</div>
 
 		<ul id="peopleList" class="people-list"></ul>
