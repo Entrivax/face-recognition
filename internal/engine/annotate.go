@@ -62,9 +62,9 @@ func Annotate(imgBytes []byte, faces []Face) ([]byte, error) {
 }
 
 var (
-	annotMatch   = color.RGBA{R: 56, G: 224, B: 200, A: 255}  // teal — matches the web UI
-	annotUnknown = color.RGBA{R: 245, G: 181, B: 63, A: 255}  // amber
-	annotLabelBg = color.RGBA{R: 11, G: 14, B: 18, A: 217}    // rgba(11,14,18,0.85)
+	annotMatch   = color.RGBA{R: 56, G: 224, B: 200, A: 255} // teal — matches the web UI
+	annotUnknown = color.RGBA{R: 245, G: 181, B: 63, A: 255} // amber
+	annotLabelBg = color.RGBA{R: 11, G: 14, B: 18, A: 217}   // rgba(11,14,18,0.85)
 )
 
 // drawBrackets draws the four corner brackets of the bbox (clipped to the

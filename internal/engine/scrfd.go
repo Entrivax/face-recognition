@@ -58,7 +58,7 @@ func decodeSCRFD(outputs [][]float32, detScale float64, inputSize int) []Face {
 		scores := outputs[idx]
 		bboxPreds := outputs[idx+fmc]
 		kpsPreds := outputs[idx+fmc*2]
-		fs := float32(stride) // preds are multiplied by stride (mirrors sidecar)
+		fs := float32(stride) // preds are multiplied by stride (mirrors the reference insightface/SCRFD implementation)
 
 		height := inputSize / stride
 		width := inputSize / stride
@@ -128,8 +128,8 @@ func decodeSCRFD(outputs [][]float32, detScale float64, inputSize int) []Face {
 	return faces
 }
 
-// nmsIndices returns the indices of detections to keep after greedy NMS,
-// mirroring the sidecar's _nms (order by score desc, suppress IoU > thresh).
+// nmsIndices returns the indices of detections to keep after greedy NMS:
+// order by score desc, suppress IoU > thresh.
 func nmsIndices(dets []rawDetection, thresh float32) []int {
 	n := len(dets)
 	if n == 0 {

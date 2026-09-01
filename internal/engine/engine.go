@@ -1,7 +1,8 @@
 // Package engine owns the face-recognition pipeline: detect faces in an
 // image, align each to 112x112, compute embeddings, and match them against a
-// set of known identities. Inference itself is delegated to a Python ONNX
-// sidecar (see sidecar.go); this file holds the pure-Go logic around it.
+// set of known identities. Inference runs in-process via CGO + the ONNX
+// Runtime C API (see internal/onnxrt); this file holds the pure-Go logic
+// around it.
 package engine
 
 import (

@@ -560,8 +560,10 @@ func (d *DB) RenamePerson(oldName, newName string) (*Person, error) {
 		}
 	}
 	// Move the thumbnail sidecar with the ID change (a case-only rename
-	// keeps the ID, so nothing to do there).
+	// keeps the ID, so nothing to do there). If the transaction below fails,
+	// the move is undone best-effort so disk and DB stay consistent.
 	thumb, thumbSrc := p.Thumb, p.ThumbSrc
+	thumbMoved := false
 	if id != p.ID && thumb != "" {
 		oldThumb := filepath.Join(d.ThumbDir(), thumb)
 		if _, err := os.Stat(oldThumb); err == nil {
@@ -571,7 +573,7 @@ func (d *DB) RenamePerson(oldName, newName string) (*Person, error) {
 			if err := os.Rename(oldThumb, filepath.Join(d.ThumbDir(), id+".jpg")); err != nil {
 				return nil, fmt.Errorf("rename thumbnail: %w", err)
 			}
-			thumb = id + ".jpg"
+			thumb, thumbMoved = id+".jpg", true
 		} else {
 			// Sidecar already gone: clear the stale record so the next
 			// rescan backfills a thumbnail under the new ID.
@@ -613,6 +615,11 @@ func (d *DB) RenamePerson(oldName, newName string) (*Person, error) {
 		return nil
 	})
 	if err != nil {
+		// The sidecar already moved to <newID>.jpg; move it back best-effort
+		// so a failed transaction doesn't leave it under the new ID.
+		if thumbMoved {
+			_ = os.Rename(filepath.Join(d.ThumbDir(), thumb), filepath.Join(d.ThumbDir(), p.Thumb))
+		}
 		return nil, err
 	}
 	p.ID, p.Name, p.Thumb, p.ThumbSrc = id, newName, thumb, thumbSrc

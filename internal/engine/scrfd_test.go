@@ -36,7 +36,7 @@ func TestNMSIndices(t *testing.T) {
 	// Two heavily-overlapping boxes -> keep only the higher-scored one.
 	dets := []rawDetection{
 		mk(0, 0, 10, 10, 0.9),
-		mk(1, 1, 11, 11, 0.8), // overlaps ~68% with box 0
+		mk(1, 1, 11, 11, 0.8),       // overlaps ~68% with box 0
 		mk(100, 100, 110, 110, 0.7), // disjoint
 	}
 	keep := nmsIndices(dets, 0.4)

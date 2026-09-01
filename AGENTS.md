@@ -11,7 +11,7 @@ written in **Go** with **CGO**. It maintains a database of known people (from a
 identifies each one (name + confidence, or `unknown`). It runs on CPU.
 
 Current state: **complete and working.** Inference runs **in-process via CGO +
-the ONNX Runtime C API** (no Python, no subprocess). Enrolled 11 people / 38
+the ONNX Runtime C API** (no Python, no subprocess). Enrolled 24 people / 66
 photos, all tests pass, Docker image builds and runs (~508 MB).
 
 ## Architecture (important — don't reinvent this)
@@ -74,7 +74,7 @@ internal/
     paste.js             clipboard routing (enroll → photos → stage)
 third_party/onnxruntime/ ORT C header + libonnxruntime.so (via `make ort`)
 models/                  det_10g.onnx, w600k_r50.onnx  (gitignored; downloaded)
-people/<Name>/*.jpg      the dataset — 11 people, 38 photos
+people/<Name>/*.jpg      the dataset — 24 people, 66 photos enrolled
 data/faces.db            generated face DB (bbolt, gitignored)
 data/embeddings.json     JSON interchange copy (gitignored): auto-imported when
                          the store is empty; written by `recogn export`
@@ -125,7 +125,7 @@ export GOPATH=$PWD/.gopath GOMODCACHE=$PWD/.gomodcache GOCACHE=$PWD/.gocache \
   so the checksum db is writable.
 - Flags are **per-subcommand** (`flag.NewFlagSet`) and Go stops flag parsing at
   the first positional arg: `./recogn recognize --json img.jpg` ✓, `... img.jpg --json` ✗.
-- Not a git repo yet — `git init` if you want history.
+- The repo is a plain **git** repo — history exists, no special workflow (no hooks/CI).
 
 ## Verified baseline (don't regress these)
 
@@ -207,6 +207,10 @@ command hits a permission error.
   LE` (`encodePhoto`/`decodePhoto`; decode rejects size mismatches).
 - Embeddings are stripped from API/CLI JSON output (`Face.Embedding` is `json:"-"`
   or nil-ed) — don't leak 512-float arrays to clients.
+- **API request bodies are capped**: 32 MiB (`maxUpload`) on `/api/recognize`
+  and the enroll endpoints (multipart images), 1 MiB on JSON bodies
+  (`POST /api/config`, `POST /api/people/{name}/rename`, …). Wrap new
+  handlers' bodies in `http.MaxBytesReader`/`io.LimitReader` the same way.
 - Enrollment stores **one embedding per photo** (largest face) and matches
   per-person by best similarity. Photos with no detectable face are skipped with
   a warning, never stored. DB photo paths are **basenames relative to the
@@ -243,6 +247,11 @@ command hits a permission error.
   folder move rolls the folder back. Photo paths and `ThumbSrc` are
   folder-relative basenames, so they need no rewrite; the engine identity set
   reloads via `s.reload()` afterwards.
+- **Deleting a person** (Remove button in the people list →
+  `DELETE /api/people/{name}`): removes the DB record and the thumbnail
+  sidecar, then deletes `people/<Name>/` best-effort — otherwise the next
+  rescan would silently re-enroll the person. The response reports
+  `"folder_removed"` (false when the folder couldn't be removed).
 - **onnxrt memory discipline**: every `OrtValue`/buffer allocated in the C shim
   is freed (tensor data via `ort_free`, sessions via `ort_close`). If you extend
   the shim, keep the ownership rules in `onnxrt.h` accurate and re-run the

@@ -10,12 +10,12 @@ import (
 )
 
 // cgoInferencer runs SCRFD + ArcFace in-process via the ONNX Runtime C API
-// (see internal/onnxrt). It replaces the Python sidecar: detection
-// pre/post-processing and face embedding are done here in Go, with only the
-// raw model execution delegated to libonnxruntime through CGO.
+// (see internal/onnxrt): detection pre/post-processing and face embedding are
+// done here in Go, with only the raw model execution delegated to
+// libonnxruntime through CGO.
 //
-// Like the sidecar, it is serialized with a mutex — CPU inference here is
-// single-stream and ORT sessions are not run concurrently.
+// Inference is serialized with a mutex — CPU inference here is single-stream
+// and ORT sessions are not run concurrently.
 type cgoInferencer struct {
 	det *onnxrt.Session
 	emb *onnxrt.Session
@@ -80,7 +80,7 @@ func (c *cgoInferencer) embedImage(aligned *image.NRGBA) ([]float32, error) {
 		return nil, fmt.Errorf("embedder returned %d outputs, want 1", len(outs))
 	}
 	emb := outs[0].Data
-	// L2-normalise (ArcFace output), mirroring the sidecar.
+	// L2-normalise (ArcFace output is unit L2 norm).
 	var norm float64
 	for _, v := range emb {
 		norm += float64(v) * float64(v)

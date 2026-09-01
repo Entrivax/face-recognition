@@ -7,7 +7,7 @@ import (
 )
 
 // Preprocessing converts decoded images into the float32 CHW tensors the ONNX
-// models expect, replicating exactly what the Python sidecar did with OpenCV.
+// models expect, matching the reference insightface/OpenCV pipeline exactly.
 //
 // Detector (SCRFD): letterbox the image into a 640x640 canvas (aspect ratio
 // preserved, top-left anchored, zero padding), then normalise with
@@ -26,7 +26,7 @@ const detInputSize = 640
 // map detected coordinates back to the original image space.
 type detLetterbox struct {
 	tensor []float32 // 1x3x640x640 CHW
-	scale  float64   // det_scale from the sidecar: resizedHeight / origHeight
+	scale  float64   // det_scale: resizedHeight / origHeight
 	newW   int
 	newH   int
 }
@@ -71,9 +71,9 @@ func preprocessDetect(imgBytes []byte) (*detLetterbox, error) {
 		for x := 0; x < newW; x++ {
 			r, g, bl, _ := resized.At(x, y).RGBA()
 			// RGBA() returns 16-bit; convert to 8-bit.
-			rf := float32(r>>8)
-			gf := float32(g>>8)
-			bf := float32(bl>>8)
+			rf := float32(r >> 8)
+			gf := float32(g >> 8)
+			bf := float32(bl >> 8)
 			idx := y*detInputSize + x
 			tensor[0*plane+idx] = (rf - mean) * inv
 			tensor[1*plane+idx] = (gf - mean) * inv

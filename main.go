@@ -182,7 +182,7 @@ func runEnroll(cfg config.Config, force, prune, thresholdSet bool) error {
 
 	fmt.Printf("Enrolling from %s (model warmup may take a moment)...\n", cfg.PeopleDir)
 	if err := eng.Ping(); err != nil {
-		return fmt.Errorf("inference sidecar failed to start: %w", err)
+		return fmt.Errorf("inference backend failed to start: %w", err)
 	}
 	res, err := enroll.Scan(eng, database, enroll.Options{
 		PeopleDir: cfg.PeopleDir,
@@ -213,7 +213,7 @@ func runEnroll(cfg config.Config, force, prune, thresholdSet bool) error {
 
 // fileResult is the per-image recognition outcome (also the --json record).
 // raw keeps the original bytes for --draw; encoding/json skips it.
-type fileResultT struct {
+type fileResult struct {
 	Image string        `json:"image"`
 	Faces []engine.Face `json:"faces"`
 	Error string        `json:"error,omitempty"`
@@ -231,14 +231,14 @@ func runRecognize(cfg config.Config, images []string, jsonOut bool, drawArg stri
 		fmt.Fprintln(os.Stderr, "warning: face database is empty — run 'recogn enroll' first")
 	}
 	if err := eng.Ping(); err != nil {
-		return fmt.Errorf("inference sidecar failed to start: %w", err)
+		return fmt.Errorf("inference backend failed to start: %w", err)
 	}
 
-	var all []fileResultT
+	var all []fileResult
 	hadErr := false
 
 	for _, imgPath := range images {
-		fr := fileResultT{Image: imgPath}
+		fr := fileResult{Image: imgPath}
 		b, err := os.ReadFile(imgPath)
 		if err != nil {
 			fr.Error = err.Error()
@@ -286,9 +286,6 @@ func runRecognize(cfg config.Config, images []string, jsonOut bool, drawArg stri
 		}
 		for i, f := range fr.Faces {
 			label := f.Name
-			if label == "unknown" {
-				label = "unknown"
-			}
 			fmt.Printf("  face %d: %-22s confidence=%.2f  bbox=(%.0f,%.0f %.0fx%.0f)  det=%.2f\n",
 				i+1, label, f.Confidence, f.BBox[0], f.BBox[1], f.BBox[2], f.BBox[3], f.Score)
 		}
@@ -304,8 +301,8 @@ func runRecognize(cfg config.Config, images []string, jsonOut bool, drawArg stri
 // verbatim) or a directory (one <base>.annotated.jpg per input). Progress
 // lines go to stdout in normal mode, stderr in --json mode so the JSON on
 // stdout stays machine-readable.
-func writeAnnotated(drawArg string, results []fileResultT, jsonOut bool) error {
-	var ok []fileResultT
+func writeAnnotated(drawArg string, results []fileResult, jsonOut bool) error {
+	var ok []fileResult
 	for _, fr := range results {
 		if fr.Error == "" && fr.raw != nil {
 			ok = append(ok, fr)
@@ -400,7 +397,7 @@ func runServe(cfg config.Config, thresholdSet bool) error {
 		if _, statErr := os.Stat(cfg.PeopleDir); statErr == nil {
 			fmt.Println("Face DB is empty; enrolling from people/ first...")
 			if err := eng.Ping(); err != nil {
-				return fmt.Errorf("inference sidecar failed to start: %w", err)
+				return fmt.Errorf("inference backend failed to start: %w", err)
 			}
 			res, err := enroll.Scan(eng, database, enroll.Options{
 				PeopleDir: cfg.PeopleDir,
