@@ -59,11 +59,11 @@ func (s *Server) routes() {
 	m.HandleFunc("/", s.handleIndex)
 	m.HandleFunc("/api/health", s.handleHealth)
 	m.HandleFunc("/api/recognize", s.handleRecognize)
-	m.HandleFunc("/api/people", s.handlePeople)              // GET list
-	m.HandleFunc("/api/people/", s.handlePersonSubroutes)     // enroll/delete
-	m.HandleFunc("/api/enroll", s.handleEnrollFolder)         // rescan people/
-	m.HandleFunc("/api/config", s.handleConfig)               // GET/POST threshold
-	m.HandleFunc("/api/thumbs/", s.handleThumb)               // face thumbnails
+	m.HandleFunc("/api/people", s.handlePeople)           // GET list
+	m.HandleFunc("/api/people/", s.handlePersonSubroutes) // enroll/delete
+	m.HandleFunc("/api/enroll", s.handleEnrollFolder)     // rescan people/
+	m.HandleFunc("/api/config", s.handleConfig)           // GET/POST threshold
+	m.HandleFunc("/api/thumbs/", s.handleThumb)           // face thumbnails
 	s.mux = m
 }
 
@@ -131,7 +131,7 @@ func (s *Server) handleRecognize(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "POST required")
 		return
 	}
-	img, err := readImage(r)
+	img, err := readImage(w, r)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -170,11 +170,11 @@ func (s *Server) handlePeople(w http.ResponseWriter, r *http.Request) {
 	}
 	people := s.db.People()
 	type summary struct {
-		ID      string `json:"id"`
-		Name    string `json:"name"`
-		Photos  int    `json:"photos"`
-		Embeds  int    `json:"embeddings"`
-		Thumb   string `json:"thumb"`
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		Photos int    `json:"photos"`
+		Embeds int    `json:"embeddings"`
+		Thumb  string `json:"thumb"`
 	}
 	out := make([]summary, 0, len(people))
 	for _, p := range people {
@@ -507,6 +507,17 @@ func thumbURL(personID, srcPhoto string) string {
 }
 
 func (s *Server) handleDeletePerson(w http.ResponseWriter, r *http.Request, name string) {
+	if err := enroll.CheckName(name); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	p := s.db.Get(name)
+	if p == nil {
+		writeErr(w, http.StatusNotFound, "person not found")
+		return
+	}
+	// Capture the canonical name before the record is gone.
+	dir := filepath.Join(s.cfg.PeopleDir, p.Name)
 	removed, err := s.db.RemovePerson(name)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -516,8 +527,19 @@ func (s *Server) handleDeletePerson(w http.ResponseWriter, r *http.Request, name
 		writeErr(w, http.StatusNotFound, "person not found")
 		return
 	}
+	// Best-effort: drop the dataset folder too, otherwise the next rescan
+	// silently re-enrolls the deleted person ("resurrection"). CheckName
+	// guarantees no separators, so only the direct folder is removed.
+	folderRemoved := true
+	if err := os.RemoveAll(dir); err != nil {
+		folderRemoved = false
+		slog.Warn("remove people folder", "dir", dir, "err", err)
+	}
 	s.reload()
-	writeJSON(w, http.StatusOK, map[string]any{"removed": name})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"removed":        name,
+		"folder_removed": folderRemoved,
+	})
 }
 
 // handleRenamePerson renames a person end-to-end: the people/<Name> dataset
@@ -550,7 +572,7 @@ func (s *Server) handleRenamePerson(w http.ResponseWriter, r *http.Request, oldN
 		writeErr(w, http.StatusNotFound, "person not found")
 		return
 	}
-	oldCanonical := p.Name // p aliases the DB record; capture before mutating
+	oldCanonical := p.Name // db.Get returns a copy; use the canonical name for the folder
 	if newName == oldCanonical {
 		writeErr(w, http.StatusBadRequest, "new name is unchanged")
 		return
@@ -616,6 +638,7 @@ func (s *Server) handleEnrollPerson(w http.ResponseWriter, r *http.Request, name
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxUpload)
 	if err := r.ParseMultipartForm(maxUpload); err != nil {
 		writeErr(w, http.StatusBadRequest, "parse form: "+err.Error())
 		return
@@ -689,6 +712,7 @@ func (s *Server) handleEnrollFace(w http.ResponseWriter, r *http.Request, name s
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxUpload)
 	if err := r.ParseMultipartForm(maxUpload); err != nil {
 		writeErr(w, http.StatusBadRequest, "parse form: "+err.Error())
 		return
@@ -813,6 +837,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, map[string]any{"threshold": s.eng.Threshold()})
 	case http.MethodPost:
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		var body struct {
 			Threshold float64 `json:"threshold"`
 		}
@@ -847,7 +872,8 @@ func (s *Server) reload() {
 // ---- helpers ----
 
 // readImage extracts image bytes from a multipart "image" field or raw body.
-func readImage(r *http.Request) ([]byte, error) {
+func readImage(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxUpload)
 	ct := r.Header.Get("Content-Type")
 	if strings.HasPrefix(ct, "multipart/form-data") {
 		if err := r.ParseMultipartForm(maxUpload); err != nil {
@@ -863,7 +889,9 @@ func readImage(r *http.Request) ([]byte, error) {
 		return nil, errors.New("multipart field 'image' not found")
 	}
 	defer r.Body.Close()
-	b, err := io.ReadAll(io.LimitReader(r.Body, maxUpload))
+	// The body is MaxBytesReader-capped above, so ReadAll stops at maxUpload
+	// with an error instead of buffering an unbounded stream.
+	b, err := io.ReadAll(r.Body)
 	if err != nil {
 		return nil, err
 	}

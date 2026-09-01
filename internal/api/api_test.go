@@ -30,9 +30,9 @@ func (s *stubEngine) Detect(b []byte) ([]engine.Face, error)    { return s.faces
 func (s *stubEngine) EmbedFace(b []byte, f engine.Face) ([]float32, error) {
 	return []float32{0.1, 0.2}, nil
 }
-func (s *stubEngine) SetThreshold(t float64)   { s.threshold = t }
-func (s *stubEngine) Threshold() float64        { return s.threshold }
-func (s *stubEngine) Ping() error               { return nil }
+func (s *stubEngine) SetThreshold(t float64) { s.threshold = t }
+func (s *stubEngine) Threshold() float64     { return s.threshold }
+func (s *stubEngine) Ping() error            { return nil }
 
 func newTestServer(t *testing.T, eng Engine) (*Server, *db.DB) {
 	t.Helper()
@@ -1101,5 +1101,76 @@ func TestThumbChooserNoFace(t *testing.T) {
 	}
 	if p := database.Get("Bob"); p.Thumb != "" {
 		t.Errorf("failed selection must not create a thumbnail")
+	}
+}
+
+// TestBodyTooLarge checks that request bodies over the size cap are rejected
+// with 400 instead of being buffered (or spilling to temp files).
+func TestBodyTooLarge(t *testing.T) {
+	s, _ := newTestServer(t, &stubEngine{threshold: 0.45})
+
+	// /api/config caps at 1 MiB.
+	req := httptest.NewRequest(http.MethodPost, "/api/config",
+		bytes.NewReader(make([]byte, (1<<20)+1)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("oversized config body: got %d, want 400", rec.Code)
+	}
+
+	// /api/recognize raw body caps at maxUpload.
+	req = httptest.NewRequest(http.MethodPost, "/api/recognize",
+		bytes.NewReader(make([]byte, maxUpload+1)))
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("oversized recognize body: got %d, want 400", rec.Code)
+	}
+}
+
+// TestDeletePersonRemovesFolder checks that deleting a person also removes
+// their dataset folder, so a rescan cannot re-enroll them.
+func TestDeletePersonRemovesFolder(t *testing.T) {
+	s, database := newTestServer(t, &stubEngine{})
+	if err := database.AddPhoto("Alice", "a/1.jpg", []byte("x"), []float32{1}); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(s.cfg.PeopleDir, "Alice")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.jpg"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/people/Alice", nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		FolderRemoved bool `json:"folder_removed"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.FolderRemoved {
+		t.Errorf("folder_removed = false, want true")
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("people folder still exists after delete")
+	}
+	if database.Get("Alice") != nil {
+		t.Errorf("Alice should be removed from the DB")
+	}
+
+	// A bad name is rejected before anything happens.
+	req = httptest.NewRequest(http.MethodDelete, "/api/people/.hidden", nil)
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("bad name: got %d, want 400", rec.Code)
 	}
 }

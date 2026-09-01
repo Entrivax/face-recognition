@@ -318,6 +318,25 @@ func TestReplaceSamePath(t *testing.T) {
 	}
 }
 
+// TestGetReturnsCopy checks that Get/GetByID hand out copies: mutating the
+// returned pointer must not touch the stored record.
+func TestGetReturnsCopy(t *testing.T) {
+	d := openTemp(t)
+	if err := d.AddPhoto("Alice", "a/1.jpg", []byte("x"), []float32{1}); err != nil {
+		t.Fatal(err)
+	}
+	p := d.Get("Alice")
+	p.Name = "MUTATED"
+	p.Photos = nil
+	byID := d.GetByID(p.ID)
+	byID.Photos = nil
+	byID.Name = "ALSO-MUTATED"
+	fresh := d.Get("Alice")
+	if fresh == nil || fresh.Name != "Alice" || len(fresh.Photos) != 1 {
+		t.Fatalf("stored record was mutated through the returned pointer: %+v", fresh)
+	}
+}
+
 func TestAddPhotoIDCollision(t *testing.T) {
 	d := openTemp(t)
 	if err := d.AddPhoto("Bob", "b/1.jpg", []byte("x"), []float32{1}); err != nil {

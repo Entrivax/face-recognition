@@ -350,11 +350,17 @@ func (d *DB) People() []Person {
 	return out
 }
 
-// Get returns a person by name (case-insensitive), or nil.
+// Get returns a person by name (case-insensitive), or nil. The returned
+// pointer refers to a copy: mutating it never affects the stored record.
 func (d *DB) Get(name string) *Person {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return d.findLocked(name)
+	p := d.findLocked(name)
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	return &cp
 }
 
 func (d *DB) findLocked(name string) *Person {
@@ -366,11 +372,17 @@ func (d *DB) findLocked(name string) *Person {
 	return nil
 }
 
-// GetByID returns a person by ID, or nil.
+// GetByID returns a person by ID, or nil. The returned pointer refers to a
+// copy: mutating it never affects the stored record.
 func (d *DB) GetByID(id string) *Person {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return d.findByIDLocked(id)
+	p := d.findByIDLocked(id)
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	return &cp
 }
 
 func (d *DB) findByIDLocked(id string) *Person {
