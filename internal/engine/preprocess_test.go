@@ -10,8 +10,8 @@ import (
 )
 
 // makeJPEG encodes a solid-colour image of the given size to JPEG bytes.
-func makeJPEG(t *testing.T, w, h int, c color.RGBA) []byte {
-	t.Helper()
+func makeJPEG(tb testing.TB, w, h int, c color.RGBA) []byte {
+	tb.Helper()
 	img := image.NewNRGBA(image.Rect(0, 0, w, h))
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
@@ -20,7 +20,7 @@ func makeJPEG(t *testing.T, w, h int, c color.RGBA) []byte {
 	}
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	return buf.Bytes()
 }
@@ -96,5 +96,94 @@ func TestPreprocessFace(t *testing.T) {
 	if math.Abs(float64(tensor[plane])-1.0) > 1e-3 ||
 		math.Abs(float64(tensor[2*plane])-1.0) > 1e-3 {
 		t.Errorf("G/B channels not ~1.0: %v %v", tensor[plane], tensor[2*plane])
+	}
+}
+
+// --- Benchmarks (informational: they measure the preprocessing hot paths the
+// direct-Pix fast paths in engine.go / preprocess.go optimise) ---
+
+// benchGradientNRGBA fills a w x h NRGBA with a deterministic opaque gradient,
+// so benchmarks exercise the opaque fast path with realistic per-pixel work.
+func benchGradientNRGBA(w, h int) *image.NRGBA {
+	img := image.NewNRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.SetNRGBA(x, y, color.NRGBA{
+				R: uint8(x * 255 / (w - 1)),
+				G: uint8(y * 255 / (h - 1)),
+				B: uint8((x*x + 3*y) % 256),
+				A: 0xff,
+			})
+		}
+	}
+	return img
+}
+
+// benchPhotoJPEG builds a deterministic w x h JPEG with per-pixel variation,
+// so its decode cost resembles a real photo rather than a flat fill.
+func benchPhotoJPEG(tb testing.TB, w, h int) []byte {
+	tb.Helper()
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, benchGradientNRGBA(w, h), &jpeg.Options{Quality: 92}); err != nil {
+		tb.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// BenchmarkPreprocessDetect covers the full detector input path: JPEG decode,
+// letterbox resize (bilinear) and the 3x640x640 CHW tensor build.
+func BenchmarkPreprocessDetect(b *testing.B) {
+	img := benchPhotoJPEG(b, 1024, 768)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := preprocessDetect(img); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkPreprocessFace covers the embedder input path: aligned 112x112
+// NRGBA -> normalised 3x112x112 CHW tensor.
+func BenchmarkPreprocessFace(b *testing.B) {
+	img := benchGradientNRGBA(112, 112)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		preprocessFace(img)
+	}
+}
+
+// BenchmarkResizeBilinear covers the letterbox resize on an opaque NRGBA.
+func BenchmarkResizeBilinear(b *testing.B) {
+	src := benchGradientNRGBA(640, 480)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		resizeBilinear(src, 320, 240)
+	}
+}
+
+// BenchmarkAffineWarp112 covers the Umeyama backward warp that renders one
+// aligned 112x112 face crop.
+func BenchmarkAffineWarp112(b *testing.B) {
+	src := benchGradientNRGBA(320, 240)
+	m := [2][3]float64{{0.9, -0.2, 60}, {0.2, 0.9, -20}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		affineWarp(src, m, 112, 112)
+	}
+}
+
+// BenchmarkCropImage covers the bbox crop used by thumbnails and the
+// landmark-less alignment fallback.
+func BenchmarkCropImage(b *testing.B) {
+	src := benchGradientNRGBA(400, 300)
+	r := image.Rect(40, 30, 240, 190)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cropImage(src, r)
 	}
 }

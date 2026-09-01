@@ -148,13 +148,16 @@ func (e *Engine) MatchEmbedding(emb []float32) (Match, bool) {
 }
 
 // bestPerPerson computes every known person's best cosine similarity to emb
-// (one entry per person, regardless of threshold).
+// (one entry per person, regardless of threshold). The query's own norm is
+// computed once here (see cosineWithNorm) instead of once per enrolled
+// embedding.
 func (e *Engine) bestPerPerson(emb []float32) map[string]Match {
 	best := make(map[string]Match, len(e.known))
+	sqrtNa := sqrtNorm(emb)
 	for _, p := range e.known {
 		m := Match{PersonID: p.ID, Name: p.Name, Score: -1}
 		for _, pe := range p.Embeddings {
-			if s := Cosine(emb, pe); s > m.Score {
+			if s := cosineWithNorm(emb, pe, sqrtNa); s > m.Score {
 				m.Score = s
 			}
 		}
@@ -163,15 +166,14 @@ func (e *Engine) bestPerPerson(emb []float32) map[string]Match {
 	return best
 }
 
-// MatchAll returns every enrolled person whose best cosine similarity to emb
-// clears the threshold, ranked best-first (ties broken by name). One entry
-// per person: a person with several enrolled photos contributes only their
-// best-scoring embedding.
-func (e *Engine) MatchAll(emb []float32) []Match {
-	all := e.bestPerPerson(emb)
+// matchesAboveThreshold filters a bestPerPerson result to the entries whose
+// score clears thresh, ranked best-first (ties broken by name). Shared by
+// MatchAll and Recognize so Recognize needs only one bestPerPerson pass —
+// previously the unknown-face path computed the map twice.
+func matchesAboveThreshold(all map[string]Match, thresh float64) []Match {
 	out := make([]Match, 0, len(all))
 	for _, m := range all {
-		if m.Score >= e.thresh {
+		if m.Score >= thresh {
 			out = append(out, m)
 		}
 	}
@@ -182,6 +184,14 @@ func (e *Engine) MatchAll(emb []float32) []Match {
 		return out[i].Name < out[j].Name
 	})
 	return out
+}
+
+// MatchAll returns every enrolled person whose best cosine similarity to emb
+// clears the threshold, ranked best-first (ties broken by name). One entry
+// per person: a person with several enrolled photos contributes only their
+// best-scoring embedding.
+func (e *Engine) MatchAll(emb []float32) []Match {
+	return matchesAboveThreshold(e.bestPerPerson(emb), e.thresh)
 }
 
 // LargestFace returns the face with the largest bounding-box area and whether
@@ -233,7 +243,10 @@ func (e *Engine) Recognize(imgBytes []byte) ([]Face, error) {
 			continue
 		}
 		faces[i].Embedding = emb
-		matches := e.MatchAll(emb)
+		// One bestPerPerson pass feeds both the threshold-filtered Matches and
+		// (when nothing clears the threshold) the near-miss confidence hint.
+		all := e.bestPerPerson(emb)
+		matches := matchesAboveThreshold(all, e.thresh)
 		faces[i].Matches = matches
 		if len(matches) > 0 {
 			faces[i].Confidence = math.Max(0, matches[0].Score)
@@ -243,7 +256,7 @@ func (e *Engine) Recognize(imgBytes []byte) ([]Face, error) {
 			// Nothing cleared the threshold; keep the near-miss score as the
 			// displayed confidence hint.
 			best := -1.0
-			for _, m := range e.bestPerPerson(emb) {
+			for _, m := range all {
 				if m.Score > best {
 					best = m.Score
 				}
@@ -272,6 +285,37 @@ func Cosine(a, b []float32) float64 {
 		return 0
 	}
 	return dot / (math.Sqrt(na) * math.Sqrt(nb))
+}
+
+// sqrtNorm returns sqrt(sum(a[i]^2)), accumulated in the same index order as
+// the na accumulation inside Cosine, so hoisting it out of a per-embedding
+// loop keeps the arithmetic bit-identical.
+func sqrtNorm(a []float32) float64 {
+	var na float64
+	for i := range a {
+		na += float64(a[i]) * float64(a[i])
+	}
+	return math.Sqrt(na)
+}
+
+// cosineWithNorm is Cosine(a, b) with a's norm precomputed via sqrtNorm.
+// bestPerPerson uses it to pay the query norm once per face instead of once
+// per enrolled embedding. Bit-identical to Cosine: the dot product and nb are
+// accumulated in the same order, and the final division uses the same
+// sqrt(na)*sqrt(nb) product — only the sqrt(na) operand is reused.
+func cosineWithNorm(a, b []float32, sqrtNa float64) float64 {
+	if len(a) == 0 || len(b) == 0 || len(a) != len(b) {
+		return 0
+	}
+	var dot, nb float64
+	for i := range a {
+		dot += float64(a[i]) * float64(b[i])
+		nb += float64(b[i]) * float64(b[i])
+	}
+	if sqrtNa == 0 || nb == 0 {
+		return 0
+	}
+	return dot / (sqrtNa * math.Sqrt(nb))
 }
 
 // alignFaceImage warps the face described by f's 5-point landmarks into a
@@ -362,6 +406,70 @@ func FaceThumb(imgBytes []byte, f Face, size int) ([]byte, error) {
 // origin.
 func cropImage(src image.Image, r image.Rectangle) *image.NRGBA {
 	dst := image.NewNRGBA(image.Rect(0, 0, r.Dx(), r.Dy()))
+	// Type-checked once per call, not once per pixel. The generic At/Set copy
+	// at the bottom is kept for every other source type (e.g. *image.YCbCr
+	// from JPEG) and for rects reaching outside the source, where At() yields
+	// transparent zeros but direct Pix indexing would be invalid — per-pixel
+	// semantics must not change in either case.
+	switch s := src.(type) {
+	case *image.NRGBA:
+		if !r.In(s.Rect) {
+			break
+		}
+		// Read src.Pix directly instead of src.At(...)/dst.Set(...).
+		// Exactness: At() returns color.NRGBA and dst.Set runs it through
+		// color.NRGBAModel, which identity-returns its own NRGBA type (the
+		// stdlib model functions short-circuit their own concrete type) — so
+		// Set stores the source bytes verbatim, alpha included. A plain row
+		// copy therefore reproduces the generic path byte for byte; no
+		// premultiply/unpremultiply round trip may be inserted here (NRGBA is
+		// NOT premultiplied, so that would corrupt semi-transparent pixels).
+		for y := 0; y < r.Dy(); y++ {
+			si := s.PixOffset(r.Min.X, r.Min.Y+y)
+			di := y * dst.Stride
+			copy(dst.Pix[di:di+4*r.Dx()], s.Pix[si:si+4*r.Dx()])
+		}
+		return dst
+	case *image.RGBA:
+		if !r.In(s.Rect) {
+			break
+		}
+		// RGBA stores alpha-premultiplied bytes, so At().RGBA() returns
+		// v8*0x101 for every channel (no per-pixel alpha multiply);
+		// NRGBAModel has no RGBA fast path, so dst.Set really un-premultiplies
+		// through the model — replicated below with the model's exact integer
+		// math (same floor divisions): opaque stores the bytes as-is
+		// ((v8*0x101)>>8 == v8), fully transparent zeroes them (even a
+		// nonzero premultiplied RGB), and anything between un-premultiplies
+		// as r' = (R*0x101*0xffff)/(A*0x101) = R*0xffff/A, with alpha stored
+		// as uint8((A*0x101)>>8) == A.
+		for y := 0; y < r.Dy(); y++ {
+			si := s.PixOffset(r.Min.X, r.Min.Y+y)
+			di := y * dst.Stride
+			for x := 0; x < r.Dx(); x++ {
+				R, G, B, A := s.Pix[si], s.Pix[si+1], s.Pix[si+2], s.Pix[si+3]
+				switch A {
+				case 0xff:
+					dst.Pix[di], dst.Pix[di+1], dst.Pix[di+2], dst.Pix[di+3] = R, G, B, 0xff
+				case 0:
+					dst.Pix[di], dst.Pix[di+1], dst.Pix[di+2], dst.Pix[di+3] = 0, 0, 0, 0
+				default:
+					a := uint32(A)
+					dst.Pix[di] = uint8((uint32(R) * 0xffff / a) >> 8)
+					dst.Pix[di+1] = uint8((uint32(G) * 0xffff / a) >> 8)
+					dst.Pix[di+2] = uint8((uint32(B) * 0xffff / a) >> 8)
+					dst.Pix[di+3] = A
+				}
+				si += 4
+				di += 4
+			}
+		}
+		return dst
+	}
+	// Generic fallback: the original per-pixel copy. Reached by non-NRGBA/RGBA
+	// sources via the switch's default path and by NRGBA/RGBA sources whose
+	// rect is not fully inside the source (the fast cases above break); At()
+	// returns transparent zeros outside bounds, exactly as before.
 	for y := 0; y < r.Dy(); y++ {
 		for x := 0; x < r.Dx(); x++ {
 			dst.Set(x, y, src.At(r.Min.X+x, r.Min.Y+y))
@@ -378,11 +486,42 @@ func resizeBilinear(src image.Image, w, h int) *image.NRGBA {
 	if sw == 0 || sh == 0 {
 		return dst
 	}
-	for y := 0; y < h; y++ {
-		fy := (float64(y)+0.5)*float64(sh)/float64(h) - 0.5 + float64(sb.Min.Y)
-		for x := 0; x < w; x++ {
-			fx := (float64(x)+0.5)*float64(sw)/float64(w) - 0.5 + float64(sb.Min.X)
-			dst.Set(x, y, bilinear(src, sb, fx, fy))
+	// The source type is checked once per call; the generic fallback keeps the
+	// original per-pixel At/Set path for every other source type (e.g.
+	// *image.YCbCr from JPEG), whose semantics must not change.
+	switch s := src.(type) {
+	case *image.NRGBA:
+		// Identical fx/fy arithmetic to the generic loop; only the per-sample
+		// read (Pix instead of At().RGBA()) and the write (setNRGBA8 instead
+		// of dst.Set) differ, both proven byte-exact (see their comments).
+		for y := 0; y < h; y++ {
+			fy := (float64(y)+0.5)*float64(sh)/float64(h) - 0.5 + float64(sb.Min.Y)
+			di := y * dst.Stride
+			for x := 0; x < w; x++ {
+				fx := (float64(x)+0.5)*float64(sw)/float64(w) - 0.5 + float64(sb.Min.X)
+				c := bilinearNRGBA(s, sb, fx, fy)
+				setNRGBA8(dst.Pix[di:di+4:di+4], c)
+				di += 4
+			}
+		}
+	case *image.RGBA:
+		for y := 0; y < h; y++ {
+			fy := (float64(y)+0.5)*float64(sh)/float64(h) - 0.5 + float64(sb.Min.Y)
+			di := y * dst.Stride
+			for x := 0; x < w; x++ {
+				fx := (float64(x)+0.5)*float64(sw)/float64(w) - 0.5 + float64(sb.Min.X)
+				c := bilinearRGBA(s, sb, fx, fy)
+				setNRGBA8(dst.Pix[di:di+4:di+4], c)
+				di += 4
+			}
+		}
+	default:
+		for y := 0; y < h; y++ {
+			fy := (float64(y)+0.5)*float64(sh)/float64(h) - 0.5 + float64(sb.Min.Y)
+			for x := 0; x < w; x++ {
+				fx := (float64(x)+0.5)*float64(sw)/float64(w) - 0.5 + float64(sb.Min.X)
+				dst.Set(x, y, bilinear(src, sb, fx, fy))
+			}
 		}
 	}
 	return dst
@@ -471,12 +610,40 @@ func invertAffine(m [2][3]float64) [2][3]float64 {
 func affineWarp(src image.Image, m [2][3]float64, w, h int) *image.NRGBA {
 	dst := image.NewNRGBA(image.Rect(0, 0, w, h))
 	sb := src.Bounds()
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			fx := m[0][0]*float64(x) + m[0][1]*float64(y) + m[0][2]
-			fy := m[1][0]*float64(x) + m[1][1]*float64(y) + m[1][2]
-			c := bilinear(src, sb, fx, fy)
-			dst.Set(x, y, c)
+	// Source type checked once per call; the generic fallback keeps the
+	// original per-pixel At/Set path for other source types (e.g. *image.YCbCr
+	// from JPEG), whose semantics must not change.
+	switch s := src.(type) {
+	case *image.NRGBA:
+		for y := 0; y < h; y++ {
+			di := y * dst.Stride
+			for x := 0; x < w; x++ {
+				fx := m[0][0]*float64(x) + m[0][1]*float64(y) + m[0][2]
+				fy := m[1][0]*float64(x) + m[1][1]*float64(y) + m[1][2]
+				c := bilinearNRGBA(s, sb, fx, fy)
+				setNRGBA8(dst.Pix[di:di+4:di+4], c)
+				di += 4
+			}
+		}
+	case *image.RGBA:
+		for y := 0; y < h; y++ {
+			di := y * dst.Stride
+			for x := 0; x < w; x++ {
+				fx := m[0][0]*float64(x) + m[0][1]*float64(y) + m[0][2]
+				fy := m[1][0]*float64(x) + m[1][1]*float64(y) + m[1][2]
+				c := bilinearRGBA(s, sb, fx, fy)
+				setNRGBA8(dst.Pix[di:di+4:di+4], c)
+				di += 4
+			}
+		}
+	default:
+		for y := 0; y < h; y++ {
+			for x := 0; x < w; x++ {
+				fx := m[0][0]*float64(x) + m[0][1]*float64(y) + m[0][2]
+				fy := m[1][0]*float64(x) + m[1][1]*float64(y) + m[1][2]
+				c := bilinear(src, sb, fx, fy)
+				dst.Set(x, y, c)
+			}
 		}
 	}
 	return dst
@@ -512,6 +679,116 @@ func bilinear(src image.Image, b image.Rectangle, fx, fy float64) (nrgba color8)
 		g: uint8(clamp(lerp(g00, g10, g01, g11))),
 		b: uint8(clamp(lerp(b00, b10, b01, b11))),
 		a: uint8(clamp(lerp(a00, a10, a01, a11))),
+	}
+}
+
+// sampleNRGBA returns the four float64 samples bilinear() would derive from
+// src.At(x, y).RGBA()/257 for an *image.NRGBA source. Exact: for opaque pixels
+// (A==0xff) At().RGBA() returns v8*0x101 and v8*0x101/257 == v8 exactly in
+// float64, so the raw Pix byte IS the sample; alpha is A*0x101/257 == A. For
+// semi-transparent pixels NRGBA.RGBA() premultiplies (r16 = R*0x101*A/0xff,
+// integer floor) — replicated here with the same integer math before the /257,
+// and the alpha sample stays float64(A).
+func sampleNRGBA(s *image.NRGBA, b image.Rectangle, x, y int) [4]float64 {
+	if x < b.Min.X || y < b.Min.Y || x >= b.Max.X || y >= b.Max.Y {
+		return [4]float64{}
+	}
+	i := s.PixOffset(x, y)
+	r8, g8, b8, a8 := s.Pix[i], s.Pix[i+1], s.Pix[i+2], s.Pix[i+3]
+	if a8 == 0xff {
+		return [4]float64{float64(r8), float64(g8), float64(b8), float64(a8)}
+	}
+	a := uint32(a8)
+	return [4]float64{
+		float64(uint32(r8)*0x101*a/0xff) / 257,
+		float64(uint32(g8)*0x101*a/0xff) / 257,
+		float64(uint32(b8)*0x101*a/0xff) / 257,
+		float64(a8),
+	}
+}
+
+// sampleRGBA is sampleNRGBA for *image.RGBA sources. RGBA stores
+// alpha-premultiplied bytes, so At().RGBA() returns v8*0x101 for every pixel
+// and v8*0x101/257 == v8 exactly — the raw Pix byte IS the sample, for alpha
+// included.
+func sampleRGBA(s *image.RGBA, b image.Rectangle, x, y int) [4]float64 {
+	if x < b.Min.X || y < b.Min.Y || x >= b.Max.X || y >= b.Max.Y {
+		return [4]float64{}
+	}
+	i := s.PixOffset(x, y)
+	return [4]float64{
+		float64(s.Pix[i]), float64(s.Pix[i+1]),
+		float64(s.Pix[i+2]), float64(s.Pix[i+3]),
+	}
+}
+
+// blendBilinear lerps the four bilinear corner samples and clamps to 8 bits.
+// The specialised bilinearNRGBA/bilinearRGBA share it; the operations and their
+// order are identical to the lerp closure inside bilinear().
+func blendBilinear(s00, s10, s01, s11 [4]float64, dx, dy float64) color8 {
+	lerp := func(v00, v10, v01, v11 float64) float64 {
+		top := v00*(1-dx) + v10*dx
+		bot := v01*(1-dx) + v11*dx
+		return top*(1-dy) + bot*dy
+	}
+	return color8{
+		r: uint8(clamp(lerp(s00[0], s10[0], s01[0], s11[0]))),
+		g: uint8(clamp(lerp(s00[1], s10[1], s01[1], s11[1]))),
+		b: uint8(clamp(lerp(s00[2], s10[2], s01[2], s11[2]))),
+		a: uint8(clamp(lerp(s00[3], s10[3], s01[3], s11[3]))),
+	}
+}
+
+// bilinearNRGBA is bilinear specialised for *image.NRGBA sources: samples come
+// straight from Pix (see sampleNRGBA for the exactness argument) with the same
+// floor/lerp/clamp arithmetic as bilinear.
+func bilinearNRGBA(s *image.NRGBA, b image.Rectangle, fx, fy float64) color8 {
+	x0 := int(math.Floor(fx))
+	y0 := int(math.Floor(fy))
+	x1 := x0 + 1
+	y1 := y0 + 1
+	dx := fx - float64(x0)
+	dy := fy - float64(y0)
+	return blendBilinear(
+		sampleNRGBA(s, b, x0, y0), sampleNRGBA(s, b, x1, y0),
+		sampleNRGBA(s, b, x0, y1), sampleNRGBA(s, b, x1, y1),
+		dx, dy,
+	)
+}
+
+// bilinearRGBA is bilinearNRGBA for *image.RGBA sources.
+func bilinearRGBA(s *image.RGBA, b image.Rectangle, fx, fy float64) color8 {
+	x0 := int(math.Floor(fx))
+	y0 := int(math.Floor(fy))
+	x1 := x0 + 1
+	y1 := y0 + 1
+	dx := fx - float64(x0)
+	dy := fy - float64(y0)
+	return blendBilinear(
+		sampleRGBA(s, b, x0, y0), sampleRGBA(s, b, x1, y0),
+		sampleRGBA(s, b, x0, y1), sampleRGBA(s, b, x1, y1),
+		dx, dy,
+	)
+}
+
+// setNRGBA8 writes c into a 4-byte NRGBA Pix slice with exactly the semantics
+// of (*image.NRGBA).Set(x, y, c), i.e. color.NRGBAModel.Convert(c): opaque
+// (a==0xff) stores the channels as-is (At().RGBA() = v8*0x101, (v8*0x101)>>8 ==
+// v8), fully transparent zeroes them, and anything between is un-premultiplied
+// with the same integer floor division the model performs
+// (r' = (r16*0xffff)/a16 = (c.r*0xffff)/c.a after cancelling 0x101).
+func setNRGBA8(pix []uint8, c color8) {
+	switch c.a {
+	case 0xff:
+		pix[0], pix[1], pix[2], pix[3] = c.r, c.g, c.b, 0xff
+	case 0:
+		pix[0], pix[1], pix[2], pix[3] = 0, 0, 0, 0
+	default:
+		a := uint32(c.a)
+		pix[0] = uint8((uint32(c.r) * 0xffff / a) >> 8)
+		pix[1] = uint8((uint32(c.g) * 0xffff / a) >> 8)
+		pix[2] = uint8((uint32(c.b) * 0xffff / a) >> 8)
+		pix[3] = c.a
 	}
 }
 

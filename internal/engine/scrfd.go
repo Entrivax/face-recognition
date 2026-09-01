@@ -1,6 +1,9 @@
 package engine
 
-import "sort"
+import (
+	"sort"
+	"sync"
+)
 
 // SCRFD post-processing, ported from python/infer.py (which mirrors the
 // insightface SCRFD implementation). It decodes the detector's raw output
@@ -28,13 +31,38 @@ type rawDetection struct {
 	kps            [5][2]float32
 }
 
-// anchorCenters builds the (N,2) anchor-center grid for a feature map of
-// height x width at the given stride, with numAnchors per location. Cached by
-// the caller.
+// anchor-center grids are pure constants for a given feature-map geometry, but
+// decodeSCRFD used to rebuild them on every detection. They are cached by
+// (height, width, stride, numAnchors); the cached slice is shared between
+// calls, so callers must treat it as read-only (decodeSCRFD does).
+var (
+	anchorCentersMu    sync.Mutex
+	anchorCentersCache = map[[4]int][][2]float32{}
+)
+
+// anchorCenters returns the (N,2) anchor-center grid for a feature map of
+// height x width at the given stride, with numAnchors per location, cached by
+// geometry. The values are identical to building the grid fresh every call.
 func anchorCenters(height, width, stride, numAnchors int) [][2]float32 {
+	key := [4]int{height, width, stride, numAnchors}
+	anchorCentersMu.Lock()
+	c, ok := anchorCentersCache[key]
+	anchorCentersMu.Unlock()
+	if ok {
+		return c
+	}
+	c = buildAnchorCenters(height, width, stride, numAnchors)
+	anchorCentersMu.Lock()
+	anchorCentersCache[key] = c
+	anchorCentersMu.Unlock()
+	return c
+}
+
+// buildAnchorCenters constructs one grid: np.mgrid[:height,:width][::-1] gives
+// (x,y) per cell, then * stride.
+func buildAnchorCenters(height, width, stride, numAnchors int) [][2]float32 {
 	n := height * width * numAnchors
 	out := make([][2]float32, 0, n)
-	// np.mgrid[:height,:width][::-1] gives (x,y) per cell, then * stride.
 	for i := 0; i < height; i++ {
 		for j := 0; j < width; j++ {
 			cx := float32(j * stride)

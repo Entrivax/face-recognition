@@ -67,17 +67,36 @@ func preprocessDetect(imgBytes []byte) (*detLetterbox, error) {
 		tensor[i] = padVal
 	}
 	plane := detInputSize * detInputSize
+	// resized is always *image.NRGBA (resizeBilinear's output type), so read
+	// its Pix bytes directly instead of going through resized.At().RGBA().
+	// Exactness: for opaque pixels (A==0xff) NRGBA.RGBA() returns v8*0x101 and
+	// (v8*0x101)>>8 == v8 — the same value the generic path's r>>8 produces —
+	// and v8*0x101/257 == v8 exactly in float64. Semi-transparent pixels
+	// (only possible for sources with an alpha channel) replicate the
+	// premultiplication NRGBA.RGBA() performs before the >>8, so every
+	// tensor value is bit-identical to the generic loop.
 	for y := 0; y < newH; y++ {
+		row := resized.Pix[resized.PixOffset(0, y):]
+		idx := y * detInputSize
 		for x := 0; x < newW; x++ {
-			r, g, bl, _ := resized.At(x, y).RGBA()
-			// RGBA() returns 16-bit; convert to 8-bit.
-			rf := float32(r >> 8)
-			gf := float32(g >> 8)
-			bf := float32(bl >> 8)
-			idx := y*detInputSize + x
+			i := x * 4
+			r8, g8, b8, a8 := row[i], row[i+1], row[i+2], row[i+3]
+			var rf, gf, bf float32
+			if a8 == 0xff {
+				rf = float32(r8)
+				gf = float32(g8)
+				bf = float32(b8)
+			} else {
+				// NRGBA.RGBA() premultiplies: v16 = v8*0x101*A/0xff.
+				a := uint32(a8)
+				rf = float32((uint32(r8) * 0x101 * a / 0xff) >> 8)
+				gf = float32((uint32(g8) * 0x101 * a / 0xff) >> 8)
+				bf = float32((uint32(b8) * 0x101 * a / 0xff) >> 8)
+			}
 			tensor[0*plane+idx] = (rf - mean) * inv
 			tensor[1*plane+idx] = (gf - mean) * inv
 			tensor[2*plane+idx] = (bf - mean) * inv
+			idx++
 		}
 	}
 	return &detLetterbox{tensor: tensor, scale: scale, newW: newW, newH: newH}, nil
@@ -92,6 +111,39 @@ func preprocessFace(aligned *image.NRGBA) []float32 {
 	plane := size * size
 	tensor := make([]float32, 3*plane)
 	b := aligned.Bounds()
+	// The aligned input is exactly size x size (affineWarp / resizeBilinear
+	// output), so read its Pix bytes directly — byte-exact versus the generic
+	// At().RGBA() path for the same reason as preprocessDetect (opaque
+	// NRGBA pixels: v8*0x101>>8 == v8; semi-transparent ones replicate the
+	// premultiplication below).
+	if aligned.Rect.Dx() >= size && aligned.Rect.Dy() >= size {
+		for y := 0; y < size; y++ {
+			i := aligned.PixOffset(b.Min.X, b.Min.Y+y)
+			idx := y * size
+			for x := 0; x < size; x++ {
+				r8, g8, b8, a8 := aligned.Pix[i], aligned.Pix[i+1], aligned.Pix[i+2], aligned.Pix[i+3]
+				var rf, gf, bf float32
+				if a8 == 0xff {
+					rf = float32(r8)
+					gf = float32(g8)
+					bf = float32(b8)
+				} else {
+					a := uint32(a8)
+					rf = float32((uint32(r8) * 0x101 * a / 0xff) >> 8)
+					gf = float32((uint32(g8) * 0x101 * a / 0xff) >> 8)
+					bf = float32((uint32(b8) * 0x101 * a / 0xff) >> 8)
+				}
+				tensor[0*plane+idx] = (rf - mean) * inv
+				tensor[1*plane+idx] = (gf - mean) * inv
+				tensor[2*plane+idx] = (bf - mean) * inv
+				i += 4
+				idx++
+			}
+		}
+		return tensor
+	}
+	// Generic fallback (input smaller than 112x112: At() returns transparent
+	// zeros outside the rect, exactly like the original loop).
 	for y := 0; y < size; y++ {
 		for x := 0; x < size; x++ {
 			r, g, bl, _ := aligned.At(b.Min.X+x, b.Min.Y+y).RGBA()
