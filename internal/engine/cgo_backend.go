@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"fmt"
 	"image"
 	"math"
@@ -100,7 +101,17 @@ func (c *cgoInferencer) ping() error {
 }
 
 func (c *cgoInferencer) detect(imgBytes []byte) ([]Face, error) {
-	lb, err := preprocessDetect(imgBytes)
+	src, _, err := image.Decode(bytes.NewReader(imgBytes))
+	if err != nil {
+		return nil, fmt.Errorf("decode image: %w", err)
+	}
+	return c.detectFromImage(src)
+}
+
+// detectFromImage runs the detector on an already-decoded image, so callers
+// that also align faces from the same image (Recognize) decode only once.
+func (c *cgoInferencer) detectFromImage(src image.Image) ([]Face, error) {
+	lb, err := letterboxDetect(src)
 	if err != nil {
 		return nil, err
 	}

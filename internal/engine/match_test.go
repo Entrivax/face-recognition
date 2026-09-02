@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"image"
+	"strings"
 	"testing"
 )
 
@@ -62,6 +63,9 @@ type fakeInferencer struct {
 }
 
 func (f *fakeInferencer) detect([]byte) ([]Face, error) { return f.faces, nil }
+func (f *fakeInferencer) detectFromImage(image.Image) ([]Face, error) {
+	return f.faces, nil
+}
 func (f *fakeInferencer) embedImage(*image.NRGBA) ([]float32, error) {
 	return []float32{1, 0, 0}, nil // matches Alice in the test identity set
 }
@@ -84,6 +88,9 @@ type errEmbedInferencer struct {
 }
 
 func (f *errEmbedInferencer) detect([]byte) ([]Face, error) { return f.faces, nil }
+func (f *errEmbedInferencer) detectFromImage(image.Image) ([]Face, error) {
+	return f.faces, nil
+}
 func (f *errEmbedInferencer) embedImage(*image.NRGBA) ([]float32, error) {
 	return nil, fmt.Errorf("embed boom")
 }
@@ -151,6 +158,9 @@ type batchFallbackInferencer struct {
 }
 
 func (f *batchFallbackInferencer) detect([]byte) ([]Face, error) { return f.faces, nil }
+func (f *batchFallbackInferencer) detectFromImage(image.Image) ([]Face, error) {
+	return f.faces, nil
+}
 func (f *batchFallbackInferencer) embedImage(*image.NRGBA) ([]float32, error) {
 	return []float32{1, 0, 0}, nil
 }
@@ -187,6 +197,9 @@ type nilAwareBatchInferencer struct {
 }
 
 func (f *nilAwareBatchInferencer) detect([]byte) ([]Face, error) { return f.faces, nil }
+func (f *nilAwareBatchInferencer) detectFromImage(image.Image) ([]Face, error) {
+	return f.faces, nil
+}
 func (f *nilAwareBatchInferencer) embedImage(*image.NRGBA) ([]float32, error) {
 	return []float32{1, 2, 0}, nil
 }
@@ -254,4 +267,69 @@ func makeLandmarks() [][2]float64 {
 		out[i] = [2]float64{float64(p[0]), float64(p[1])}
 	}
 	return out
+}
+
+// routingInferencer records which detect entry point Recognize uses, so the
+// decode-once wiring can be verified without models.
+type routingInferencer struct {
+	faces         []Face
+	detectBytes   int
+	detectFromSrc int
+}
+
+func (f *routingInferencer) detect([]byte) ([]Face, error) {
+	f.detectBytes++
+	return f.faces, nil
+}
+func (f *routingInferencer) detectFromImage(image.Image) ([]Face, error) {
+	f.detectFromSrc++
+	return f.faces, nil
+}
+func (f *routingInferencer) embedImage(*image.NRGBA) ([]float32, error) {
+	return []float32{1, 2, 0}, nil
+}
+func (f *routingInferencer) embedBatch(aligned []*image.NRGBA) ([][]float32, error) {
+	out := make([][]float32, len(aligned))
+	for i, a := range aligned {
+		if a != nil {
+			out[i] = []float32{1, 2, 0}
+		}
+	}
+	return out, nil
+}
+func (f *routingInferencer) ping() error { return nil }
+func (f *routingInferencer) close()      {}
+
+// TestRecognizeRoutesThroughDetectFromImage pins the decode-once wiring:
+// Recognize must hand its decoded image to the inferencer exactly once via
+// detectFromImage and never re-run the bytes-based detect path.
+func TestRecognizeRoutesThroughDetectFromImage(t *testing.T) {
+	inf := &routingInferencer{
+		faces: []Face{{BBox: [4]float64{0, 0, 10, 10}, Landmarks: makeLandmarks()}},
+	}
+	e := NewWithInferencer(inf, 0.9)
+	e.SetKnown([]KnownPerson{
+		{ID: "alice", Name: "Alice", Embeddings: [][]float32{{1, 2, 0}}},
+	})
+	faces, err := e.Recognize(makeTestImage(t, 64, 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(faces) != 1 || faces[0].Name != "Alice" {
+		t.Fatalf("identity = %+v, want Alice", faces[0])
+	}
+	if inf.detectFromSrc != 1 || inf.detectBytes != 0 {
+		t.Errorf("detect routing: detectFromImage=%d detect=%d, want 1/0",
+			inf.detectFromSrc, inf.detectBytes)
+	}
+}
+
+// TestRecognizeUndecodableImage locks the error path for garbage input:
+// Recognize decodes first, so the failure mentions the source image.
+func TestRecognizeUndecodableImage(t *testing.T) {
+	e := NewWithInferencer(&routingInferencer{faces: nil}, 0.5)
+	_, err := e.Recognize([]byte("not an image"))
+	if err == nil || !strings.Contains(err.Error(), "decode source image") {
+		t.Errorf("err = %v, want decode source image failure", err)
+	}
 }

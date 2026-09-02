@@ -66,8 +66,12 @@ var arcfaceTemplate = [5][2]float32{
 // implementation is the in-process CGO backend (onnxrt); the interface exists
 // so the engine can be exercised with a stub in tests.
 type inferencer interface {
-	// detect finds all faces in a raw image (jpeg/png/webp/bmp/gif bytes).
+	// detect finds all faces in a raw image (jpeg/png/webp/bmp/gif bytes),
+	// decoding it internally.
 	detect(imgBytes []byte) ([]Face, error)
+	// detectFromImage finds all faces in an already-decoded image, so callers
+	// that also align faces from the same image (Recognize) decode only once.
+	detectFromImage(src image.Image) ([]Face, error)
 	// embedImage computes the 512-d embedding of an aligned 112x112 face.
 	embedImage(aligned *image.NRGBA) ([]float32, error)
 	// embedBatch computes embeddings for several aligned faces, ideally in
@@ -231,24 +235,24 @@ func LargestFace(faces []Face) (Face, bool) {
 // carries Matches: every enrolled person above the threshold, ranked — useful
 // for spotting near-tied identities (possible duplicate people).
 //
-// The image is decoded exactly once here and reused for every face's
-// alignment crop (detect decodes internally as well; per-face alignment used
-// to re-decode, which dominated CPU time on multi-face photos). The aligned
-// faces go to the inferencer's embedBatch, which fans per-face Runs across
-// the concurrency gate, so multi-face photos use several cores.
+// The image is decoded exactly once here and the decoded image is reused for
+// both the detector's letterbox and every face's alignment crop (both used to
+// decode independently, and per-face alignment before that re-decoded per
+// face). The aligned faces go to the inferencer's embedBatch, which fans
+// per-face Runs across the concurrency gate, so multi-face photos use
+// several cores.
 func (e *Engine) Recognize(imgBytes []byte) ([]Face, error) {
-	faces, err := e.inf.detect(imgBytes)
+	// Decode once for detection and all alignments below.
+	src, _, err := image.Decode(bytes.NewReader(imgBytes))
+	if err != nil {
+		return nil, fmt.Errorf("decode source image: %w", err)
+	}
+	faces, err := e.inf.detectFromImage(src)
 	if err != nil {
 		return nil, err
 	}
 	if len(faces) == 0 {
 		return faces, nil
-	}
-	// Decode once for all alignments. detect() has already validated that the
-	// bytes decode, so this cannot fail in practice.
-	src, _, err := image.Decode(bytes.NewReader(imgBytes))
-	if err != nil {
-		return nil, fmt.Errorf("decode source image: %w", err)
 	}
 	// Align every face first (pure Go, no inference) so all faces can be
 	// embedded in one batched Run. A face whose alignment fails keeps its nil

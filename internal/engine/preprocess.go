@@ -37,6 +37,13 @@ func preprocessDetect(imgBytes []byte) (*detLetterbox, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode image: %w", err)
 	}
+	return letterboxDetect(src)
+}
+
+// letterboxDetect builds the SCRFD input tensor from an already-decoded
+// image, so callers that also align faces can decode the bytes only once
+// (mirrors alignFaceFromImage on the alignment side).
+func letterboxDetect(src image.Image) (*detLetterbox, error) {
 	b := src.Bounds()
 	origW, origH := b.Dx(), b.Dy()
 	if origW == 0 || origH == 0 {
