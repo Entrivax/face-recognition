@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         recogn — hover capture
 // @namespace    recogn.hover-capture
-// @version      1.3.0
+// @version      1.3.1
 // @description  Press Alt+R for full-screen capture mode: click any image or video to send its current frame to your local recogn server; recognised faces are drawn over the element until you clear them.
 // @author       recogn
 // @license      MIT
@@ -61,7 +61,8 @@
  *      frame; playing and paused frames both capture.
  *   4. Hover a pill: the detected-people list slides open below the header
  *      and collapses on leave; it refreshes after a re-scan.
- *   5. object-fit: cover images: boxes track the visible crop.
+ *   5. object-fit: cover images: boxes track the visible crop, honouring
+ *      object-position (e.g. a top-anchored 2/3 card).
  *   6. Scroll/resize while results are up: they follow their element.
  *   7. Alt+R exits the mode but keeps results; Escape/✕ clear them.
  *   8. Server stopped: a red pill/toast names the configured URL.
@@ -361,7 +362,7 @@
 			if (!isVideo) blob = await recaptureImage(target, cw, ch);
 			else throw new Error("this video's frame is cross-origin protected and cannot be captured");
 		}
-		return { blob, cw, ch };
+		return { blob, cw, ch, sw, sh }; // full frame; the HUD maps boxes onto the element's visible region itself
 	}
 
 	// ---- recogn API ----
@@ -401,33 +402,54 @@
 
 	// ---- geometry: where does the media actually paint? ----
 
+	// object-position keywords are axis-bound: left/right position X, top/bottom
+	// position Y, center fits either. Computed styles hand us percentages
+	// ("50% 0%"); keyword parsing stays for raw/older values.
+	const POS_KEYWORDS = {
+		left: { axis: "x", pct: 0 },
+		right: { axis: "x", pct: 1 },
+		top: { axis: "y", pct: 0 },
+		bottom: { axis: "y", pct: 1 },
+		center: { pct: 0.5 },
+	};
+
 	function posToken(v) {
-		if (v === "left" || v === "top") return { pct: 0 };
-		if (v === "right" || v === "bottom") return { pct: 1 };
-		if (v === "center" || !v) return { pct: 0.5 };
+		const kw = POS_KEYWORDS[String(v || "").toLowerCase()];
+		if (kw) return { axis: kw.axis, pct: kw.pct };
 		if (v.endsWith("%")) return { pct: Math.min(1, Math.max(0, parseFloat(v) / 100)) };
-		if (v.endsWith("px")) return { px: Math.max(0, parseFloat(v) || 0) };
+		if (v.endsWith("px")) return { px: parseFloat(v) || 0 };
 		return { pct: 0.5 };
 	}
 
+	function isYToken(token) { return token.axis === "y"; }
+
 	function parseObjectPosition(value) {
 		const parts = String(value || "").trim().split(/\s+/).filter(Boolean);
-		if (parts.length < 1 || parts.length > 2) return { x: { pct: 0.5 }, y: { pct: 0.5 } };
-		const x = posToken(parts[0]);
-		const y = parts.length === 2 ? posToken(parts[1]) : { pct: 0.5 };
-		return { x, y };
+		if (parts.length > 2) parts.length = 2; // four-value syntax degrades to its first pair
+		const a = posToken(parts[0]);
+		const b = parts.length === 2 ? posToken(parts[1]) : { pct: 0.5 };
+		// A lone vertical keyword pins Y ("top" = "center top"); with two tokens
+		// a leading vertical keyword takes the Y slot regardless of order
+		// ("top 20%" = x 20%, y top).
+		if (isYToken(a)) return { x: isYToken(b) ? { pct: 0.5 } : b, y: a };
+		return { x: a, y: b };
 	}
 
+	// Portion of the leftover space a token claims. Leftover is negative when
+	// the content overflows the box (object-fit: cover), so 50% must resolve to
+	// a negative offset (centered overflow) — no clamping here, matching
+	// background-position semantics.
 	function posOffset(token, leftover) {
-		leftover = Math.max(0, leftover);
-		if (token.px !== undefined) return Math.min(token.px, leftover);
+		if (token.px !== undefined) return token.px;
 		return token.pct * leftover;
 	}
 
-	// The engine reports boxes in the full frame's pixel space, but object-fit
-	// means the element box is often not the painted area. Compute the painted
-	// content rect (viewport coords) from the computed style. Axis-aligned
-	// elements only — transformed (rotated/skewed) boxes are a known limitation.
+	// The server's boxes are in the full frame's pixel space, but object-fit
+	// means the element box is often not the painted area — and object-position
+	// may push the painted rect past the box (negative offsets under cover).
+	// Compute both the painted content rect and the visible (clipped) part, in
+	// viewport coords, from the computed style. Axis-aligned elements only —
+	// transformed (rotated/skewed) boxes are a known limitation.
 	function contentRect(el, sw, sh) {
 		const box = el.getBoundingClientRect();
 		const cs = getComputedStyle(el);
@@ -454,11 +476,19 @@
 				w = box.width; h = box.height;
 		}
 		const pos = parseObjectPosition(cs.objectPosition);
+		const left = box.left + posOffset(pos.x, box.width - w);
+		const top = box.top + posOffset(pos.y, box.height - h);
+		// The element clips the content to its box: intersect the painted rect
+		// with the box to get the on-screen region (cover overflows it, contain
+		// letterboxes inside it). Nothing paints when the intersection is empty.
+		const visLeft = Math.max(left, box.left);
+		const visTop = Math.max(top, box.top);
+		const vw = Math.min(left + w, box.right) - visLeft;
+		const vh = Math.min(top + h, box.bottom) - visTop;
+		if (!(w > 0) || !(h > 0) || !(vw > 0) || !(vh > 0)) return null;
 		return {
-			left: box.left + posOffset(pos.x, box.width - w),
-			top: box.top + posOffset(pos.y, box.height - h),
-			width: w,
-			height: h,
+			left, top, width: w, height: h, // painted rect (may exceed the box)
+			vis: { left: visLeft, top: visTop, width: vw, height: vh }, // on-screen
 		};
 	}
 
@@ -468,7 +498,7 @@
 	// and shrink away when the request settles. Opacity falls off linearly
 	// toward the centre (SHIMMER.centerDim), so the bloom reads as a soft glow
 	// with a quiet middle. Skipped entirely under
-	// prefers-reduced-motion. The canvas covers the painted content rect — the
+	// prefers-reduced-motion. The canvas covers the visible content rect — the
 	// same one the face-box canvas gets — so object-fit crops shimmer exactly
 	// where the image paints. A standalone factory instead of the demo's custom
 	// element (no shadow DOM / hover events), plus an adaptive gap that keeps
@@ -678,31 +708,39 @@
 	}
 
 	// Corner brackets + labels — port of internal/web/static/js/overlay.js.
-	// Box coords are capture-canvas pixels; kx/ky map them onto the overlay
-	// canvas (displayed content size × devicePixelRatio) so text and line
-	// widths stay readable at any displayed size.
+	// Box coords are capture-canvas pixels, i.e. the full painted rect that the
+	// element may crop. The paint-rect scale (kx/ky) plus the visible-origin
+	// offset (ox/oy) map them onto the overlay canvas, which covers only the
+	// on-screen rect (× devicePixelRatio so text and line widths stay
+	// readable); the canvas clips whatever the element crops away.
 	function renderFaces(s) {
 		const c = s.canvas;
 		const cr = s.cr;
 		if (!cr) return;
+		const vis = cr.vis;
 		const dpr = Math.min(2, window.devicePixelRatio || 1);
-		const pw = Math.max(1, Math.round(cr.width * dpr));
-		const ph = Math.max(1, Math.round(cr.height * dpr));
+		const pw = Math.max(1, Math.round(vis.width * dpr));
+		const ph = Math.max(1, Math.round(vis.height * dpr));
 		if (c.width !== pw) c.width = pw;
 		if (c.height !== ph) c.height = ph;
 		const ctx = c.getContext("2d");
 		ctx.clearRect(0, 0, c.width, c.height);
 		const faces = s.faces;
 		if (!faces || !faces.length) return;
-		const kx = c.width / s.capture.cw;
-		const ky = c.height / s.capture.ch;
+		// capture px → device px by the painted rect, then shift by the visible
+		// origin (negative under cover) so boxes land on the painted pixels
+		// that are actually on screen.
+		const kx = cr.width / s.capture.cw * dpr;
+		const ky = cr.height / s.capture.ch * dpr;
+		const ox = (cr.left - vis.left) * dpr;
+		const oy = (cr.top - vis.top) * dpr;
 		const scale = Math.max(c.width, c.height) / 900;
 
 		for (let i = 0; i < faces.length; i++) {
 			const f = faces[i] || {};
 			const b = f.bbox || [0, 0, 0, 0];
-			const x = b[0] * kx;
-			const y = b[1] * ky;
+			const x = ox + b[0] * kx;
+			const y = oy + b[1] * ky;
 			const bw = Math.max(2, b[2] * kx);
 			const bh = Math.max(2, b[3] * ky);
 			const known = f.name && f.name !== "unknown";
@@ -754,7 +792,7 @@
 		if (!s.target.isConnected) { removeHud(s); return; }
 		const box = s.target.getBoundingClientRect();
 		if (box.width < 2 && box.height < 2) { removeHud(s); return; }
-		const cr = contentRect(s.target, s.capture.cw, s.capture.ch);
+		const cr = contentRect(s.target, s.capture.sw, s.capture.sh);
 		s.cr = cr;
 		const st = s.el.style;
 		st.left = box.left + "px";
@@ -762,16 +800,23 @@
 		st.width = box.width + "px";
 		st.height = box.height + "px";
 		const cs = s.canvas.style;
-		cs.left = (cr.left - box.left) + "px";
-		cs.top = (cr.top - box.top) + "px";
-		cs.width = cr.width + "px";
-		cs.height = cr.height + "px";
-		const ss = s.shimmer.el.style; // shimmer covers the same painted rect
-		ss.left = cs.left;
+		const ss = s.shimmer.el.style;
+		if (!cr) { // nothing paints inside the box right now — hide the canvases
+			cs.width = ss.width = "0px";
+			cs.height = ss.height = "0px";
+			s.shimmer.sync(0, 0);
+			return;
+		}
+		const vis = cr.vis; // the element clips the painted area to this
+		cs.left = (vis.left - box.left) + "px";
+		cs.top = (vis.top - box.top) + "px";
+		cs.width = vis.width + "px";
+		cs.height = vis.height + "px";
+		ss.left = cs.left; // shimmer covers the same visible rect
 		ss.top = cs.top;
 		ss.width = cs.width;
 		ss.height = cs.height;
-		s.shimmer.sync(cr.width, cr.height);
+		s.shimmer.sync(vis.width, vis.height);
 		renderFaces(s);
 	}
 
