@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         recogn — hover capture
 // @namespace    recogn.hover-capture
-// @version      1.2.0
+// @version      1.3.0
 // @description  Press Alt+R for full-screen capture mode: click any image or video to send its current frame to your local recogn server; recognised faces are drawn over the element until you clear them.
 // @author       recogn
 // @license      MIT
@@ -31,6 +31,9 @@
  * is drawn over that element with the web UI's corner-bracket style. The
  * shield stays up for scanning several media in a row; clicking an
  * already-annotated one re-scans it in place (e.g. a fresh video frame).
+ * While a scan is in flight a pixel shimmer (ported from the repo's
+ * shimmer-animation.html demo) blooms over the media being scanned and
+ * shrinks away when the pill resolves; prefers-reduced-motion skips it.
  *
  * Results stay on the page after you leave capture mode until you clear them:
  *   • hover a status pill to expand the detected-people list beneath it
@@ -62,6 +65,10 @@
  *   6. Scroll/resize while results are up: they follow their element.
  *   7. Alt+R exits the mode but keeps results; Escape/✕ clear them.
  *   8. Server stopped: a red pill/toast names the configured URL.
+ *   9. While a scan runs, a pixel shimmer blooms over the media and shrinks
+ *      away when the pill resolves (result or error); re-clicking restarts
+ *      it; squares fade with proximity to the centre; prefers-reduced-motion
+ *      skips it.
  */
 
 (function () {
@@ -101,6 +108,7 @@
 		}
 		.rcg-hud { position: fixed; z-index: 2147483647; pointer-events: none; }
 		.rcg-boxes { position: absolute; pointer-events: none; }
+		.rcg-shimmer { position: absolute; pointer-events: none; }
 		.rcg-pill {
 			position: absolute; bottom: calc(100% + 6px); left: 6px; display: inline-flex; flex-direction: column;
 			max-width: calc(100% - 12px); padding: 3px 8px; border-radius: 6px;
@@ -454,6 +462,163 @@
 		};
 	}
 
+	// ---- pixel shimmer (port of shimmer-animation.html's <pixel-canvas>) ----
+	// A field of tiny squares over the media a scan is running on: pixels bloom
+	// outward from the centre (delay = distance to centre), pulse at full size
+	// and shrink away when the request settles. Opacity falls off linearly
+	// toward the centre (SHIMMER.centerDim), so the bloom reads as a soft glow
+	// with a quiet middle. Skipped entirely under
+	// prefers-reduced-motion. The canvas covers the painted content rect — the
+	// same one the face-box canvas gets — so object-fit crops shimmer exactly
+	// where the image paints. A standalone factory instead of the demo's custom
+	// element (no shadow DOM / hover events), plus an adaptive gap that keeps
+	// the grid ≤ ~3000 pixels on large media.
+
+	const SHIMMER = {
+		colors: ["#5b8cff", "#49c0f7", "#8bd1ff"], // pending blue + sky tones
+		speed: 200, // demo default; a pixel's pulse step is this × 0.001 × rand(0.1, 0.9)
+		maxPixels: 6000, // density cap; the gap adapts to honour it
+		centerDim: 0.95, // how much opacity drops at the very centre (0 = off, 1 = invisible)
+	};
+
+	function createShimmer() {
+		const el = document.createElement("canvas");
+		el.className = "rcg-shimmer";
+		const ctx = el.getContext("2d");
+		const reduced = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+		const speed = reduced ? 0 : SHIMMER.speed * 0.001;
+		let pixels = [];
+		let cssW = 0;
+		let cssH = 0;
+		let raf = 0;
+		let prev = 0;
+
+		const rand = (min, max) => Math.random() * (max - min) + min;
+
+		// Rebuild the grid for the current size (the demo re-inits via its
+		// ResizeObserver on resize, restarting the bloom — mirrored here).
+		function makePixels() {
+			pixels = [];
+			if (!cssW || !cssH) return;
+			const gap = Math.min(12, Math.max(6, Math.ceil(Math.sqrt((cssW * cssH) / SHIMMER.maxPixels))));
+			const size = Math.min(6, Math.max(3, gap / 2))
+			const maxDist = Math.hypot(cssW, cssH) / 2; // centre → farthest corner
+			for (let x = gap / 2; x < cssW; x += gap) {
+				for (let y = gap / 2; y < cssH; y += gap) {
+					const dx = x - cssW / 2;
+					const dy = y - cssH / 2;
+					const dist = Math.sqrt(dx * dx + dy * dy) * 0.5;
+					pixels.push({
+						x, y,
+						color: SHIMMER.colors[Math.floor(Math.random() * SHIMMER.colors.length)],
+						speed: rand(0.1, 0.9) * speed,
+						size: 0,
+						sizeStep: Math.random() * 2.5,
+						minSize: size,
+						maxSize: rand(size, size + 1),
+						delay: reduced ? 0 : dist,
+						counter: 0,
+						counterStep: Math.random() * 4 + (cssW + cssH) * 0.01,
+						// radial opacity falloff: squares fade gradually toward the centre
+						alpha: 1 - SHIMMER.centerDim * (1 - Math.min(1, Math.pow(2 * dist / maxDist, 2))),
+						isReverse: false,
+						isShimmer: false,
+						isIdle: false,
+					});
+				}
+			}
+		}
+
+		function draw(p) {
+			const off = 1 - p.size * 0.5; // centre the square on (x, y)
+			ctx.globalAlpha = p.alpha; // multiplies any alpha baked into the hex colour
+			ctx.fillStyle = p.color;
+			ctx.fillRect(p.x + off, p.y + off, p.size, p.size);
+		}
+
+		// The demo's Pixel.appear/disappear/shimmer inlined: appear=true grows
+		// and then pulses, false shrinks to idle. Per-pixel state survives mode
+		// switches, so interrupting a bloom shrinks what has appeared so far.
+		function step(p, appear) {
+			if (appear) {
+				p.isIdle = false;
+				if (p.counter <= p.delay) {
+					p.counter += p.counterStep;
+					return;
+				}
+				if (p.size >= p.maxSize) p.isShimmer = true;
+				if (p.isShimmer) {
+					if (p.size >= p.maxSize) p.isReverse = true;
+					else if (p.size <= p.minSize) p.isReverse = false;
+					p.size += p.isReverse ? -p.speed : p.speed;
+				} else {
+					p.size += p.sizeStep;
+				}
+			} else {
+				p.isShimmer = false;
+				p.counter = 0;
+				if (p.size <= 0) {
+					p.isIdle = true;
+					return;
+				}
+				p.size -= 0.5;
+			}
+			if (p.size > 0) draw(p);
+		}
+
+		function loop(appear) {
+			raf = requestAnimationFrame(() => loop(appear));
+			const now = performance.now();
+			if (now - prev < 1000 / 60) return; // throttle on high-refresh displays
+			prev = now;
+			ctx.clearRect(0, 0, cssW, cssH);
+			let allIdle = true;
+			for (const p of pixels) {
+				step(p, appear);
+				if (!p.isIdle) allIdle = false;
+			}
+			if (allIdle) {
+				cancelAnimationFrame(raf);
+				raf = 0;
+				ctx.clearRect(0, 0, cssW, cssH);
+			}
+		}
+
+		function start(appear) {
+			if (reduced) return;
+			if (raf) cancelAnimationFrame(raf);
+			prev = 0; // let the first frame run immediately
+			loop(appear);
+		}
+
+		// Ticker feed: keep the canvas on the content rect and the grid in step
+		// with the displayed size.
+		function sync(w, h) {
+			w = Math.max(0, Math.round(w));
+			h = Math.max(0, Math.round(h));
+			if (w === cssW && h === cssH) return;
+			cssW = w;
+			cssH = h;
+			const dpr = Math.min(2, window.devicePixelRatio || 1);
+			el.width = Math.max(1, Math.round(w * dpr));
+			el.height = Math.max(1, Math.round(h * dpr));
+			ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+			makePixels();
+		}
+
+		return {
+			el,
+			sync,
+			appear: () => start(true),
+			disappear: () => start(false),
+			destroy: () => {
+				if (raf) cancelAnimationFrame(raf);
+				raf = 0;
+				pixels = [];
+			},
+		};
+	}
+
 	// ---- overlay HUD ----
 
 	function setPill(s, text, kind, spinning) {
@@ -503,6 +668,7 @@
 	function removeHud(s) {
 		if (!s || s.removed) return;
 		s.removed = true;
+		s.shimmer.destroy();
 		s.el.remove();
 		overlays.delete(s.target);
 	}
@@ -600,6 +766,12 @@
 		cs.top = (cr.top - box.top) + "px";
 		cs.width = cr.width + "px";
 		cs.height = cr.height + "px";
+		const ss = s.shimmer.el.style; // shimmer covers the same painted rect
+		ss.left = cs.left;
+		ss.top = cs.top;
+		ss.width = cs.width;
+		ss.height = cs.height;
+		s.shimmer.sync(cr.width, cr.height);
 		renderFaces(s);
 	}
 
@@ -623,6 +795,7 @@
 		el.className = "rcg-hud";
 		const canvas = document.createElement("canvas");
 		canvas.className = "rcg-boxes";
+		const shimmer = createShimmer();
 		const pill = document.createElement("div");
 		pill.className = "rcg-pill pending";
 		const row = document.createElement("div");
@@ -644,10 +817,10 @@
 		list.className = "rcg-people-inner";
 		people.appendChild(list);
 		pill.append(row, people);
-		el.append(canvas, pill);
+		el.append(canvas, shimmer.el, pill);
 		document.documentElement.appendChild(el);
 
-		const s = { target, capture, el, canvas, pill, row, txt, list, faces: null, cr: null, seq: 0, removed: false };
+		const s = { target, capture, el, canvas, shimmer, pill, row, txt, list, faces: null, cr: null, seq: 0, removed: false };
 		x.addEventListener("click", (e) => {
 			e.stopPropagation(); // dismissal must not read as a rescan
 			removeHud(s);
@@ -662,6 +835,7 @@
 		// rapid re-clicks must not let a slow first request win.
 		s.showResult = (data, seq) => {
 			if (s.removed || seq !== s.seq) return;
+			s.shimmer.disappear();
 			s.faces = data.faces;
 			const known = s.faces.filter((f) => f && f.name && f.name !== "unknown").length;
 			if (!s.faces.length) setPill(s, "0 faces", "warn", false);
@@ -674,6 +848,7 @@
 		};
 		s.showError = (message, seq) => {
 			if (s.removed || seq !== s.seq) return;
+			s.shimmer.disappear();
 			setPill(s, String(message).slice(0, 140), "err", false);
 		};
 		overlays.set(target, s);
@@ -703,6 +878,7 @@
 			renderFaces(hud);
 			renderPeople(hud);
 			setPill(hud, "recognizing…", "pending", true);
+			hud.shimmer.appear();
 		}
 		let capture;
 		try {
@@ -714,6 +890,7 @@
 		}
 		if (!hud) hud = createHud(target, capture);
 		const seq = ++hud.seq;
+		hud.shimmer.appear();
 		try {
 			const data = await recognize(capture.blob);
 			hud.showResult(data, seq);
