@@ -65,6 +65,16 @@ func (f *fakeInferencer) detect([]byte) ([]Face, error) { return f.faces, nil }
 func (f *fakeInferencer) embedImage(*image.NRGBA) ([]float32, error) {
 	return []float32{1, 0, 0}, nil // matches Alice in the test identity set
 }
+func (f *fakeInferencer) embedBatch(aligned []*image.NRGBA) ([][]float32, error) {
+	out := make([][]float32, len(aligned))
+	for i, a := range aligned {
+		if a == nil {
+			continue
+		}
+		out[i] = []float32{1, 0, 0}
+	}
+	return out, nil
+}
 func (f *fakeInferencer) ping() error { return nil }
 func (f *fakeInferencer) close()      {}
 
@@ -75,6 +85,9 @@ type errEmbedInferencer struct {
 
 func (f *errEmbedInferencer) detect([]byte) ([]Face, error) { return f.faces, nil }
 func (f *errEmbedInferencer) embedImage(*image.NRGBA) ([]float32, error) {
+	return nil, fmt.Errorf("embed boom")
+}
+func (f *errEmbedInferencer) embedBatch([]*image.NRGBA) ([][]float32, error) {
 	return nil, fmt.Errorf("embed boom")
 }
 func (f *errEmbedInferencer) ping() error { return nil }
@@ -129,4 +142,116 @@ func TestRecognizeEmbedFailureLeavesUnknown(t *testing.T) {
 	if len(faces[0].Matches) != 0 {
 		t.Errorf("expected no matches after embed failure, got %+v", faces[0].Matches)
 	}
+}
+
+// batchFallbackInferencer fails every embedBatch call but embeds fine
+// per-face, exercising Recognize's whole-batch fallback path.
+type batchFallbackInferencer struct {
+	faces []Face
+}
+
+func (f *batchFallbackInferencer) detect([]byte) ([]Face, error) { return f.faces, nil }
+func (f *batchFallbackInferencer) embedImage(*image.NRGBA) ([]float32, error) {
+	return []float32{1, 0, 0}, nil
+}
+func (f *batchFallbackInferencer) embedBatch([]*image.NRGBA) ([][]float32, error) {
+	return nil, fmt.Errorf("batch boom")
+}
+func (f *batchFallbackInferencer) ping() error { return nil }
+func (f *batchFallbackInferencer) close()      {}
+
+// TestRecognizeBatchFailureFallsBackToPerFace checks that a whole-batch
+// failure degrades to per-face embedding without changing the result.
+func TestRecognizeBatchFailureFallsBackToPerFace(t *testing.T) {
+	e := NewWithInferencer(&batchFallbackInferencer{
+		faces: []Face{{BBox: [4]float64{0, 0, 10, 10}}},
+	}, 0.5)
+	e.SetKnown([]KnownPerson{
+		{ID: "alice", Name: "Alice", Embeddings: [][]float32{{1, 0, 0}}},
+	})
+	faces, err := e.Recognize(makeTestImage(t, 64, 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(faces) != 1 || faces[0].Name != "Alice" {
+		t.Fatalf("identity = %+v, want Alice", faces[0])
+	}
+}
+
+// nilAwareBatchInferencer returns a directionally distinct embedding per
+// input index (face 0 → Alice's direction, face 1 → Bob's) and nil for nil
+// inputs, letting Recognize's face→embedding mapping be verified without
+// models. (Embeddings must be non-collinear: cosine ignores magnitude.)
+type nilAwareBatchInferencer struct {
+	faces []Face
+}
+
+func (f *nilAwareBatchInferencer) detect([]byte) ([]Face, error) { return f.faces, nil }
+func (f *nilAwareBatchInferencer) embedImage(*image.NRGBA) ([]float32, error) {
+	return []float32{1, 2, 0}, nil
+}
+func (f *nilAwareBatchInferencer) embedBatch(aligned []*image.NRGBA) ([][]float32, error) {
+	out := make([][]float32, len(aligned))
+	for i, a := range aligned {
+		if a == nil {
+			continue // failed alignment stays nil
+		}
+		if i%2 == 0 {
+			out[i] = []float32{1, 2, 0} // Alice's direction
+		} else {
+			out[i] = []float32{2, 1, 0} // Bob's direction
+		}
+	}
+	return out, nil
+}
+func (f *nilAwareBatchInferencer) ping() error { return nil }
+func (f *nilAwareBatchInferencer) close()      {}
+
+// TestRecognizeMultiFaceBatchedMapping feeds two detectable faces and
+// directionally distinct per-face embeddings; each face must receive its own
+// identity, and the face→embedding mapping must be by detection index (no
+// cross-wiring). A high threshold keeps Matches to the single best identity.
+func TestRecognizeMultiFaceBatchedMapping(t *testing.T) {
+	e := NewWithInferencer(&nilAwareBatchInferencer{
+		faces: []Face{
+			{BBox: [4]float64{0, 0, 10, 10}, Landmarks: makeLandmarks()},
+			{BBox: [4]float64{30, 0, 10, 10}, Landmarks: makeLandmarks()},
+		},
+	}, 0.9)
+	e.SetKnown([]KnownPerson{
+		{ID: "alice", Name: "Alice", Embeddings: [][]float32{{1, 2, 0}}},
+		{ID: "bob", Name: "Bob", Embeddings: [][]float32{{2, 1, 0}}},
+	})
+	faces, err := e.Recognize(makeTestImage(t, 64, 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(faces) != 2 {
+		t.Fatalf("expected 2 faces, got %d", len(faces))
+	}
+	if faces[0].Name != "Alice" || faces[0].PersonID != "alice" {
+		t.Errorf("face 0 = %+v, want Alice", faces[0])
+	}
+	if faces[1].Name != "Bob" || faces[1].PersonID != "bob" {
+		t.Errorf("face 1 = %+v, want Bob", faces[1])
+	}
+	// Embeddings map back per index (directions, not swapped).
+	if faces[0].Embedding == nil || faces[1].Embedding == nil {
+		t.Fatal("embeddings must be populated")
+	}
+	if c := Cosine(faces[0].Embedding, []float32{1, 2, 0}); c < 0.9999 {
+		t.Errorf("face 0 embedding direction wrong (cosine %.4f to Alice's vector)", c)
+	}
+	if c := Cosine(faces[1].Embedding, []float32{2, 1, 0}); c < 0.9999 {
+		t.Errorf("face 1 embedding direction wrong (cosine %.4f to Bob's vector)", c)
+	}
+}
+
+// makeLandmarks returns 5 template-matching landmarks so alignment succeeds.
+func makeLandmarks() [][2]float64 {
+	out := make([][2]float64, 5)
+	for i, p := range arcfaceTemplate {
+		out[i] = [2]float64{float64(p[0]), float64(p[1])}
+	}
+	return out
 }

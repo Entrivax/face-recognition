@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"recogn/internal/db"
 	"recogn/internal/engine"
@@ -51,7 +52,18 @@ type Options struct {
 	// person's folder (and, when a person's folder disappeared entirely,
 	// all of their photo entries). Opt-in: datasets may be temporarily
 	// unmounted, so staleness is never cleaned up automatically.
-	Prune    bool
+	Prune bool
+	// Workers is how many photos are detected+embedded in parallel. Values
+	// <= 1 (the default) run exactly like the original serial scan; larger
+	// values fan the per-photo work out over a bounded worker pool. The
+	// engine's own inference gate stays the authoritative bound, so Workers
+	// above it just queue on the gate.
+	Workers int
+	// Progress is called once per processed file with the person, the file
+	// name, and 1-based/total counters within that person's folder. With
+	// Workers > 1 files complete out of order, so idx counts completed
+	// files of the person rather than scan order. It is always called
+	// sequentially (never concurrently) from the aggregation step.
 	Progress func(person, file string, idx, total int)
 }
 
@@ -62,9 +74,33 @@ type FaceEngine interface {
 	EmbedFace(imgBytes []byte, f engine.Face) ([]float32, error)
 }
 
+// scanJob is one photo to process, flattened out of the folder walk so
+// parallel workers can pick jobs from any person's folder.
+type scanJob struct {
+	person string // person (folder) name
+	folder string // absolute folder path
+	file   string // image file name inside the folder
+	force  bool
+}
+
+// scanOutcome is the per-file result, keyed back to its job by index so
+// aggregation can replay the serial scan order exactly.
+type scanOutcome struct {
+	added  bool
+	reason string
+	err    error
+}
+
 // Scan walks peopleDir, embeds each new/changed image, and stores results in
 // the database. The engine must already have its identity set loaded if you
 // want matching afterwards; this only writes the DB.
+//
+// The per-photo work runs with Options.Workers parallel workers (<=1 = the
+// serial path); the Result is aggregated from per-file outcomes in the
+// original walk order, so counts and Skipped entries are identical to a
+// serial run regardless of completion order. DB writes are safe to
+// parallelise: every db.DB method takes its own mutex and bbolt serialises
+// writers internally.
 func Scan(eng FaceEngine, database *db.DB, opts Options) (Result, error) {
 	var res Result
 	entries, err := os.ReadDir(opts.PeopleDir)
@@ -81,6 +117,10 @@ func Scan(eng FaceEngine, database *db.DB, opts Options) (Result, error) {
 	}
 	sort.Slice(personDirs, func(i, j int) bool { return personDirs[i].Name() < personDirs[j].Name() })
 
+	// Flatten the walk into an ordered job list (scan order = the serial
+	// loop's order: person dirs sorted, files sorted within each folder).
+	var jobs []scanJob
+	filesPerPerson := make(map[string]int, len(personDirs))
 	for _, pd := range personDirs {
 		name := pd.Name()
 		folder := filepath.Join(opts.PeopleDir, name)
@@ -93,24 +133,45 @@ func Scan(eng FaceEngine, database *db.DB, opts Options) (Result, error) {
 		if opts.Prune {
 			res.PhotosPruned += pruneMissing(database, name, files)
 		}
-		for i, f := range files {
-			if opts.Progress != nil {
-				opts.Progress(name, f, i+1, len(files))
-			}
-			added, reason, err := enrollOne(eng, database, name, folder, f, opts.Force)
-			switch {
-			case err != nil:
+		filesPerPerson[name] = len(files)
+		for _, f := range files {
+			jobs = append(jobs, scanJob{person: name, folder: folder, file: f, force: opts.Force})
+		}
+	}
+
+	// Run the jobs with a bounded worker pool; results are written to the
+	// outcome slot of their job index. Serial fast-path for Workers <= 1.
+	outcomes := make([]scanOutcome, len(jobs))
+	if opts.Workers <= 1 {
+		for i, job := range jobs {
+			outcomes[i] = runScanJob(eng, database, job)
+		}
+	} else {
+		scanParallel(eng, database, jobs, opts.Workers, outcomes)
+	}
+
+	// Aggregate in scan order and fire Progress sequentially. Progress idx
+	// counts completed files within the person's folder (1-based), so with
+	// parallel workers the counter tracks completions, not scan order.
+	done := make(map[string]int, len(filesPerPerson))
+	for i, job := range jobs {
+		if opts.Progress != nil {
+			done[job.person]++
+			opts.Progress(job.person, job.file, done[job.person], filesPerPerson[job.person])
+		}
+		o := outcomes[i]
+		switch {
+		case o.err != nil:
+			res.PhotosFailed++
+			res.Skipped = append(res.Skipped, SkippedPhoto{job.person, job.file, o.err.Error()})
+		case o.added:
+			res.PhotosAdded++
+		default:
+			if o.reason != "" {
 				res.PhotosFailed++
-				res.Skipped = append(res.Skipped, SkippedPhoto{name, f, err.Error()})
-			case added:
-				res.PhotosAdded++
-			default:
-				if reason != "" {
-					res.PhotosFailed++
-					res.Skipped = append(res.Skipped, SkippedPhoto{name, f, reason})
-				} else {
-					res.PhotosKept++ // unchanged, skipped by hash
-				}
+				res.Skipped = append(res.Skipped, SkippedPhoto{job.person, job.file, o.reason})
+			} else {
+				res.PhotosKept++ // unchanged, skipped by hash
 			}
 		}
 	}
@@ -121,6 +182,40 @@ func Scan(eng FaceEngine, database *db.DB, opts Options) (Result, error) {
 		res.PhotosPruned += pruneMissingPeople(database, opts.PeopleDir)
 	}
 	return res, nil
+}
+
+// runScanJob processes one flattened photo job, returning its outcome.
+func runScanJob(eng FaceEngine, database *db.DB, job scanJob) scanOutcome {
+	added, reason, err := enrollOne(eng, database, job.person, job.folder, job.file, job.force)
+	return scanOutcome{added: added, reason: reason, err: err}
+}
+
+// scanParallel runs jobs over `workers` goroutines, each calling the same
+// enrollOne the serial path uses. Outcomes land in the job-indexed slice, so
+// the caller never needs to know about completion order.
+func scanParallel(eng FaceEngine, database *db.DB, jobs []scanJob, workers int, outcomes []scanOutcome) {
+	if workers > len(jobs) {
+		workers = len(jobs)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	next := make(chan int, workers)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for i := range next {
+				outcomes[i] = runScanJob(eng, database, jobs[i])
+			}
+		}()
+	}
+	for i := range jobs {
+		next <- i
+	}
+	close(next)
+	wg.Wait()
 }
 
 // pruneMissing removes DB photo entries of the named person whose file is not

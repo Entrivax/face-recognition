@@ -19,6 +19,11 @@ type Config struct {
 	EmbModel  string  // ArcFace embedder ONNX filename (inside ModelsDir)
 	Threshold float64 // cosine-similarity threshold for a positive match
 	Addr      string  // listen address for `serve`
+	// Concurrency is how many model Runs may execute in parallel (the
+	// engine's inference gate) and the default worker count for batch jobs
+	// (enrollment scan, CLI recognize, multi-upload). 0 = auto
+	// (DefaultConcurrency in internal/engine).
+	Concurrency int
 }
 
 // Default returns a Config populated from defaults, environment and flags.
@@ -34,6 +39,7 @@ func Default() Config {
 		Threshold: envFloat("RECOGN_THRESHOLD", 0.45),
 		Addr:      envOr("RECOGN_ADDR", ":8080"),
 	}
+	cfg.Concurrency = envInt("RECOGN_CONCURRENCY", 0)
 	cfg.DBPath = filepath.Join(cfg.DataDir, "faces.db")
 	return cfg
 }
@@ -55,6 +61,17 @@ func envFloat(key string, def float64) float64 {
 	if v := os.Getenv(key); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			return f
+		}
+	}
+	return def
+}
+
+// envInt parses an integer environment variable, falling back to def when it
+// is unset or unparsable.
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
 		}
 	}
 	return def

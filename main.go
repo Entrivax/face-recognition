@@ -22,6 +22,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -128,8 +129,19 @@ To add someone new, drop a folder with their photos into people/ and run
 `)
 }
 
+// resolveWorkers returns the batch-worker count for the given config: an
+// explicit positive RECOGN_CONCURRENCY wins, otherwise the engine default
+// (one stream per core, capped at 4).
+func resolveWorkers(cfg config.Config) int {
+	if cfg.Concurrency > 0 {
+		return cfg.Concurrency
+	}
+	return engine.DefaultConcurrency()
+}
+
 // openEngine builds the engine + DB and loads identities into the engine.
-// Inference runs in-process via CGO + the ONNX Runtime C API.
+// Inference runs in-process via CGO + the ONNX Runtime C API, with at most
+// cfg.Concurrency (default engine.DefaultConcurrency) model Runs in parallel.
 //
 // Threshold precedence: an explicit --threshold flag wins; otherwise the value
 // persisted in the DB (set via POST /api/config or the UI slider); otherwise
@@ -138,7 +150,7 @@ func openEngine(cfg config.Config, thresholdSet bool) (*engine.Engine, *db.DB, e
 	if err := engine.CheckModels(cfg.DetModelPath(), cfg.EmbModelPath()); err != nil {
 		return nil, nil, err
 	}
-	eng, err := engine.New(cfg.DetModelPath(), cfg.EmbModelPath(), cfg.Threshold)
+	eng, err := engine.NewWithConcurrency(cfg.DetModelPath(), cfg.EmbModelPath(), cfg.Threshold, cfg.Concurrency)
 	if err != nil {
 		return nil, nil, fmt.Errorf("init inference backend: %w", err)
 	}
@@ -188,6 +200,7 @@ func runEnroll(cfg config.Config, force, prune, thresholdSet bool) error {
 		PeopleDir: cfg.PeopleDir,
 		Force:     force,
 		Prune:     prune,
+		Workers:   resolveWorkers(cfg),
 		Progress: func(person, file string, idx, total int) {
 			fmt.Printf("\r  %-24s [%d/%d] %-40s", person, idx, total, truncate(file, 40))
 		},
@@ -237,29 +250,41 @@ func runRecognize(cfg config.Config, images []string, jsonOut bool, drawArg stri
 	var all []fileResult
 	hadErr := false
 
-	for _, imgPath := range images {
-		fr := fileResult{Image: imgPath}
-		b, err := os.ReadFile(imgPath)
-		if err != nil {
-			fr.Error = err.Error()
-			hadErr = true
-			all = append(all, fr)
-			continue
+	// Recognize the images with a bounded worker pool, preserving input
+	// order: each result lands in its own index slot, so JSON/annotated/
+	// text output is identical to the serial loop's.
+	results := make([]fileResult, len(images))
+	workers := resolveWorkers(cfg)
+	if workers > len(images) {
+		workers = len(images)
+	}
+	if workers <= 1 {
+		for i, imgPath := range images {
+			results[i] = recognizeOne(eng, imgPath)
 		}
-		faces, err := eng.Recognize(b)
-		if err != nil {
-			fr.Error = err.Error()
-			hadErr = true
-			all = append(all, fr)
-			continue
+	} else {
+		next := make(chan int, workers)
+		var wg sync.WaitGroup
+		wg.Add(workers)
+		for w := 0; w < workers; w++ {
+			go func() {
+				defer wg.Done()
+				for i := range next {
+					results[i] = recognizeOne(eng, images[i])
+				}
+			}()
 		}
-		// Strip embeddings from CLI/JSON output.
-		for i := range faces {
-			faces[i].Embedding = nil
+		for i := range images {
+			next <- i
 		}
-		fr.Faces = faces
-		fr.raw = b
+		close(next)
+		wg.Wait()
+	}
+	for _, fr := range results {
 		all = append(all, fr)
+		if fr.Error != "" {
+			hadErr = true
+		}
 	}
 
 	if drawArg != "" {
@@ -294,6 +319,29 @@ func runRecognize(cfg config.Config, images []string, jsonOut bool, drawArg stri
 		return fmt.Errorf("one or more images failed")
 	}
 	return nil
+}
+
+// recognizeOne runs the full pipeline on one image file, producing the
+// per-image CLI/JSON record (embeddings stripped from the faces).
+func recognizeOne(eng *engine.Engine, imgPath string) fileResult {
+	fr := fileResult{Image: imgPath}
+	b, err := os.ReadFile(imgPath)
+	if err != nil {
+		fr.Error = err.Error()
+		return fr
+	}
+	faces, err := eng.Recognize(b)
+	if err != nil {
+		fr.Error = err.Error()
+		return fr
+	}
+	// Strip embeddings from CLI/JSON output.
+	for i := range faces {
+		faces[i].Embedding = nil
+	}
+	fr.Faces = faces
+	fr.raw = b
+	return fr
 }
 
 // writeAnnotated writes annotated copies (boxes + labels) of the successfully
@@ -401,6 +449,7 @@ func runServe(cfg config.Config, thresholdSet bool) error {
 			}
 			res, err := enroll.Scan(eng, database, enroll.Options{
 				PeopleDir: cfg.PeopleDir,
+				Workers:   resolveWorkers(cfg),
 				Progress: func(person, file string, idx, total int) {
 					fmt.Printf("\r  %-24s [%d/%d] %-40s", person, idx, total, truncate(file, 40))
 				},

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"recogn/internal/config"
@@ -43,15 +44,26 @@ type Server struct {
 	eng     Engine
 	db      *db.DB
 	refresh func(e Engine, d *db.DB) // push DB identities into the engine
+	workers int                      // batch worker count (uploads, rescan)
 	mux     *http.ServeMux
 }
 
 // New builds a Server. refresh is called after any mutation to reload the
 // engine's identity set from the DB (may be nil).
 func New(cfg config.Config, eng Engine, database *db.DB, refresh func(Engine, *db.DB)) *Server {
-	s := &Server{cfg: cfg, eng: eng, db: database, refresh: refresh}
+	s := &Server{cfg: cfg, eng: eng, db: database, refresh: refresh, workers: resolveWorkers(cfg)}
 	s.routes()
 	return s
+}
+
+// resolveWorkers returns the batch-worker count for a config: an explicit
+// positive RECOGN_CONCURRENCY wins, otherwise the engine default. (Mirrors
+// main.resolveWorkers; kept here because main cannot be imported.)
+func resolveWorkers(cfg config.Config) int {
+	if cfg.Concurrency > 0 {
+		return cfg.Concurrency
+	}
+	return engine.DefaultConcurrency()
 }
 
 func (s *Server) routes() {
@@ -677,14 +689,49 @@ func (s *Server) handleEnrollPerson(w http.ResponseWriter, r *http.Request, name
 	added := 0
 	var failures []string
 	saved := make([]string, 0, len(files))
-	for _, f := range files {
-		rel, err := enroll.EnrollBytes(s.eng, s.db, s.cfg.PeopleDir, name, f.name, f.data)
-		if err != nil {
-			failures = append(failures, fmt.Sprintf("%s: %v", f.name, err))
+	// Embed the uploads with a bounded worker pool, preserving input order:
+	// each result lands in its index slot, so `saved` and `failures` list
+	// files in the order they were submitted regardless of completion order.
+	type enrollResult struct {
+		rel string
+		err error
+	}
+	results := make([]enrollResult, len(files))
+	workers := s.workers
+	if workers > len(files) {
+		workers = len(files)
+	}
+	if workers <= 1 {
+		for i, f := range files {
+			rel, err := enroll.EnrollBytes(s.eng, s.db, s.cfg.PeopleDir, name, f.name, f.data)
+			results[i] = enrollResult{rel: rel, err: err}
+		}
+	} else {
+		next := make(chan int, workers)
+		var wg sync.WaitGroup
+		wg.Add(workers)
+		for w := 0; w < workers; w++ {
+			go func() {
+				defer wg.Done()
+				for i := range next {
+					rel, err := enroll.EnrollBytes(s.eng, s.db, s.cfg.PeopleDir, name, files[i].name, files[i].data)
+					results[i] = enrollResult{rel: rel, err: err}
+				}
+			}()
+		}
+		for i := range files {
+			next <- i
+		}
+		close(next)
+		wg.Wait()
+	}
+	for i, r := range results {
+		if r.err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", files[i].name, r.err))
 			continue
 		}
 		added++
-		saved = append(saved, rel)
+		saved = append(saved, r.rel)
 	}
 	s.reload()
 	resp := map[string]any{"person": name, "added": added, "total": len(files), "saved": saved}
@@ -778,6 +825,7 @@ func (s *Server) handleEnrollFolder(w http.ResponseWriter, r *http.Request) {
 		PeopleDir: s.cfg.PeopleDir,
 		Force:     force,
 		Prune:     prune,
+		Workers:   s.workers,
 	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())

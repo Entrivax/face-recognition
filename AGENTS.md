@@ -50,7 +50,8 @@ internal/
   engine/engine.go       Face/KnownPerson, pipeline, Umeyama align, cosine
   engine/preprocess.go   image → CHW float tensor (letterbox + normalise)
   engine/scrfd.go        SCRFD output decode + NMS (pure Go)
-  engine/cgo_backend.go  inferencer impl using onnxrt (mutex-serialised)
+  engine/cgo_backend.go  inferencer impl using onnxrt (bounded-concurrency
+                         gate, parallel per-face embedding)
   db/db.go               face DB: bbolt store (data/faces.db) + JSON
                          interchange import/export (embeddings.json), CRUD
   enroll/enroll.go       scan people/ → embeddings (incremental by content hash)
@@ -86,9 +87,16 @@ Makefile, README.md, scripts/dataset-test.sh
 ## The inference seam (if you touch internal/engine or internal/onnxrt)
 
 `engine.Engine` talks to an unexported `inferencer` interface
-(`detect` / `embedImage` / `ping` / `close`). The production impl is
-`cgoInferencer`. `engine.New(detModel, embModel, thresh)` builds it;
-`engine.NewWithInferencer` is for tests. Keep inference behind this seam.
+(`detect` / `embedImage` / `embedBatch` / `ping` / `close`). The production
+impl is `cgoInferencer`. `engine.New(detModel, embModel, thresh)` builds it
+with the default concurrency; `engine.NewWithConcurrency(..., concurrency)`
+bounds the parallel model Runs; `engine.NewWithInferencer` is for tests. Keep
+inference behind this seam. `embedBatch` embeds N aligned faces by fanning
+per-face Runs across the concurrency gate — **never** batch them into one
+[N,3,112,112] Run: although ArcFace's input batch dim is dynamic, this
+export's BatchNormalization normalises over the batch axis at Run time, so
+batched outputs diverge from per-face ones (measured cosine 0.007–0.59;
+pinned by `TestRunBatchEmbedder` / `TestCGOBatchedEmbedParity`).
 
 **Preprocessing must match the models exactly** (these were validated
 bit-for-bit against the reference Python/insightface pipeline):
@@ -112,7 +120,8 @@ export GOPATH=$PWD/.gopath GOMODCACHE=$PWD/.gomodcache GOCACHE=$PWD/.gocache \
 ```
 
 **Prefer the `Makefile`** — it sets all of these plus the CGO include/lib flags:
-`make build` / `make test` / `make vet` / `make serve` / `make ort` / `make dataset-test`.
+`make build` / `make test` / `make test-race` / `make vet` / `make serve` /
+`make ort` / `make dataset-test`.
 
 - **CGO is required** (`CGO_ENABLED=1`) and needs `gcc`. The ORT C lib+header
   must exist in `third_party/onnxruntime` — `make ort` fetches them (needs
@@ -189,9 +198,15 @@ command hits a permission error.
   and `facecheck` learns whether another modal is open via an injected
   `onAnyModalOpen` callback. `/app.js` is a 1-line compat shim — don't delete
   it (`TestIndexServed` still GETs it).
-- The engine is safe for concurrent use; a **single mutex** serialises CGO
-  inference (matches ORT CPU single-stream semantics). Don't run sessions
-  concurrently without checking ORT thread-safety.
+- The engine is safe for concurrent use. CGO inference is bounded, not
+  serialised: a semaphore in `cgoInferencer` admits up to
+  `RECOGN_CONCURRENCY` (default `min(NumCPU, 4)`) parallel model Runs — safe
+  because each session uses intra-op threads = 1 (Runs execute on the calling
+  goroutine) and ORT's CPU execution provider is thread-safe for concurrent
+  Runs on one session, enforced by `TestConcurrentRunParity` (run
+  `make test-race` after touching anything parallel). Only the Run holds a
+  slot; Go-side pre/post-processing stays outside the gate. `close()` drains
+  every slot before closing the sessions.
 - **DB storage is bbolt** (`data/faces.db`, dep `go.etcd.io/bbolt`) with an
   in-memory mirror behind the DB RWMutex — reads never touch the file. Every
   mutating method commits a targeted `bolt.Update` FIRST, then updates the
@@ -259,11 +274,14 @@ command hits a permission error.
 
 ## Known limitations / possible next tasks
 
-- **CPU-only** inference (~0.2–0.6 s/photo). GPU = use the ORT GPU build of
-  `libonnxruntime` + enable a CUDA execution provider in the C shim + a CUDA
-  base image.
-- Single serialized inference stream — high-throughput batch work would need a
-  session pool or batched tensors.
+- **CPU-only** inference (~0.2–0.6 s/photo; parallel Runs scale across cores
+  via `RECOGN_CONCURRENCY`). GPU = use the ORT GPU build of `libonnxruntime`
+  + enable a CUDA execution provider in the C shim + a CUDA base image.
+- Detection cannot be batched across images: `det_10g.onnx` declares a fixed
+  batch dim of 1. ArcFace's input batch dim is dynamic, but its export still
+  normalises over the batch axis (fixed {1,512} output shape), so faces must
+  never share a Run — `embedBatch` fans per-face Runs instead. Cross-image
+  throughput comes from concurrent Runs, not batched tensors.
 - CGO means no static/cross-compiled binary; the binary links glibc +
   libonnxruntime. Builds are for the host (linux/amd64) unless you set up a
   cross C toolchain.

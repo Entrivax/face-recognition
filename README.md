@@ -245,7 +245,16 @@ poisoning the database.
   hint.
 - **Multiple photos per person** improve robustness — enrollment keeps every
   photo's embedding and matches against the best.
-- **Concurrency** — inference is serialized through a single mutex around the
-  ORT sessions (CPU inference is single-stream); the HTTP layer itself is
-  concurrent and the DB saves are atomic.
+- **Concurrency** — inference is *bounded*, not serialised: up to
+  `RECOGN_CONCURRENCY` model Runs execute in parallel on the ORT sessions
+  (safe because each session runs with intra-op threads = 1, and ORT's CPU
+  execution provider is thread-safe for concurrent Runs — verified by
+  `TestConcurrentRunParity`). Multi-face photos embed their faces through
+  `embedBatch`, which fans per-face Runs across that gate (tensor batching is
+  intentionally *not* used: the ArcFace export's BatchNormalization couples
+  faces within a batch, see `TestRunBatchEmbedder`). Batch jobs (enrollment
+  scan, CLI recognize, multi-upload) fan out over the same worker budget; the
+  HTTP layer is concurrent and the DB saves are atomic.
+  `RECOGN_CONCURRENCY` defaults to `min(NumCPU, 4)`; set it to `1` to restore
+  strictly serial inference.
 - **No GPU required** — everything runs on CPU via the ONNX Runtime C library.

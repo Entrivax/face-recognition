@@ -37,8 +37,13 @@ type Tensor struct {
 	Dims []int64
 }
 
-// Session is an open ONNX model. Not safe for concurrent Run calls; callers
-// (the engine) serialize. Close must be called to release native resources.
+// Session is an open ONNX model. Run is safe for concurrent calls from
+// multiple goroutines (ORT's CPU execution provider is thread-safe for
+// concurrent Runs on one session, and this shim keeps only read-only globals
+// and a thread-local error buffer during Run — verified by
+// TestConcurrentRunParity). Close must not race an in-flight Run; the engine
+// drains its inference gate before calling it. Close must be called to
+// release native resources.
 type Session struct {
 	s *C.ort_session
 }

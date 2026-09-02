@@ -8,7 +8,9 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"recogn/internal/db"
 	"recogn/internal/engine"
@@ -333,5 +335,201 @@ func TestScanPrunesMissingPhotos(t *testing.T) {
 	}
 	if p := database.Get("Bob"); p == nil || len(p.Photos) != 0 {
 		t.Fatalf("person should remain enrolled with 0 photos, got %+v", p)
+	}
+}
+
+// slowStubEngine wraps stubEngine with a per-file sleep so parallel scans
+// genuinely overlap (and the race detector sees concurrent Detect/EmbedFace).
+type slowStubEngine struct {
+	faces []engine.Face
+	delay time.Duration
+}
+
+func (s *slowStubEngine) Detect([]byte) ([]engine.Face, error) {
+	time.Sleep(s.delay)
+	return s.faces, nil
+}
+func (s *slowStubEngine) EmbedFace([]byte, engine.Face) ([]float32, error) {
+	time.Sleep(s.delay / 2)
+	return []float32{0.1, 0.2}, nil
+}
+
+// TestScanParallelDeterministic checks that a Workers>1 scan produces exactly
+// the serial result: identical counts, identical Skipped ordering, identical
+// DB photo sets, and exactly one sequential Progress call per file. Run with
+// -race (make test-race) to catch data races in the worker pool.
+func TestScanParallelDeterministic(t *testing.T) {
+	buildDataset := func(t *testing.T) string {
+		t.Helper()
+		dir := t.TempDir()
+		for _, person := range []string{"Alice", "Bob", "Carol"} {
+			if err := os.MkdirAll(filepath.Join(dir, person), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			for i, name := range []string{"a.png", "b.png", "c.png"} {
+				img := pngBytes(t, 40+i, 40+i)
+				if err := os.WriteFile(filepath.Join(dir, person, name), img, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		// One extra real image for Bob: after the first scan it is unchanged
+		// (kept), and deleting it later exercises prune/scan paths equally.
+		if err := os.WriteFile(filepath.Join(dir, "Bob", "d.png"), pngBytes(t, 60, 60), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+
+	run := func(t *testing.T, workers int) (Result, []string, []db.Person, int) {
+		t.Helper()
+		dir := buildDataset(t)
+		database, err := db.Open(filepath.Join(t.TempDir(), "emb.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer database.Close()
+		eng := &slowStubEngine{faces: testFace(), delay: 2 * time.Millisecond}
+		var progress []string
+		var progressMu sync.Mutex
+		res, err := Scan(eng, database, Options{
+			PeopleDir: dir,
+			Workers:   workers,
+			Progress: func(person, file string, idx, total int) {
+				progressMu.Lock()
+				progress = append(progress, person+"/"+file)
+				progressMu.Unlock()
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var skipped []string
+		for _, s := range res.Skipped {
+			skipped = append(skipped, s.Person+"/"+filepath.Base(s.Path)+": "+s.Reason)
+		}
+		people := database.People() // copy out before Close (deferred)
+		return res, skipped, people, len(progress)
+	}
+
+	// Serial reference (10 files: 3 people x 3 images + 1 extra for Bob).
+	wantRes, wantSkipped, wantPeople, wantProgress := run(t, 1)
+	if wantProgress != 10 {
+		t.Fatalf("serial scan: %d progress calls, want 10", wantProgress)
+	}
+
+	for _, workers := range []int{2, 4, 8} {
+		gotRes, gotSkipped, gotPeople, gotProgress := run(t, workers)
+
+		if gotRes.PeopleSeen != wantRes.PeopleSeen ||
+			gotRes.PhotosAdded != wantRes.PhotosAdded ||
+			gotRes.PhotosKept != wantRes.PhotosKept ||
+			gotRes.PhotosFailed != wantRes.PhotosFailed ||
+			gotRes.PhotosPruned != wantRes.PhotosPruned {
+			t.Errorf("workers=%d: result counts differ: %+v vs serial %+v", workers, gotRes, wantRes)
+		}
+		if len(gotSkipped) != len(wantSkipped) {
+			t.Fatalf("workers=%d: skipped length %d, want %d (%v)", workers, len(gotSkipped), len(wantSkipped), gotSkipped)
+		}
+		for i := range gotSkipped {
+			if gotSkipped[i] != wantSkipped[i] {
+				t.Errorf("workers=%d: skipped[%d] = %q, want %q", workers, i, gotSkipped[i], wantSkipped[i])
+			}
+		}
+		// DB contents: same people with the same photo sets.
+		if len(gotPeople) != len(wantPeople) {
+			t.Errorf("workers=%d: people count = %d, want %d", workers, len(gotPeople), len(wantPeople))
+		}
+		for _, p := range gotPeople {
+			wp := findPerson(wantPeople, p.Name)
+			if wp == nil || len(wp.Photos) != len(p.Photos) {
+				t.Errorf("workers=%d: photos for %q differ from serial run", workers, p.Name)
+				continue
+			}
+			for i := range p.Photos {
+				if p.Photos[i].Path != wp.Photos[i].Path || p.Photos[i].Hash != wp.Photos[i].Hash {
+					t.Errorf("workers=%d: photo %d of %q differs: %+v vs %+v", workers, i, p.Name, p.Photos[i], wp.Photos[i])
+				}
+			}
+		}
+		if gotProgress != wantProgress {
+			t.Errorf("workers=%d: %d progress calls, want %d", workers, gotProgress, wantProgress)
+		}
+	}
+}
+
+// findPerson locates a person by name in a snapshot (nil when absent).
+func findPerson(people []db.Person, name string) *db.Person {
+	for i := range people {
+		if people[i].Name == name {
+			return &people[i]
+		}
+	}
+	return nil
+}
+
+// TestScanParallelProgressIndexes checks the Progress contract under
+// parallelism: called once per file, sequentially, with idx counting
+// completed files per person up to that person's total.
+func TestScanParallelProgressIndexes(t *testing.T) {
+	dir := t.TempDir()
+	for _, person := range []string{"Alice", "Bob"} {
+		if err := os.MkdirAll(filepath.Join(dir, person), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 5; i++ {
+			img := pngBytes(t, 40+i, 40+i)
+			name := string(rune('a'+i)) + ".png"
+			if err := os.WriteFile(filepath.Join(dir, person, name), img, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	database, err := db.Open(filepath.Join(t.TempDir(), "emb.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	eng := &slowStubEngine{faces: testFace(), delay: time.Millisecond}
+
+	type call struct {
+		person, file string
+		idx, total   int
+	}
+	var calls []call
+	var mu sync.Mutex
+	res, err := Scan(eng, database, Options{
+		PeopleDir: dir,
+		Workers:   4,
+		Progress:  func(person, file string, idx, total int) { mu.Lock(); calls = append(calls, call{person, file, idx, total}); mu.Unlock() },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.PhotosAdded != 10 {
+		t.Fatalf("added = %d, want 10", res.PhotosAdded)
+	}
+	if len(calls) != 10 {
+		t.Fatalf("%d progress calls, want 10", len(calls))
+	}
+	seen := map[string]map[string]bool{}
+	idxReached := map[string]int{}
+	for _, c := range calls {
+		if c.idx < 1 || c.idx > c.total {
+			t.Errorf("progress %s/%s: idx %d outside 1..%d", c.person, c.file, c.idx, c.total)
+		}
+		if seen[c.person] == nil {
+			seen[c.person] = map[string]bool{}
+		}
+		if seen[c.person][c.file] {
+			t.Errorf("progress: duplicate call for %s/%s", c.person, c.file)
+		}
+		seen[c.person][c.file] = true
+		idxReached[c.person] = c.idx
+	}
+	for _, person := range []string{"Alice", "Bob"} {
+		if idxReached[person] != 5 {
+			t.Errorf("person %s: last progress idx = %d, want 5", person, idxReached[person])
+		}
 	}
 }

@@ -70,6 +70,11 @@ type inferencer interface {
 	detect(imgBytes []byte) ([]Face, error)
 	// embedImage computes the 512-d embedding of an aligned 112x112 face.
 	embedImage(aligned *image.NRGBA) ([]float32, error)
+	// embedBatch computes embeddings for several aligned faces, ideally in
+	// one batched model Run. It returns one result per input index: a nil
+	// embedding marks a face whose embedding failed (the caller reports it
+	// like an embed error). An error return means the whole batch failed.
+	embedBatch(aligned []*image.NRGBA) ([][]float32, error)
 	// ping warms up the backend and verifies the models load.
 	ping() error
 	// close releases backend resources.
@@ -77,7 +82,8 @@ type inferencer interface {
 }
 
 // Engine runs detection→alignment→embedding→matching. It is safe for
-// concurrent use; the underlying inferencer serialises inference.
+// concurrent use; the underlying inferencer bounds model Runs with a
+// concurrency gate (see cgoInferencer) rather than serialising them.
 type Engine struct {
 	inf    inferencer
 	known  []KnownPerson
@@ -86,9 +92,18 @@ type Engine struct {
 
 // New creates an Engine backed by the in-process CGO/ONNX-Runtime inferencer.
 // detModel/embModel are paths to the ONNX models; thresh is the match
-// threshold. It returns an error if the models cannot be loaded.
+// threshold. It returns an error if the models cannot be loaded. The number
+// of parallel inference streams defaults to DefaultConcurrency.
 func New(detModel, embModel string, thresh float64) (*Engine, error) {
-	inf, err := NewCGOInferencer(detModel, embModel)
+	return NewWithConcurrency(detModel, embModel, thresh, defaultConcurrency)
+}
+
+// NewWithConcurrency creates an Engine backed by the in-process
+// CGO/ONNX-Runtime inferencer, allowing at most concurrency parallel model
+// Runs (<=0 selects the default). Use it to trade CPU cores for request
+// throughput; see DefaultConcurrency and config.RECOGN_CONCURRENCY.
+func NewWithConcurrency(detModel, embModel string, thresh float64, concurrency int) (*Engine, error) {
+	inf, err := newCGOInferencer(detModel, embModel, concurrency)
 	if err != nil {
 		return nil, err
 	}
@@ -218,11 +233,16 @@ func LargestFace(faces []Face) (Face, bool) {
 //
 // The image is decoded exactly once here and reused for every face's
 // alignment crop (detect decodes internally as well; per-face alignment used
-// to re-decode, which dominated CPU time on multi-face photos).
+// to re-decode, which dominated CPU time on multi-face photos). The aligned
+// faces go to the inferencer's embedBatch, which fans per-face Runs across
+// the concurrency gate, so multi-face photos use several cores.
 func (e *Engine) Recognize(imgBytes []byte) ([]Face, error) {
 	faces, err := e.inf.detect(imgBytes)
 	if err != nil {
 		return nil, err
+	}
+	if len(faces) == 0 {
+		return faces, nil
 	}
 	// Decode once for all alignments. detect() has already validated that the
 	// bytes decode, so this cannot fail in practice.
@@ -230,15 +250,37 @@ func (e *Engine) Recognize(imgBytes []byte) ([]Face, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode source image: %w", err)
 	}
+	// Align every face first (pure Go, no inference) so all faces can be
+	// embedded in one batched Run. A face whose alignment fails keeps its nil
+	// slot and is marked unknown below, exactly like an embed failure.
+	aligned := make([]*image.NRGBA, len(faces))
 	for i := range faces {
-		aligned, err := alignFaceFromImage(src, faces[i])
+		a, err := alignFaceFromImage(src, faces[i])
 		if err != nil {
-			// A single bad crop shouldn't sink the whole photo.
-			faces[i].Name = "unknown"
+			aligned[i] = nil // single bad crop shouldn't sink the whole photo
 			continue
 		}
-		emb, err := e.inf.embedImage(aligned)
-		if err != nil {
+		aligned[i] = a
+	}
+	embs, err := e.inf.embedBatch(aligned)
+	if err != nil {
+		// Whole-batch failure: fall back to per-face embedding.
+		embs = make([][]float32, len(faces))
+		for i, a := range aligned {
+			if a == nil {
+				continue
+			}
+			emb, ferr := e.inf.embedImage(a)
+			if ferr != nil {
+				continue
+			}
+			embs[i] = emb
+		}
+	}
+	for i := range faces {
+		emb := embs[i]
+		if emb == nil {
+			// Alignment or embedding failed for this face.
 			faces[i].Name = "unknown"
 			continue
 		}

@@ -28,7 +28,7 @@ WIN_CC      := x86_64-w64-mingw32-gcc
 export CGO_CFLAGS  := -I$(CURDIR)/$(ORT_DIR)/include
 export CGO_LDFLAGS := -L$(CURDIR)/$(ORT_DIR)/lib -lonnxruntime -Wl,-rpath,$(CURDIR)/$(ORT_DIR)/lib
 
-.PHONY: all build build-windows test vet enroll serve clean models ort ort-win dataset-test
+.PHONY: all build build-windows test test-race vet enroll serve clean models ort ort-win dataset-test
 
 all: build
 
@@ -73,6 +73,12 @@ dist-windows: build-windows models
 
 test: ort
 	go test ./...
+
+# Test suite under the race detector — the concurrency gate's thread-safety
+# gate (TestConcurrentRunParity) and the parallel scans only mean anything
+# with the race detector on, so run this after changing anything parallel.
+test-race: ort
+	go test -race ./...
 
 vet:
 	go vet ./...

@@ -10,6 +10,8 @@ package engine
 // gated behind RECOGN_DATASET=1. Run via `make dataset-test` or scripts.
 
 import (
+	"bytes"
+	"image"
 	"math"
 	"os"
 	"path/filepath"
@@ -162,5 +164,93 @@ func TestCGODatasetPipeline(t *testing.T) {
 			t.Errorf("weak separation: intra %.4f vs inter %.4f (margin %.3f < 0.3)",
 				intra, inter, intra-inter)
 		}
+	}
+}
+
+// TestCGOBatchedEmbedParity pins the engine's embedBatch contract on real
+// dataset faces: every batched result must equal the single-face embedding
+// (cosine >= 0.9999 — with the per-face parallel implementation this is
+// bit-exact) and stay unit-norm. If someone reintroduces true tensor
+// batching, this test fails exactly the way the ArcFace export's
+// BatchNorm batch-statistics coupling demands (measured cosines 0.007–0.59).
+// Needs the models; gated behind RECOGN_DATASET.
+func TestCGOBatchedEmbedParity(t *testing.T) {
+	if os.Getenv("RECOGN_DATASET") == "" {
+		t.Skip("set RECOGN_DATASET=1 to run the batched-embed parity test (slow)")
+	}
+	det := "../../models/det_10g.onnx"
+	emb := "../../models/w600k_r50.onnx"
+	if _, err := os.Stat(det); err != nil {
+		t.Skipf("model missing: %v", err)
+	}
+	inf, err := newCGOInferencer(det, emb, 2)
+	if err != nil {
+		t.Fatalf("newCGOInferencer: %v", err)
+	}
+	defer inf.close()
+
+	// Detect faces in a few dataset photos and align them.
+	var aligned []*image.NRGBA
+	imgs := datasetImages(t)
+	if len(imgs) == 0 {
+		t.Skip("no dataset images found")
+	}
+	for _, path := range imgs {
+		if len(aligned) >= 6 {
+			break
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		faces, err := inf.detect(b)
+		if err != nil || len(faces) == 0 {
+			continue
+		}
+		src, _, err := image.Decode(bytes.NewReader(b))
+		if err != nil {
+			continue
+		}
+		for _, f := range faces {
+			if a, err := alignFaceFromImage(src, f); err == nil {
+				aligned = append(aligned, a)
+				break // one face per photo is plenty
+			}
+		}
+	}
+	if len(aligned) < 2 {
+		t.Skip("too few aligned faces collected for a batch")
+	}
+
+	batch, err := inf.embedBatch(aligned)
+	if err != nil {
+		t.Fatalf("embedBatch: %v", err)
+	}
+	if len(batch) != len(aligned) {
+		t.Fatalf("embedBatch returned %d results for %d faces", len(batch), len(aligned))
+	}
+	for i, a := range aligned {
+		if batch[i] == nil {
+			t.Errorf("face %d: batched embedding missing", i)
+			continue
+		}
+		single, err := inf.embedImage(a)
+		if err != nil {
+			t.Fatalf("face %d: embedImage: %v", i, err)
+		}
+		if cos := Cosine(batch[i], single); cos < 0.9999 {
+			t.Errorf("face %d: batched vs single cosine = %.6f, want >= 0.9999", i, cos)
+		}
+		var n float64
+		for _, v := range batch[i] {
+			n += float64(v) * float64(v)
+		}
+		if math.Abs(math.Sqrt(n)-1.0) > 0.01 {
+			t.Errorf("face %d: batched embedding norm = %.4f, want ~1", i, math.Sqrt(n))
+		}
+	}
+	// Empty batch is a no-op, not an error.
+	if out, err := inf.embedBatch(nil); err != nil || len(out) != 0 {
+		t.Errorf("embedBatch(nil) = (%v, %v), want (empty, nil)", out, err)
 	}
 }
