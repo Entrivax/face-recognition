@@ -1,5 +1,9 @@
 # recogn
 
+<p align="center">
+  <img src="./internal/web/static/logo.svg" width="96">
+</p>
+
 Face recognition for a known set of people — **CLI + REST API + minimal web UI**, in Go.
 
 Point it at a folder of people, enroll them once, then feed it any photo: it

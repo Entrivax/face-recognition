@@ -53,10 +53,8 @@ html, body {
 }
 .brand { display: flex; align-items: baseline; gap: 10px; }
 .brand-mark {
-	width: 12px; height: 12px; align-self: center;
-	border: 2px solid var(--match);
-	border-radius: 3px;
-	box-shadow: 0 0 12px rgba(56, 224, 200, 0.5);
+	width: 32px; height: 32px; align-self: center;
+	display: flex;
 }
 .brand-word { font-weight: 700; font-size: 20px; letter-spacing: 0.2px; }
 .brand-sub {
