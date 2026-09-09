@@ -56,23 +56,38 @@ internal/
                          interchange import/export (embeddings.json), CRUD
   enroll/enroll.go       scan people/ → embeddings (incremental by content hash)
   api/api.go             REST handlers; depends on an Engine INTERFACE (testable)
-  web/web.go             serves the embedded UI (go:embed static, no build step)
-  web/static/index.html  single page; loads /js/main.js as an ES module
-  web/static/style.css   all styling
-  web/static/app.js      1-line compat shim (import "/js/main.js") for the old URL
-  web/static/js/         the front-end, native ES modules (no bundler):
-    main.js              entry: health, rescan, Escape stack, Tab traps, boot
-    dom.js               every getElementById lookup, exported as one `el` object
-    util.js              showToast, escapeHtml, fmtSize, initials
-    api.js               fetch wrappers for /api/* (422-on-enroll not thrown)
-    state.js             the one cross-module value (peopleNames)
-    overlay.js           shared drawFaces canvas renderer (corner brackets)
-    recognize.js         main stage: dropzone, results list, overlay
-    people.js            enrolled-people list + remove
-    photos.js            photos-manager modal (grid + detail, add/delete/avatar)
-    enroll.js            enroll modal + pre-submit face-check chain
-    facecheck.js         enlarged face-check viewer (read-only)
-    paste.js             clipboard routing (enroll → photos → stage)
+  web/web.go             serves the embedded UI bundle (go:embed all:dist)
+  web/dist/              Vite build output (gitignored except .gitkeep;
+                         rebuilt by `make ui`; missing → UI serves 503)
+web/                     the front-end: Preact + TypeScript, built by Vite
+  index.html             Vite entry (fonts, favicon, <div id="root">)
+  vite.config.ts         preact preset, outDir ../internal/web/dist, dev proxy
+  package.json           npm project (`npm --prefix web run dev|build`)
+  public/logo.svg        static asset copied verbatim into the bundle
+  src/
+    main.tsx             entry: <ToastProvider><App/> into #root
+    style.css            all styling (class names + ids unchanged from the
+                         old static UI — the stylesheet is untouched)
+    types.ts             API DTO types mirroring internal/api/api.go JSON
+    api.ts               typed fetch wrappers for /api/* (422-on-enroll not
+                         thrown); throws Error(j.error || fallback) otherwise
+    overlay.ts           shared drawFaces canvas renderer (corner brackets)
+    util.ts              fmtSize, initials, clipboard helpers
+    modalStack.ts        Escape-stack registry (topmost modal closes first)
+    toast.tsx            ToastProvider + useToast context
+    components/
+      App.tsx            state owner: health, people, threshold, modal open
+                         state, paste routing, Escape keydown
+      Topbar.tsx         brand + status pill
+      Stage.tsx          main stage: dropzone, preview, overlay, face rows
+                         (matches + "name this face" enroll form)
+      PeoplePanel.tsx    enrolled-people list, search, threshold slider, rescan
+      Modal.tsx          shared modal shell: backdrop, focus trap, focus
+                         save/restore, Escape-stack membership, busy lock
+      EnrollModal.tsx    enroll modal + pre-submit face-check chain
+      PhotosModal.tsx    photos manager (grid + detail, add/delete/avatar/rename)
+      FaceCheckModal.tsx enlarged face-check viewer (read-only, stacked)
+      Avatar.tsx         thumbnail img with initials fallback
 third_party/onnxruntime/ ORT C header + libonnxruntime.so (via `make ort`)
 models/                  det_10g.onnx, w600k_r50.onnx  (gitignored; downloaded)
 people/<Name>/*.jpg      the dataset — 24 people, 66 photos enrolled
@@ -121,7 +136,9 @@ export GOPATH=$PWD/.gopath GOMODCACHE=$PWD/.gomodcache GOCACHE=$PWD/.gocache \
 
 **Prefer the `Makefile`** — it sets all of these plus the CGO include/lib flags:
 `make build` / `make test` / `make test-race` / `make vet` / `make serve` /
-`make ort` / `make dataset-test`.
+`make ort` / `make ui` / `make dataset-test`.
+`make build`/`serve`/`test` depend on `ui`, which needs **Node ≥ 20 + npm**
+(see web/package.json); it skips `npm ci` when `web/node_modules` exists.
 
 - **CGO is required** (`CGO_ENABLED=1`) and needs `gcc`. The ORT C lib+header
   must exist in `third_party/onnxruntime` — `make ort` fetches them (needs
@@ -154,14 +171,16 @@ export GOPATH=$PWD/.gopath GOMODCACHE=$PWD/.gomodcache GOCACHE=$PWD/.gocache \
 ## Docker
 
 `Dockerfile` is multi-stage: (1) fetch ORT C lib, (2) fetch models, (3) build
-the CGO binary with `gcc` + ORT (rpath set to `/usr/lib/recogn`), (4) slim
-`debian:bookworm-slim` runtime with `libonnxruntime` in `/usr/lib/recogn` +
-`ldconfig`, `curl` for the healthcheck, non-root user, `EXPOSE 8080`, `VOLUME
-/data/db`. `docker-compose.yml` mounts `./people` writable at `/data/people`
-(API enrollments save uploaded photos back into it), persists the DB via
-`./data` → `/data/db`, sets `RECOGN_THRESHOLD`, healthcheck
-via `curl /api/health`. `.dockerignore` excludes `people/`, `models/`, `data/`,
-`third_party/`, `python/`, caches.
+the web UI with Vite (`node:22-bookworm-slim`, `npm ci && npm run build`),
+(4) build the CGO binary with `gcc` + ORT (rpath set to `/usr/lib/recogn`),
+(5) slim `debian:bookworm-slim` runtime with `libonnxruntime` in
+`/usr/lib/recogn` + `ldconfig`, `curl` for the healthcheck, non-root user,
+`EXPOSE 8080`, `VOLUME /data/db`. `docker-compose.yml` mounts `./people`
+writable at `/data/people` (API enrollments save uploaded photos back into
+it), persists the DB via `./data` → `/data/db`, sets `RECOGN_THRESHOLD`,
+healthcheck via `curl /api/health`. `.dockerignore` excludes `people/`,
+`models/`, `data/`, `third_party/`, `python/`, caches, `web/node_modules/`,
+and the host `internal/web/dist/` (the image builds its own bundle).
 
 **Docker CLI commands need elevated sandbox permissions** (the daemon socket and
 `~/.docker/buildx` state live outside the workspace) — retry with
@@ -190,14 +209,27 @@ command hits a permission error.
 
 - **Minimal Go deps** — stdlib + `x/image` + `bbolt` (DB) only. Image
   crop/resize/warp are hand-rolled in `engine.go`; reuse them.
-- **Front-end stays build-free** — native ES modules under `web/static/js/`,
-  no bundler/transpiler/npm. `index.html` loads `/js/main.js` as
-  `<script type="module">`; the rest are plain `import`/`export`. Keep the
-  module graph acyclic: `people`/`photos`/`enroll` never import each other —
-  cross-module refreshes go through `on*Change` callbacks wired in `main.js`,
-  and `facecheck` learns whether another modal is open via an injected
-  `onAnyModalOpen` callback. `/app.js` is a 1-line compat shim — don't delete
-  it (`TestIndexServed` still GETs it).
+- **Front-end is Preact + TypeScript, built by Vite** — sources live under
+  `web/`, the build lands in `internal/web/dist/` and is embedded by
+  `go:embed all:dist` (`internal/web/web.go`). Build with `make ui`
+  (npm ci + `tsc --noEmit && vite build`; needs Node ≥ 20). During UI work run
+  `npm --prefix web run dev` for the Vite dev server on :5173 — it proxies
+  `/api` to the Go server on :8080, so no rebuild is needed for API-side
+  checks. Architecture notes:
+  - **State lives in `App`** (health, people, threshold, which modal is
+    open); children refresh each other via `refreshAll()` callbacks — the
+    old `on*Change` callback modules are gone.
+  - **Modals stay mounted** and toggle `hidden` (the stylesheet keys off
+    `.modal[hidden]`); the shared `Modal` shell owns the focus trap, focus
+    save/restore, busy lock, and Escape-stack membership.
+  - **Escape closes the topmost modal** via `modalStack.ts` (photos modal
+    cancels its rename edit first); paste routing (`App`) routes clipboard
+    images enroll → photos → stage, and never hijacks text pasted into
+    inputs.
+  - `class`/`id` names mirror the original DOM — keep them when editing
+    components or `style.css` stops applying.
+  - TestIndexServed extracts every local asset URL from the served
+    index.html and GETs it — adding a local asset is covered automatically.
 - The engine is safe for concurrent use. CGO inference is bounded, not
   serialised: a semaphore in `cgoInferencer` admits up to
   `RECOGN_CONCURRENCY` (default `min(NumCPU, 4)`) parallel model Runs — safe

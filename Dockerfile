@@ -6,8 +6,9 @@
 #
 # Stage 1 fetches the ONNX Runtime C library + headers.
 # Stage 2 downloads the ONNX models (SCRFD detector + ArcFace embedder).
-# Stage 3 builds the CGO-enabled Go binary against the ORT C library.
-# Stage 4 is the slim runtime: debian-slim + libonnxruntime + binary + models.
+# Stage 3 builds the web UI (Preact + TypeScript) with Vite.
+# Stage 4 builds the CGO-enabled Go binary against the ORT C library.
+# Stage 5 is the slim runtime: debian-slim + libonnxruntime + binary + models.
 #
 # Build:  docker build -t recogn .
 # Run:    docker run -p 8080:8080 -v "$PWD/people:/data/people" recogn
@@ -42,7 +43,16 @@ RUN curl -fSL -o /tmp/buffalo_l.zip "$BUFFALO_URL" \
  && unzip -o /tmp/buffalo_l.zip det_10g.onnx w600k_r50.onnx -d /models \
  && rm /tmp/buffalo_l.zip
 
-# ---- Stage 3: build the CGO-enabled Go binary ------------------------------
+# ---- Stage 3: build the web UI (Preact + TypeScript → Vite bundle) ---------
+FROM node:22-bookworm-slim AS ui
+WORKDIR /src/web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+# Emits to /src/internal/web/dist (outDir ../internal/web/dist).
+RUN npm run build
+
+# ---- Stage 4: build the CGO-enabled Go binary ------------------------------
 FROM golang:1.26-bookworm AS gobuild
 # CGO needs a C toolchain.
 RUN apt-get update \
@@ -59,12 +69,15 @@ RUN go mod download
 
 COPY . .
 
+# The Vite-built UI bundle (dist/ is gitignored; Docker always builds its own).
+COPY --from=ui /src/internal/web/dist ./internal/web/dist
+
 ENV CGO_ENABLED=1 \
     CGO_CFLAGS="-I/third_party/onnxruntime/include" \
     CGO_LDFLAGS="-L/third_party/onnxruntime/lib -lonnxruntime -Wl,-rpath,/usr/lib/recogn"
 RUN go build -trimpath -ldflags="-s -w" -o /out/recogn .
 
-# ---- Stage 4: runtime -------------------------------------------------------
+# ---- Stage 5: runtime -------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 
 # curl is used by the docker-compose healthcheck; ca-certificates for any TLS.

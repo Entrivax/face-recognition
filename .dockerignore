@@ -10,6 +10,11 @@ recogn
 .gopath/
 .gomodcache/
 
+# The web UI bundle is built inside the image (stage 3); host node_modules
+# and a possibly stale host dist are excluded.
+web/node_modules/
+internal/web/dist/
+
 # Downloaded models are fetched fresh inside the image build.
 models/
 

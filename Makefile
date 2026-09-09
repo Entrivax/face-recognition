@@ -28,12 +28,22 @@ WIN_CC      := x86_64-w64-mingw32-gcc
 export CGO_CFLAGS  := -I$(CURDIR)/$(ORT_DIR)/include
 export CGO_LDFLAGS := -L$(CURDIR)/$(ORT_DIR)/lib -lonnxruntime -Wl,-rpath,$(CURDIR)/$(ORT_DIR)/lib
 
-.PHONY: all build build-windows test test-race vet enroll serve clean models ort ort-win dataset-test
+.PHONY: all build build-windows test test-race vet enroll serve clean models ort ort-win ui dataset-test
 
 all: build
 
+# Build the web UI (Preact + TypeScript via Vite) into internal/web/dist,
+# which the Go binary embeds. Needs Node >= 20; skipped when node_modules
+# is already populated the same way `ort` is skipped once fetched.
+ui:
+	@if [ ! -d web/node_modules ]; then \
+	  echo "Installing web UI dependencies..."; \
+	  npm --prefix web ci; \
+	fi
+	npm --prefix web run build
+
 # The CGO backend needs the ONNX Runtime C library present first.
-build: ort
+build: ort ui
 	go build -o $(BINARY) .
 
 # Cross-compile a Windows binary (recogn.exe). Requires mingw-w64:
@@ -42,7 +52,7 @@ build: ort
 #   macOS (brew)  : brew install mingw-w64
 # The resulting recogn.exe needs onnxruntime.dll next to it (or on PATH).
 # `make dist-windows` bundles everything into a zip.
-build-windows: ort-win
+build-windows: ort-win ui
 	GOOS=windows GOARCH=amd64 \
 	CC=$(WIN_CC) \
 	CGO_CFLAGS="-I$(CURDIR)/$(ORT_WIN_DIR)/include" \
@@ -63,7 +73,7 @@ ort-win:
 	fi
 
 # Bundle the Windows binary + DLL + models into a distributable zip.
-dist-windows: build-windows models
+dist-windows: build-windows models ui
 	@mkdir -p dist/recogn-windows
 	cp $(WIN_BINARY) dist/recogn-windows/
 	cp $(ORT_WIN_DIR)/lib/onnxruntime.dll dist/recogn-windows/
@@ -120,4 +130,4 @@ models:
 
 clean:
 	rm -f $(BINARY) $(WIN_BINARY)
-	rm -rf .gocache dist
+	rm -rf .gocache dist web/node_modules

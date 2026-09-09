@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -311,15 +312,50 @@ func TestRecognizeDraw(t *testing.T) {
 
 func TestIndexServed(t *testing.T) {
 	s, _ := newTestServer(t, &stubEngine{})
-	for _, path := range []string{"/", "/app.js", "/style.css"} {
-		req := httptest.NewRequest(http.MethodGet, path, nil)
+
+	// The single-page UI itself (built by `make ui` into internal/web/dist).
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /: got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "recogn") {
+		t.Fatalf("GET /: body does not look like the UI: %.80s", rec.Body.String())
+	}
+
+	// Every local asset the page references (hashed bundles, logo) serves too.
+	body := rec.Body.String()
+	seen := map[string]bool{}
+	for _, m := range assetRefRe.FindAllStringSubmatch(body, -1) {
+		u := m[1]
+		if seen[u] {
+			continue
+		}
+		seen[u] = true
+		req := httptest.NewRequest(http.MethodGet, u, nil)
 		rec := httptest.NewRecorder()
 		s.Handler().ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
-			t.Errorf("GET %s: got %d", path, rec.Code)
+			t.Errorf("GET %s: got %d", u, rec.Code)
 		}
 	}
+	if len(seen) == 0 {
+		t.Fatal("GET /: no local assets referenced")
+	}
+
+	// Unknown paths are not rewritten to the SPA (no fallback).
+	req = httptest.NewRequest(http.MethodGet, "/nonexistent", nil)
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("GET /nonexistent: got %d, want 404", rec.Code)
+	}
 }
+
+// assetRefRe extracts local (root-relative) src/href URLs from the built
+// index.html so the test can verify each one is served.
+var assetRefRe = regexp.MustCompile(`(?:src|href)="(/[^"]+)"`)
 
 // enrollFaceRequest POSTs a single image plus a face_index field to
 // /api/people/{name}/enroll-face.

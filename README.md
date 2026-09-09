@@ -1,7 +1,7 @@
 # recogn
 
 <p align="center">
-  <img src="./internal/web/static/logo.svg" width="96">
+  <img src="./web/public/logo.svg" width="96">
 </p>
 
 Face recognition for a known set of people — **CLI + REST API + minimal web UI**, in Go.
@@ -40,7 +40,9 @@ internal/
   db/                  face database: bbolt store (data/faces.db) + JSON import/export
   enroll/              people/ folder scanning + embedding
   api/                 REST API handlers
-  web/                 embedded web UI (static/)
+  web/                 serves the embedded UI bundle (dist/ via go:embed)
+web/                   the web UI sources: Preact + TypeScript, built by Vite
+  src/                 components, typed API client, styles
 third_party/onnxruntime/  ORT C header + libonnxruntime (via `make ort`)
 third_party/onnxruntime-win/  Windows ORT C header + onnxruntime.dll (via `make ort-win`)
 models/                det_10g.onnx, w600k_r50.onnx  (downloaded)
@@ -88,6 +90,7 @@ docker run -p 8080:8080 -v "$PWD/people:/data/people" -v recogn-db:/data/db reco
 
 - Go 1.22+
 - A C toolchain (`gcc`) — inference uses CGO
+- Node.js 20+ with npm — the web UI (Preact + TypeScript) is built by Vite
 - The ONNX Runtime C library + header (fetched into `third_party/onnxruntime` by `make ort`)
 - The two ONNX models in `./models` (see below)
 
@@ -95,13 +98,30 @@ docker run -p 8080:8080 -v "$PWD/people:/data/people" -v recogn-db:/data/db reco
 
 ```sh
 make models     # download SCRFD + ArcFace into ./models (~289 MB, once)
-make build      # fetch the ORT C library (make ort) and build ./recogn with CGO
+make build      # fetch the ORT C library (make ort), build the web UI (make ui),
+                # and build ./recogn with CGO
 ```
 
 `make build` depends on `make ort`, which downloads `libonnxruntime` +
-`onnxruntime_c_api.h` into `third_party/onnxruntime`. The binary is linked with
-an `$ORIGIN`-relative rpath, so it runs in place as long as `third_party/`
-stays next to it.
+`onnxruntime_c_api.h` into `third_party/onnxruntime`, and on `make ui`, which
+installs the web UI's npm dependencies (once) and builds it into
+`internal/web/dist/` — that folder is embedded into the binary. The binary is
+linked with an `$ORIGIN`-relative rpath, so it runs in place as long as
+`third_party/` stays next to it.
+
+### Web UI development
+
+The front-end (`web/`) is a standalone Vite project. For UI work, run the Go
+server and the Vite dev server side by side — API calls are proxied, so there
+is no rebuild loop:
+
+```sh
+make serve                    # Go API + (previously built) UI on :8080
+npm --prefix web run dev      # Vite dev server on http://localhost:5173
+```
+
+`npm --prefix web run build` type-checks (`tsc --noEmit`) and rebuilds the
+bundle that the Go binary embeds.
 
 ### Cross-compile for Windows
 

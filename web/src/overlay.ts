@@ -1,22 +1,29 @@
-/* recogn — shared face overlay renderer.
-	 One renderer for every surface that shows detected faces: the main stage,
-	 the photos-manager detail view, and the enroll face-check viewer. Draws
-	 scaled corner brackets per face; labels (identity + confidence) are
-	 optional for small thumbnails. */
+// Shared face overlay renderer.
+// One renderer for every surface that shows detected faces: the main stage,
+// the photos-manager detail view, the enroll thumbnails, and the face-check
+// viewer. Draws scaled corner brackets per face; labels (identity +
+// confidence) are optional for small thumbnails.
 
-export function drawFaces(canvas, img, faces, opts = {}) {
+import type { Face } from "./types";
+
+interface DrawOpts {
+	labels?: boolean;
+}
+
+export function drawFaces(canvas: HTMLCanvasElement, img: HTMLImageElement, faces: Face[], opts: DrawOpts = {}): void {
 	const w = img.naturalWidth;
 	const h = img.naturalHeight;
 	if (!w || !h) return;
 	canvas.width = w;
 	canvas.height = h;
 	const ctx = canvas.getContext("2d");
+	if (!ctx) return;
 	ctx.clearRect(0, 0, w, h);
 	const scale = Math.max(w, h) / 900; // line width scales with image size
 
 	faces.forEach((f, i) => {
 		const [x, y, bw, bh] = f.bbox;
-		const known = f.name && f.name !== "unknown";
+		const known = Boolean(f.name && f.name !== "unknown");
 		const col = known ? "#38e0c8" : "#f5b53f";
 		const L = Math.max(14 * scale, Math.min(bw, bh) * 0.22); // bracket arm
 		const lw = Math.max(2, 2.5 * scale);
@@ -26,17 +33,17 @@ export function drawFaces(canvas, img, faces, opts = {}) {
 		ctx.shadowBlur = 6 * scale;
 
 		// corner brackets
-		const corners = [
+		const corners: [number, number, number, number][] = [
 			[x, y, 1, 1], [x + bw, y, -1, 1],
 			[x, y + bh, 1, -1], [x + bw, y + bh, -1, -1],
 		];
-		corners.forEach(([cx, cy, sx, sy]) => {
+		for (const [cx, cy, sx, sy] of corners) {
 			ctx.beginPath();
 			ctx.moveTo(cx + L * sx, cy);
 			ctx.lineTo(cx, cy);
 			ctx.lineTo(cx, cy + L * sy);
 			ctx.stroke();
-		});
+		}
 
 		if (!opts || !opts.labels) return;
 
@@ -64,7 +71,7 @@ export function drawFaces(canvas, img, faces, opts = {}) {
 }
 
 // Draw once the image has dimensions (immediately when already loaded).
-export function drawWhenReady(canvas, img, faces, opts) {
+export function drawWhenReady(canvas: HTMLCanvasElement, img: HTMLImageElement, faces: Face[], opts: DrawOpts): void {
 	const draw = () => drawFaces(canvas, img, faces, opts);
 	if (img.complete && img.naturalWidth) draw();
 	else img.onload = draw;

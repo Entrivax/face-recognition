@@ -122,9 +122,9 @@ func (w *statusWriter) WriteHeader(code int) {
 // ---- handlers ----
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	// Serve index.html at "/" and static assets (app.js, style.css, ...) for
-	// any other non-API path. API routes are registered on more specific
-	// patterns, so they take precedence over this catch-all.
+	// Serve index.html at "/" and the built UI bundle (assets/, logo.svg,
+	// ...) for any other non-API path. API routes are registered on more
+	// specific patterns, so they take precedence over this catch-all.
 	web.ServeUI(w, r)
 }
 

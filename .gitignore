@@ -1,10 +1,15 @@
 # Build artifacts
 recogn
 recogn.exe
-dist
+/dist
 .gocache
 .gopath
 .gomodcache
+web/node_modules
+
+# Built web UI bundle (rebuilt via `make ui`); .gitkeep keeps the dir tracked
+internal/web/dist/*
+!internal/web/dist/.gitkeep
 
 # Downloaded ONNX models (large; fetched via `make models`)
 models
