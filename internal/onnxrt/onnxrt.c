@@ -10,9 +10,16 @@
 //     caller frees both via ort_free.
 #include "onnxrt.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 
 #include "onnxruntime_c_api.h"
 
@@ -33,21 +40,71 @@
 // --------------------------------------------------------------------------
 static ORT_TLS char g_err[1024];
 
-static void set_err(const char* fmt, const char* detail) {
-  if (detail) {
-    snprintf(g_err, sizeof(g_err), fmt, detail);
-  } else {
-    snprintf(g_err, sizeof(g_err), "%s", fmt);
-  }
+static void set_err(const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(g_err, sizeof(g_err), fmt, ap);
+  va_end(ap);
 }
 
 const char* ort_last_error(void) { return g_err; }
 
 // --------------------------------------------------------------------------
-// API table + global env
+// Shared-library loading + API table + global env
 // --------------------------------------------------------------------------
-static const OrtApi* g_api = NULL;
-static OrtEnv*       g_env = NULL;
+// The ORT C API is reached through one exported entry point,
+// OrtGetApiBase()->GetApi(ORT_API_VERSION), which returns the OrtApi function
+// table used everywhere below. The library is therefore loaded at runtime via
+// dlopen/LoadLibrary (see ort_runtime_load) instead of a link-time
+// -lonnxruntime, which is what lets the executable embed it and stay a single
+// file. The handle is intentionally never released: ORT keeps process-global
+// state (the OrtEnv) and the library must outlive every session.
+typedef const OrtApiBase* (*ort_get_api_base_fn)(void);
+static void*               g_lib          = NULL; // dlopen/LoadLibrary handle (never released)
+static ort_get_api_base_fn g_get_api_base = NULL;
+static const OrtApi*       g_api          = NULL;
+static OrtEnv*             g_env          = NULL;
+
+int ort_runtime_load(const char* path) {
+  if (g_get_api_base != NULL) return 0; // already loaded
+  if (path == NULL || path[0] == '\0') {
+    set_err("%s", "ort_runtime_load: empty library path");
+    return -1;
+  }
+#ifdef _WIN32
+  HMODULE h = LoadLibraryA(path);
+  if (h == NULL) {
+    set_err("LoadLibrary(%s) failed (GetLastError=%lu)", path, (unsigned long)GetLastError());
+    return -1;
+  }
+  FARPROC p = GetProcAddress(h, "OrtGetApiBase");
+  if (p == NULL) {
+    set_err("GetProcAddress(%s, \"OrtGetApiBase\") failed (GetLastError=%lu)",
+            path, (unsigned long)GetLastError());
+    FreeLibrary(h);
+    return -1;
+  }
+  g_lib          = (void*)h;
+  g_get_api_base = (ort_get_api_base_fn)p;
+#else
+  void* h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+  if (h == NULL) {
+    const char* e = dlerror();
+    set_err("dlopen(%s) failed: %s", path, e ? e : "unknown error");
+    return -1;
+  }
+  void* p = dlsym(h, "OrtGetApiBase");
+  if (p == NULL) {
+    const char* e = dlerror();
+    set_err("dlsym(%s, \"OrtGetApiBase\") failed: %s", path, e ? e : "symbol not found");
+    dlclose(h);
+    return -1;
+  }
+  g_lib          = h;
+  g_get_api_base = (ort_get_api_base_fn)p;
+#endif
+  return 0;
+}
 
 static int check_status(OrtStatus* st, const char* what) {
   if (st == NULL) return 0;
@@ -61,7 +118,13 @@ static int check_status(OrtStatus* st, const char* what) {
 
 int ort_global_init(void) {
   if (g_api != NULL && g_env != NULL) return 0; // already initialised
-  g_api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+  if (g_get_api_base == NULL) {
+    set_err("%s",
+            "ONNX Runtime shared library not loaded: ort_runtime_load() must "
+            "succeed before opening sessions");
+    return -1;
+  }
+  g_api = g_get_api_base()->GetApi(ORT_API_VERSION);
   if (g_api == NULL) {
     set_err("%s", "OrtGetApiBase()->GetApi returned NULL (version mismatch?)");
     return -1;

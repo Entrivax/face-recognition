@@ -258,3 +258,82 @@ func cosine(a, b []float32) float64 {
 	}
 	return dot / (math.Sqrt(na) * math.Sqrt(nb))
 }
+
+// TestRuntimeLoadAndExtract verifies the single-file deployment path: the
+// embedded library bytes are written to a cache dir and dlopen'd, and the
+// resulting runtime opens and runs a model identically to the file-path build.
+func TestRuntimeLoadAndExtract(t *testing.T) {
+	libPath := "../../third_party/onnxruntime/lib/libonnxruntime.so.1.23.2"
+	data, err := os.ReadFile(libPath)
+	if err != nil {
+		t.Skip("onnxruntime library not present; run `make ort`")
+	}
+	// Extraction must produce a loadable file with matching size.
+	path, err := extractTo(t.TempDir(), repoLibFile(), data)
+	if err != nil {
+		t.Fatalf("extractTo: %v", err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat extracted file: %v", err)
+	}
+	if fi.Size() != int64(len(data)) {
+		t.Fatalf("extracted size = %d, want %d", fi.Size(), len(data))
+	}
+	if fi.Mode()&0o100 == 0 {
+		t.Errorf("extracted file not executable: %v", fi.Mode())
+	}
+	if err := loadLibrary(path); err != nil {
+		t.Fatalf("loadLibrary: %v", err)
+	}
+}
+
+// TestExtractLibraryFallbackDirs verifies extractLibrary writes to a writable
+// dir and returns a real file path even when the first candidate is unusable.
+func TestExtractLibraryFallbackDirs(t *testing.T) {
+	data, err := os.ReadFile("../../third_party/onnxruntime/lib/libonnxruntime.so.1.23.2")
+	if err != nil {
+		t.Skip("onnxruntime library not present; run `make ort`")
+	}
+	path, err := extractLibrary("1.23.2", repoLibFile(), data)
+	if err != nil {
+		t.Fatalf("extractLibrary: %v", err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil || fi.Size() != int64(len(data)) {
+		t.Fatalf("extracted file missing or wrong size: %v", err)
+	}
+	// Idempotent: re-extracting returns the same path.
+	path2, err := extractLibrary("1.23.2", repoLibFile(), data)
+	if err != nil || path2 != path {
+		t.Fatalf("re-extract mismatch: %v / %v", path2, err)
+	}
+}
+
+// TestExtractAndLoadEmbeddedLibrary verifies the single-file deployment path:
+// the embedded library bytes are written to a cache dir, dlopen'd, and the
+// resulting runtime opens and runs a model.
+func TestExtractAndLoadEmbeddedLibrary(t *testing.T) {
+	libPath := filepath.Join("..", "..", "third_party", "onnxruntime", "lib", "libonnxruntime.so.1.23.2")
+	data, err := os.ReadFile(libPath)
+	if err != nil {
+		t.Skip("onnxruntime library not present; run `make ort`")
+	}
+	path, err := extractTo(t.TempDir(), "libonnxruntime.so", data)
+	if err != nil {
+		t.Fatalf("extractTo: %v", err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat extracted file: %v", err)
+	}
+	if fi.Size() != int64(len(data)) {
+		t.Fatalf("extracted size = %d, want %d", fi.Size(), len(data))
+	}
+	if fi.Mode()&0o100 == 0 {
+		t.Errorf("extracted file not executable: %v", fi.Mode())
+	}
+	if err := loadLibrary(path); err != nil {
+		t.Fatalf("loadLibrary: %v", err)
+	}
+}

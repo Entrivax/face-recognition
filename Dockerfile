@@ -4,11 +4,12 @@
 # recogn — all-in-one image: Go app (CLI + REST API + web UI) with in-process
 # ONNX inference via CGO + the ONNX Runtime C API. CPU-only. No Python.
 #
-# Stage 1 fetches the ONNX Runtime C library + headers.
+# Stage 1 fetches the ONNX Runtime C library + headers (used at build time to
+# compile the CGO shim and embed the library).
 # Stage 2 downloads the ONNX models (SCRFD detector + ArcFace embedder).
 # Stage 3 builds the web UI (Preact + TypeScript) with Vite.
-# Stage 4 builds the CGO-enabled Go binary against the ORT C library.
-# Stage 5 is the slim runtime: debian-slim + libonnxruntime + binary + models.
+# Stage 4 builds the CGO-enabled Go binary with the ORT library embedded.
+# Stage 5 is the slim runtime: debian-slim + self-contained binary + models.
 #
 # Build:  docker build -t recogn .
 # Run:    docker run -p 8080:8080 -v "$PWD/people:/data/people" recogn
@@ -74,7 +75,7 @@ COPY --from=ui /src/internal/web/dist ./internal/web/dist
 
 ENV CGO_ENABLED=1 \
     CGO_CFLAGS="-I/third_party/onnxruntime/include" \
-    CGO_LDFLAGS="-L/third_party/onnxruntime/lib -lonnxruntime -Wl,-rpath,/usr/lib/recogn"
+    CGO_LDFLAGS="-ldl"
 RUN go build -trimpath -ldflags="-s -w" -o /out/recogn .
 
 # ---- Stage 5: runtime -------------------------------------------------------
@@ -85,9 +86,8 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# The ONNX Runtime shared library, installed on the linker path.
-COPY --from=ort /ort/lib /usr/lib/recogn
-RUN ldconfig /usr/lib/recogn
+# The ONNX Runtime shared library is embedded in the binary (go:embed) and
+# loaded at runtime, so no system install is needed.
 
 WORKDIR /app
 COPY --from=gobuild /out/recogn /app/recogn
@@ -101,7 +101,9 @@ ENV RECOGN_MODELS_DIR=/app/models \
     RECOGN_PEOPLE_DIR=/data/people \
     RECOGN_DATA_DIR=/data/db \
     RECOGN_ADDR=:8080 \
-    RECOGN_THRESHOLD=0.45
+    RECOGN_THRESHOLD=0.45 \
+    # Keep the ORT extraction cache out of the /data volume.
+    XDG_CACHE_HOME=/tmp/.cache
 
 RUN mkdir -p /data/people /data/db
 

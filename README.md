@@ -105,9 +105,12 @@ make build      # fetch the ORT C library (make ort), build the web UI (make ui)
 `make build` depends on `make ort`, which downloads `libonnxruntime` +
 `onnxruntime_c_api.h` into `third_party/onnxruntime`, and on `make ui`, which
 installs the web UI's npm dependencies (once) and builds it into
-`internal/web/dist/` — that folder is embedded into the binary. The binary is
-linked with an `$ORIGIN`-relative rpath, so it runs in place as long as
-`third_party/` stays next to it.
+`internal/web/dist/` — that folder is embedded into the binary. The ONNX
+Runtime shared library is embedded too (`go:embed` from the main package) and
+loaded at runtime: on first use it is extracted to
+`~/.cache/recogn/ort/<version>/` and dlopen'd, so no external files are
+needed. Deploy just the executable — models load from `models/` or
+auto-download when missing.
 
 ### Web UI development
 
@@ -138,10 +141,13 @@ make build-windows   # fetch Windows ORT + cross-compile recogn.exe
 ```
 
 This downloads the Windows ONNX Runtime distribution into
-`third_party/onnxruntime-win/` and produces `recogn.exe`. To run the binary on
-Windows, `onnxruntime.dll` must be next to the `.exe` (or on `PATH`).
+`third_party/onnxruntime-win/` and produces `recogn.exe`. The
+`onnxruntime.dll` is embedded into the `.exe` and extracted + loaded at
+runtime via `LoadLibrary`, so the `.exe` is self-contained — no external DLL
+is needed. (Note: the official ORT Windows DLL depends on the Visual C++
+runtime, so a bare Windows machine may still need the VC redistributable.)
 
-To produce a self-contained zip with the binary, DLL, and models:
+To produce a self-contained zip with just the binary:
 
 ```sh
 make dist-windows    # → dist/recogn-windows-x64.zip

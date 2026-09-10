@@ -876,7 +876,8 @@ func max(a, b int) int {
 func CheckModels(detPath, embPath string) error {
 	for _, p := range []string{detPath, embPath} {
 		if _, err := os.Stat(p); err != nil {
-			return fmt.Errorf("model missing: %s (download it into the models directory)", filepath.Base(p))
+			return fmt.Errorf("model missing: %s (run `make models`, download the buffalo_l pack manually, "+
+				"or re-enable auto-download via RECOGN_AUTO_DOWNLOAD; override the pack URL with RECOGN_MODELS_URL)", filepath.Base(p))
 		}
 	}
 	return nil

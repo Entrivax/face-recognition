@@ -31,6 +31,8 @@ import (
 	"recogn/internal/db"
 	"recogn/internal/engine"
 	"recogn/internal/enroll"
+	"recogn/internal/models"
+	"recogn/internal/onnxrt"
 )
 
 func main() {
@@ -146,7 +148,40 @@ func resolveWorkers(cfg config.Config) int {
 // Threshold precedence: an explicit --threshold flag wins; otherwise the value
 // persisted in the DB (set via POST /api/config or the UI slider); otherwise
 // the env/default in cfg.
+// autoDownloadEnabled reports whether the model auto-download is active.
+// Enabled by default; disable with RECOGN_AUTO_DOWNLOAD=0/false/off/no.
+func autoDownloadEnabled() bool {
+	switch strings.ToLower(os.Getenv("RECOGN_AUTO_DOWNLOAD")) {
+	case "0", "false", "off", "no":
+		return false
+	}
+	return true
+}
+
+// openEngine builds the engine + DB and loads identities into the engine.
 func openEngine(cfg config.Config, thresholdSet bool) (*engine.Engine, *db.DB, error) {
+	// Register the embedded ONNX Runtime library so the first session can
+	// extract and dlopen it (single-file deployment). No-op when nothing is
+	// embedded (-tags noembed), in which case the fallback search applies.
+	onnxrt.SetRuntimeLibrary(ortLibVersion, ortLibFile, ortLibData)
+
+	// Auto-download the models if they are missing from the models dir.
+	if err := models.Ensure(cfg.ModelsDir, cfg.DetModel, cfg.EmbModel, models.Options{
+		Auto: autoDownloadEnabled(),
+		URL:  os.Getenv("RECOGN_MODELS_URL"),
+		Progress: func(done, total int64) {
+			if total > 0 {
+				fmt.Fprintf(os.Stderr, "\r  downloading models: %3d%% (%d/%d MiB)",
+					done*100/total, done>>20, total>>20)
+			}
+		},
+		Done: func(done, total int64) {
+			fmt.Fprintf(os.Stderr, "\r  downloading models: %3d%% (%d/%d MiB)\n",
+				done*100/total, done>>20, total>>20)
+		},
+	}); err != nil {
+		return nil, nil, err
+	}
 	if err := engine.CheckModels(cfg.DetModelPath(), cfg.EmbModelPath()); err != nil {
 		return nil, nil, err
 	}

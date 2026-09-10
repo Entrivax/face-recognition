@@ -1,24 +1,29 @@
 // Package onnxrt is a minimal Go binding to the ONNX Runtime C API, sufficient
 // to run recogn's two single-input float models (SCRFD detector and ArcFace
-// embedder) in-process. It requires CGO and the ONNX Runtime C library/header
+// embedder) in-process. It requires CGO and the ONNX Runtime C header
 // (fetched into third_party/onnxruntime by `make ort` for Linux, or
 // third_party/onnxruntime-win by `make ort-win` for Windows cross-compilation).
 //
-// The include/lib paths are supplied via CGO_CFLAGS / CGO_LDFLAGS (the
-// Makefile sets them). The #cgo directives below provide platform-appropriate
-// fallbacks for in-package builds.
+// The shared library itself is NOT linked at build time: the executable embeds
+// it (go:embed in the main package) and the first Open extracts it to a
+// per-version user-cache dir and loads it via dlopen/LoadLibrary — see
+// embed.go. That is what makes the deployed binary a single self-contained
+// file. The include path is supplied via CGO_CFLAGS (the Makefile sets it);
+// the #cgo directives below provide platform-appropriate fallbacks for
+// in-package builds.
 package onnxrt
 
 /*
-// Linux: use rpath so the binary finds libonnxruntime.so next to itself.
+// Linux: the ORT shared library is NOT linked at build time. It is embedded
+// into the executable and dlopen'd at startup (embed.go); -ldl covers dlopen
+// on glibc < 2.34.
 #cgo linux CFLAGS: -I${SRCDIR}/../../third_party/onnxruntime/include
-#cgo linux LDFLAGS: -L${SRCDIR}/../../third_party/onnxruntime/lib -lonnxruntime -Wl,-rpath,$ORIGIN/third_party/onnxruntime/lib -Wl,-rpath,${SRCDIR}/../../third_party/onnxruntime/lib
+#cgo linux LDFLAGS: -ldl
 
-// Windows: no rpath; onnxruntime.dll must be next to the .exe or on PATH.
-// The mingw-w64 linker resolves -lonnxruntime against onnxruntime.lib or
-// libonnxruntime.a in the ORT lib directory.
+// Windows: the shim uses LoadLibraryA (kernel32, linked by default); the
+// onnxruntime.dll is embedded into the .exe by the main package and loaded at
+// runtime, so no import library is needed.
 #cgo windows CFLAGS: -I${SRCDIR}/../../third_party/onnxruntime-win/include
-#cgo windows LDFLAGS: -L${SRCDIR}/../../third_party/onnxruntime-win/lib -lonnxruntime
 
 #include <stdlib.h>
 #include "onnxrt.h"
@@ -56,8 +61,13 @@ func lastErr() error {
 	return errors.New(msg)
 }
 
-// Open loads a model from path into a new Session.
+// Open loads a model from path into a new Session. The ONNX Runtime shared
+// library is loaded first if it is not loaded yet (embedded copy, or the
+// fallback chain in embed.go for builds without an embedded library).
 func Open(path string) (*Session, error) {
+	if err := ensureRuntime(); err != nil {
+		return nil, err
+	}
 	cpath := C.CString(path)
 	defer C.free(unsafe.Pointer(cpath))
 	s := C.ort_open(cpath)
@@ -65,6 +75,27 @@ func Open(path string) (*Session, error) {
 		return nil, fmt.Errorf("open %s: %w", path, lastErr())
 	}
 	return &Session{s: s}, nil
+}
+
+// loadLibrary dlopens/LoadLibrary's the ORT shared library at path and
+// resolves OrtGetApiBase. The handle is kept for the process lifetime.
+func loadLibrary(path string) error {
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+	if C.ort_runtime_load(cpath) != 0 {
+		return fmt.Errorf("%s", lastErr())
+	}
+	return nil
+}
+
+// loadErr reports the C shim's thread-local error string from the last
+// failed ort_runtime_load attempt.
+func loadErr() error {
+	msg := C.GoString(C.ort_last_error())
+	if msg == "" {
+		return errors.New("load failed")
+	}
+	return errors.New(msg)
 }
 
 // Close releases the session's native resources. Safe to call once.

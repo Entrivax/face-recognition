@@ -24,9 +24,12 @@ ORT_WIN_DIR := third_party/onnxruntime-win
 WIN_BINARY  := recogn.exe
 WIN_CC      := x86_64-w64-mingw32-gcc
 
-# CGO include/lib paths for the ONNX Runtime C API (Linux host).
+# CGO include path for the ONNX Runtime C API. The shared library is NOT
+# linked at build time anymore — it is embedded into the executable and
+# loaded at runtime via dlopen/LoadLibrary (see internal/onnxrt/embed.go).
+# -ldl covers dlopen on glibc < 2.34.
 export CGO_CFLAGS  := -I$(CURDIR)/$(ORT_DIR)/include
-export CGO_LDFLAGS := -L$(CURDIR)/$(ORT_DIR)/lib -lonnxruntime -Wl,-rpath,$(CURDIR)/$(ORT_DIR)/lib
+export CGO_LDFLAGS := -ldl
 
 .PHONY: all build build-windows test test-race vet enroll serve clean models ort ort-win ui dataset-test
 
@@ -56,7 +59,7 @@ build-windows: ort-win ui
 	GOOS=windows GOARCH=amd64 \
 	CC=$(WIN_CC) \
 	CGO_CFLAGS="-I$(CURDIR)/$(ORT_WIN_DIR)/include" \
-	CGO_LDFLAGS="-L$(CURDIR)/$(ORT_WIN_DIR)/lib -lonnxruntime" \
+	CGO_LDFLAGS="" \
 	go build -o $(WIN_BINARY) .
 
 # Fetch the Windows ONNX Runtime C library + headers (for cross-compilation).
@@ -72,12 +75,11 @@ ort-win:
 	  echo "Windows ORT C ready in $(ORT_WIN_DIR)"; \
 	fi
 
-# Bundle the Windows binary + DLL + models into a distributable zip.
-dist-windows: build-windows models ui
+# Bundle the self-contained Windows binary into a distributable zip.
+# ORT is embedded, so no DLL or models folder is needed.
+dist-windows: build-windows
 	@mkdir -p dist/recogn-windows
 	cp $(WIN_BINARY) dist/recogn-windows/
-	cp $(ORT_WIN_DIR)/lib/onnxruntime.dll dist/recogn-windows/
-	cp -r models dist/recogn-windows/models
 	cd dist && zip -r recogn-windows-x64.zip recogn-windows
 	@echo "Distributable: dist/recogn-windows-x64.zip"
 

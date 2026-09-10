@@ -28,8 +28,17 @@ typedef struct {
   int64_t dims[8]; // shape (up to 8 dims)
 } ort_tensor;
 
-// Global one-time init of the shared OrtEnv. Safe to call repeatedly.
+// Load the ONNX Runtime shared library from `path` (an exact file path, or a
+// bare soname like "libonnxruntime.so.1" resolved through the normal loader
+// search). Resolves the single entry point OrtGetApiBase, through which the
+// whole OrtApi function table is reached. Must be called — and succeed —
+// before ort_global_init/ort_open. The loaded library is deliberately never
+// unloaded: it lives for the whole process (ORT keeps global state).
 // Returns 0 on success.
+int  ort_runtime_load(const char* path);
+
+// Global one-time init of the shared OrtEnv. Safe to call repeatedly.
+// Requires a successful ort_runtime_load first. Returns 0 on success.
 int  ort_global_init(void);
 
 // Create a session for the model at `path`. Returns NULL on failure.

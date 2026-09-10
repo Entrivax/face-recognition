@@ -12,7 +12,7 @@ internal/web/dist/*
 !internal/web/dist/.gitkeep
 
 # Downloaded ONNX models (large; fetched via `make models`)
-models
+/models
 
 # ONNX Runtime C library + headers (fetched via `make ort` / `make ort-win`)
 third_party
