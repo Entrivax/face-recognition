@@ -55,6 +55,8 @@ internal/
   db/db.go               face DB: bbolt store (data/faces.db) + JSON
                          interchange import/export (embeddings.json), CRUD
   enroll/enroll.go       scan people/ → embeddings (incremental by content hash)
+  netutil/netutil.go     serve listener: addr normalization + bind, and the
+                         URLs a wildcard listener covers (per-interface)
   api/api.go             REST handlers; depends on an Engine INTERFACE (testable)
   web/web.go             serves the embedded UI bundle (go:embed all:dist)
   web/dist/              Vite build output (gitignored except .gitkeep;

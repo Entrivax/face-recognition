@@ -32,6 +32,7 @@ import (
 	"recogn/internal/engine"
 	"recogn/internal/enroll"
 	"recogn/internal/models"
+	"recogn/internal/netutil"
 	"recogn/internal/onnxrt"
 )
 
@@ -504,8 +505,13 @@ func runServe(cfg config.Config, thresholdSet bool) error {
 		}
 	}).Handler()
 
+	// Bind before announcing so the printed URLs match the real listener
+	// (resolves hostnames and fills in the port for a bare/zero port).
+	ln, err := netutil.Listen(cfg.Addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", cfg.Addr, err)
+	}
 	srv := &http.Server{
-		Addr:    cfg.Addr,
 		Handler: handler,
 		// Uploads are multipart images and inference is CPU-bound; keep the
 		// limits generous but bounded.
@@ -514,11 +520,10 @@ func runServe(cfg config.Config, thresholdSet bool) error {
 		WriteTimeout:      300 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
-	fmt.Printf("recogn serving on http://localhost%s  (people=%d, threshold=%.2f)\n",
-		normalizeAddr(cfg.Addr), len(database.People()), eng.Threshold())
+	printServing(ln.Addr().String(), len(database.People()), eng.Threshold())
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- srv.ListenAndServe() }()
+	go func() { errCh <- srv.Serve(ln) }()
 
 	// Graceful shutdown on Ctrl+C / SIGTERM: finish in-flight requests, then exit.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -556,11 +561,20 @@ func truncate(s string, n int) string {
 	return s[:n-1] + "…"
 }
 
-func normalizeAddr(addr string) string {
-	if strings.HasPrefix(addr, ":") {
-		return addr
+// printServing announces where the server is reachable. A specific listen
+// host yields a single URL; a wildcard listener lists every matching
+// interface (see netutil.URLs).
+func printServing(listen string, people int, threshold float64) {
+	meta := fmt.Sprintf("(people=%d, threshold=%.2f)", people, threshold)
+	urls := netutil.URLs(listen)
+	if len(urls) == 1 {
+		fmt.Printf("recogn serving on %s  %s\n", urls[0], meta)
+		return
 	}
-	return ":" + addr
+	fmt.Printf("recogn serving %s on:\n", meta)
+	for _, u := range urls {
+		fmt.Printf("  %s\n", u)
+	}
 }
 
 func must(err error) {
