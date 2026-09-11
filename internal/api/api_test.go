@@ -37,6 +37,12 @@ func (s *stubEngine) Ping() error            { return nil }
 
 func newTestServer(t *testing.T, eng Engine) (*Server, *db.DB) {
 	t.Helper()
+	// Hermetic env: admin auth must be off unless a test opts in, and the
+	// passkey store must not touch the real data/ directory.
+	t.Setenv("RECOGN_ADMIN_PASSWORD_HASH", "")
+	t.Setenv("RECOGN_WEBAUTHN_RPID", "")
+	t.Setenv("RECOGN_WEBAUTHN_ORIGIN", "")
+	t.Setenv("RECOGN_WEBAUTHN_RP_NAME", "")
 	database, err := db.Open(filepath.Join(t.TempDir(), "emb.json"))
 	if err != nil {
 		t.Fatalf("open db: %v", err)
@@ -44,7 +50,11 @@ func newTestServer(t *testing.T, eng Engine) (*Server, *db.DB) {
 	cfg := config.Default()
 	cfg.Addr = ":0"
 	cfg.PeopleDir = filepath.Join(t.TempDir(), "people")
-	s := New(cfg, eng, database, nil)
+	cfg.DataDir = filepath.Join(t.TempDir(), "data")
+	s, err := New(cfg, eng, database, nil)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
 	return s, database
 }
 

@@ -15,9 +15,14 @@ import { PeoplePanel } from "./PeoplePanel";
 import { EnrollModal, type EnrollPasteTarget } from "./EnrollModal";
 import { PhotosModal } from "./PhotosModal";
 import { FaceCheckModal } from "./FaceCheckModal";
+import { LoginModal } from "./LoginModal";
+import { PasskeysModal } from "./PasskeysModal";
 
 export function App() {
 	const toast = useToast();
+	// Used by the (mount-stable) unauthorized hook below.
+	const toastRef = useRef(toast);
+	toastRef.current = toast;
 
 	// ---- server state ----
 	const [health, setHealth] = useState<Health | null>(null);
@@ -25,11 +30,20 @@ export function App() {
 	const [people, setPeople] = useState<PersonSummary[]>([]);
 	const [peopleErr, setPeopleErr] = useState(false);
 	const [threshold, setThreshold] = useState(0.45);
+	const [authed, setAuthed] = useState(false);
 
 	// ---- modal state ----
 	const [enrollOpen, setEnrollOpen] = useState(false);
 	const [photosName, setPhotosName] = useState<string | null>(null);
 	const [checkView, setCheckView] = useState<CheckView | null>(null);
+	const [loginOpen, setLoginOpen] = useState(false);
+	const [passkeysOpen, setPasskeysOpen] = useState(false);
+
+	// Which admin-login methods the server has configured (none = open mode).
+	const authMethods = health?.auth ?? { password: false, passkey: false };
+	// Admin-only surfaces render only while logged in.
+	const enrollVisible = enrollOpen && authed;
+	const photosPerson = authed ? photosName : null;
 
 	// Clipboard routing targets registered by the children.
 	const inspectRef = useRef<((file: File) => void) | null>(null);
@@ -74,18 +88,62 @@ export function App() {
 		checkHealth();
 	}, [loadPeople, checkHealth]);
 
+	// /api/config is admin-only: fetched once the session check says we're
+	// logged in (boot) and again after a successful login.
+	const loadConfig = useCallback(async () => {
+		try {
+			const c = await api.getConfig();
+			setThreshold(c.threshold);
+		} catch {
+			// Stay on the default; the status pill shows the live value either way.
+		}
+	}, []);
+
 	// ---- boot ----
 	useEffect(() => {
 		checkHealth();
 		loadPeople();
-		// The slider mirrors the server's persisted threshold; the status pill
-		// shows the live value either way.
-		api.getConfig().then((c) => setThreshold(c.threshold)).catch(() => {});
+		api.getSession()
+			.then((s) => {
+				setAuthed(s.authenticated);
+				// The slider mirrors the server's persisted threshold; the
+				// status pill shows the live value either way.
+				if (s.authenticated) loadConfig();
+			})
+			.catch(() => setAuthed(false));
 		const t = window.setInterval(checkHealth, 30000);
 		return () => window.clearInterval(t);
-	}, [checkHealth, loadPeople]);
+	}, [checkHealth, loadPeople, loadConfig]);
+
+	// Any admin wrapper that catches a 401 flips the app to logged-out — the
+	// session expired and the next admin call would fail anyway.
+	const onUnauthorized = useCallback(() => {
+		setAuthed(false);
+		toastRef.current.show("Session expired — log in again.", "err");
+	}, []);
+
+	useEffect(() => {
+		api.setOnUnauthorized(onUnauthorized);
+		return () => api.setOnUnauthorized(null);
+	}, [onUnauthorized]);
 
 	// ---- actions ----
+	const doLogout = useCallback(async () => {
+		try {
+			await api.logout();
+			toastRef.current.show("Logged out.", "ok");
+		} catch {
+			toastRef.current.show("Logout failed.", "err");
+		}
+		setAuthed(false);
+	}, []);
+
+	// Credentials accepted: sync the admin-only config, then refresh data.
+	const onLoggedIn = useCallback(() => {
+		setAuthed(true);
+		loadConfig();
+		refreshAll();
+	}, [loadConfig, refreshAll]);
 	const commitThreshold = async (v: number) => {
 		try {
 			const j = await api.setThreshold(v);
@@ -130,13 +188,17 @@ export function App() {
 
 	// ---- body scroll lock while any modal is open ----
 	useEffect(() => {
-		document.body.classList.toggle("modal-open", enrollOpen || photosName !== null || checkView !== null);
-	}, [enrollOpen, photosName, checkView]);
+		document.body.classList.toggle(
+			"modal-open",
+			enrollVisible || photosPerson !== null || checkView !== null || loginOpen || passkeysOpen,
+		);
+	}, [enrollVisible, photosPerson, checkView, loginOpen, passkeysOpen]);
 
 	// ---- clipboard routing ----
 	// Ctrl+V / Cmd+V routes by context: with the enroll modal open, pasted
 	// images join the review list; with the photos manager open they upload
-	// straight into that person; otherwise they are inspected on the stage.
+	// straight into that person; otherwise (including when logged out — the
+	// admin targets are unavailable then) they are inspected on the stage.
 	// Plain-text pastes into inputs are never hijacked.
 	useEffect(() => {
 		const onPaste = (e: ClipboardEvent) => {
@@ -152,13 +214,13 @@ export function App() {
 			e.preventDefault();
 
 			const enroll = enrollPasteRef.current;
-			if (enrollOpen && enroll) {
+			if (enrollVisible && enroll) {
 				if (enroll.isBusy()) return;
 				enroll.addPending(files);
 				enroll.pulseDrop();
 				enroll.scrollLastThumb();
 				toast.show(`Added ${plural(files.length)} from clipboard.`, "ok");
-			} else if (photosName !== null && photosAddRef.current) {
+			} else if (photosPerson !== null && photosAddRef.current) {
 				photosAddRef.current(files);
 			} else {
 				inspectRef.current?.(files[0]);
@@ -167,7 +229,7 @@ export function App() {
 		};
 		document.addEventListener("paste", onPaste);
 		return () => document.removeEventListener("paste", onPaste);
-	}, [enrollOpen, photosName, toast]);
+	}, [enrollVisible, photosPerson, toast]);
 
 	// A face check finished in the enroll modal: live-update the enlarged
 	// viewer when it is showing that photo.
@@ -177,11 +239,20 @@ export function App() {
 
 	return (
 		<>
-			<Topbar health={health} err={healthErr} />
+			<Topbar
+				health={health}
+				err={healthErr}
+				authed={authed}
+				authMethods={authMethods}
+				onLogin={() => setLoginOpen(true)}
+				onLogout={doLogout}
+				onPasskeys={() => setPasskeysOpen(true)}
+			/>
 
 			<main class="layout">
-				<Stage onEnrolled={refreshAll} registerInspect={registerInspect} />
+				<Stage authed={authed} onEnrolled={refreshAll} registerInspect={registerInspect} />
 				<PeoplePanel
+					authed={authed}
 					people={people}
 					peopleErr={peopleErr}
 					threshold={threshold}
@@ -194,7 +265,7 @@ export function App() {
 			</main>
 
 			<EnrollModal
-				open={enrollOpen}
+				open={enrollVisible}
 				peopleNames={people.map((p) => p.name)}
 				onCloseRequest={() => setEnrollOpen(false)}
 				onChange={refreshAll}
@@ -204,7 +275,7 @@ export function App() {
 			/>
 
 			<PhotosModal
-				person={photosName}
+				person={photosPerson}
 				onCloseRequest={() => setPhotosName(null)}
 				onRenamed={setPhotosName}
 				onChange={refreshAll}
@@ -212,6 +283,18 @@ export function App() {
 			/>
 
 			<FaceCheckModal view={checkView} onCloseRequest={() => setCheckView(null)} />
+
+			<LoginModal
+				open={loginOpen}
+				health={health}
+				onCloseRequest={() => setLoginOpen(false)}
+				onLoggedIn={onLoggedIn}
+			/>
+
+			<PasskeysModal
+				open={passkeysOpen && authed}
+				onCloseRequest={() => setPasskeysOpen(false)}
+			/>
 		</>
 	);
 }

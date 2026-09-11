@@ -1,5 +1,8 @@
 // Right panel: the enrolled-people list (with search filter), the match
 // threshold slider, the enroll entry point, and the people-folder rescan.
+// The gallery itself is public (the list endpoint is); the threshold,
+// rescan, enroll, remove and open-photos controls are admin-only and only
+// render while logged in.
 
 import { useEffect, useState } from "preact/hooks";
 import type { TargetedEvent } from "preact";
@@ -7,6 +10,8 @@ import type { PersonSummary } from "../types";
 import { Avatar } from "./Avatar";
 
 interface PeoplePanelProps {
+	/** logged in? gates the admin-only controls (list itself is public) */
+	authed: boolean;
 	people: PersonSummary[];
 	peopleErr: boolean;
 	/** server-persisted threshold (mirrored by the slider) */
@@ -20,6 +25,7 @@ interface PeoplePanelProps {
 
 export function PeoplePanel(props: PeoplePanelProps) {
 	const {
+		authed,
 		people, peopleErr, threshold, onRescan,
 		onOpenPhotos, onRemove,
 	} = props;
@@ -62,33 +68,37 @@ export function PeoplePanel(props: PeoplePanelProps) {
 				<p class="lede" id="peopleCount">{countText}</p>
 			</div>
 
-			<div class="threshold-row">
-				<label
-					class="threshold-label"
-					for="thresholdSlider"
-					title="Minimum cosine similarity for a positive match — higher means fewer false positives"
-				>
-					Threshold
-				</label>
-				<input
-					id="thresholdSlider"
-					type="range"
-					min="0.30"
-					max="0.70"
-					step="0.01"
-					value={slider}
-					aria-label="Match threshold"
-					onInput={slideInput}
-					onChange={() => props.onThresholdCommit(Number(slider))}
-				/>
-				<span class="threshold-value" id="thresholdValue">{Number(slider).toFixed(2)}</span>
-			</div>
+			{authed && (
+				<div class="threshold-row">
+					<label
+						class="threshold-label"
+						for="thresholdSlider"
+						title="Minimum cosine similarity for a positive match — higher means fewer false positives"
+					>
+						Threshold
+					</label>
+					<input
+						id="thresholdSlider"
+						type="range"
+						min="0.30"
+						max="0.70"
+						step="0.01"
+						value={slider}
+						aria-label="Match threshold"
+						onInput={slideInput}
+						onChange={() => props.onThresholdCommit(Number(slider))}
+					/>
+					<span class="threshold-value" id="thresholdValue">{Number(slider).toFixed(2)}</span>
+				</div>
+			)}
 
-			<div class="people-actions">
-				<button id="enrollBtn" class="btn btn-accent" aria-haspopup="dialog" onClick={props.onEnrollClick}>
-					Enroll new person
-				</button>
-			</div>
+			{authed && (
+				<div class="people-actions">
+					<button id="enrollBtn" class="btn btn-accent" aria-haspopup="dialog" onClick={props.onEnrollClick}>
+						Enroll new person
+					</button>
+				</div>
+			)}
 
 			<div class="people-search">
 				<input
@@ -105,61 +115,78 @@ export function PeoplePanel(props: PeoplePanelProps) {
 
 			<ul id="peopleList" class="people-list">
 				{filtered.map((p) => (
-					<PersonRow key={p.id} person={p} onOpen={onOpenPhotos} onRemove={onRemove} />
+					<PersonRow key={p.id} person={p} authed={authed} onOpen={onOpenPhotos} onRemove={onRemove} />
 				))}
 				{noMatch && <li class="people-nomatch">No people match “{query.trim()}”.</li>}
 			</ul>
 
-			<div class="people-footer">
-				<button
-					id="rescanBtn"
-					class="btn btn-ghost"
-					title="Re-scan the people/ folder on the server"
-					disabled={rescanning}
-					onClick={doRescan}
-				>
-					{rescanning ? "Rescanning…" : "Rescan people folder"}
-				</button>
-			</div>
+			{authed && (
+				<div class="people-footer">
+					<button
+						id="rescanBtn"
+						class="btn btn-ghost"
+						title="Re-scan the people/ folder on the server"
+						disabled={rescanning}
+						onClick={doRescan}
+					>
+						{rescanning ? "Rescanning…" : "Rescan people folder"}
+					</button>
+				</div>
+			)}
 		</aside>
 	);
 }
 
 function PersonRow(props: {
 	person: PersonSummary;
+	authed: boolean;
 	onOpen: (name: string) => void;
 	onRemove: (name: string) => void;
 }) {
 	const p = props.person;
+	const authed = props.authed;
 	return (
 		<li class="person-row">
-			<button
-				type="button"
-				class="person-avatar-btn"
-				title="Manage photos"
-				aria-label={`Manage photos for ${p.name}`}
-				onClick={() => props.onOpen(p.name)}
-			>
-				<Avatar src={p.thumb} name={p.name} />
-			</button>
-			<button
-				type="button"
-				class="person-open"
-				title="Manage photos"
-				aria-label={`Manage photos for ${p.name}`}
-				onClick={() => props.onOpen(p.name)}
-			>
-				<span class="person-name">{p.name}</span>
-				<span class="person-count">{p.photos} photo(s)</span>
-			</button>
-			<button
-				class="person-del"
-				title={`Remove ${p.name}`}
-				aria-label={`Remove ${p.name}`}
-				onClick={() => props.onRemove(p.name)}
-			>
-				×
-			</button>
+			{authed ? (
+				<button
+					type="button"
+					class="person-avatar-btn"
+					title="Manage photos"
+					aria-label={`Manage photos for ${p.name}`}
+					onClick={() => props.onOpen(p.name)}
+				>
+					<Avatar src={p.thumb} name={p.name} />
+				</button>
+			) : (
+				<span class="person-avatar-holder"><Avatar src={p.thumb} name={p.name} /></span>
+			)}
+			{authed ? (
+				<button
+					type="button"
+					class="person-open"
+					title="Manage photos"
+					aria-label={`Manage photos for ${p.name}`}
+					onClick={() => props.onOpen(p.name)}
+				>
+					<span class="person-name">{p.name}</span>
+					<span class="person-count">{p.photos} photo(s)</span>
+				</button>
+			) : (
+				<span class="person-open static">
+					<span class="person-name">{p.name}</span>
+					<span class="person-count">{p.photos} photo(s)</span>
+				</span>
+			)}
+			{authed && (
+				<button
+					class="person-del"
+					title={`Remove ${p.name}`}
+					aria-label={`Remove ${p.name}`}
+					onClick={() => props.onRemove(p.name)}
+				>
+					×
+				</button>
+			)}
 		</li>
 	);
 }

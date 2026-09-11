@@ -11,13 +11,15 @@ import { drawWhenReady } from "../overlay";
 import { useToast } from "../toast";
 
 interface StageProps {
+	/** logged in? gates the per-face "name this person" enroll form */
+	authed: boolean;
 	/** refresh people + health after a face was enrolled from a row */
 	onEnrolled: () => void;
 	/** register the paste-routing entry point (inspect a file on the stage) */
 	registerInspect: (fn: ((file: File) => void) | null) => void;
 }
 
-export function Stage({ onEnrolled, registerInspect }: StageProps) {
+export function Stage({ authed, onEnrolled, registerInspect }: StageProps) {
 	const toast = useToast();
 
 	const [previewURL, setPreviewURL] = useState<string | null>(null);
@@ -203,6 +205,7 @@ export function Stage({ onEnrolled, registerInspect }: StageProps) {
 								key={i}
 								face={f}
 								index={i}
+								authed={authed}
 								enrolledName={enrolled[i]}
 								canEnroll={currentFileRef.current !== null}
 								onEnroll={handleRowEnroll}
@@ -216,11 +219,12 @@ export function Stage({ onEnrolled, registerInspect }: StageProps) {
 }
 
 // One face row: index badge, identity, ranked matches (with a duplicate hint
-// when the top two scores are nearly tied), and — for unknown faces — the
-// inline "name this person" enroll form.
+// when the top two scores are nearly tied), and — for unknown faces while
+// logged in — the inline "name this person" enroll form.
 function FaceRow(props: {
 	face: Face;
 	index: number;
+	authed: boolean;
 	enrolledName?: string;
 	canEnroll: boolean;
 	onEnroll: (faceNo: number, person: string, done: (ok: boolean) => void) => void;
@@ -258,7 +262,7 @@ function FaceRow(props: {
 			<div>
 				<div class="face-name">{name}</div>
 				{matchesBlock}
-				{!known && props.canEnroll && (
+				{!known && props.authed && props.canEnroll && (
 					<form
 						class="face-enroll"
 						onSubmit={(e) => {

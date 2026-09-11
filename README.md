@@ -69,6 +69,8 @@ named volume (`recogn-db`) so it survives rebuilds and restarts.
 - **Dataset**: `./people` is mounted writable at `/data/people` so photos
   enrolled through the API/UI are saved back into it (as `<Name>/<sha1>.<ext>`).
 - **Threshold**: set `RECOGN_THRESHOLD` in `docker-compose.yml`.
+- **Admin login**: optional — set `RECOGN_ADMIN_PASSWORD_HASH` (or register
+  passkeys); see [Securing the admin interface](#securing-the-admin-interface).
 - **One-off CLI** (against the same image):
 
   ```sh
@@ -210,13 +212,87 @@ people panel has a filter box and a threshold slider (persisted server-side).
 | `DELETE` | `/api/people/{name}` | remove a person |
 | `POST` | `/api/enroll?force=true` | re-scan the `people/` folder (incremental unless `force`); `?prune=true` also drops DB photo entries whose files are missing (CLI: `recogn enroll --prune`) |
 | `GET`/`POST` | `/api/config` | read/set the match threshold; POSTed values are persisted in the DB and survive restarts (an explicit `--threshold` flag still wins) |
-| `GET`  | `/api/health` | status, people count, threshold |
+| `GET`  | `/api/health` | status, people count, threshold, configured admin auth (`"auth":{"password":…,"passkey":…}`) |
 
 Example:
 
 ```sh
 curl -F "image=@photo.jpg" http://localhost:8080/api/recognize
 ```
+
+Admin endpoints (enroll, people/photo edits, threshold config) require a login
+once admin auth is configured — see [Securing the admin
+interface](#securing-the-admin-interface).
+
+## Securing the admin interface
+
+Admin actions — enroll, edit people/photos, threshold config, serving
+full-resolution enrolled photos — require a login **once admin auth is
+configured**. With no auth configured the server behaves exactly as before
+(everything public) and logs a warning at startup.
+
+| Access | Routes |
+|--------|--------|
+| Public | UI recognize stage, `POST /api/recognize`, `GET /api/people` (read-only list incl. `thumb` URLs), `GET /api/thumbs/{id}.jpg`, `GET /api/health`, auth endpoints below |
+| Admin (login) | everything else: enroll/rescan, add/rename/delete people, photo add/delete/detect, thumbnail regen, `GET`/`POST /api/config`, full-resolution enrolled photo files, passkey management |
+
+Auth endpoints: `POST /api/login`, `POST /api/logout`, `GET /api/auth/session`,
+`POST /api/auth/passkey/register/begin|finish` (admin),
+`POST /api/auth/passkey/login/begin|finish` (public),
+`GET|DELETE /api/auth/passkeys` (admin). Failed logins are rate-limited per IP
+(10 failures / 5 min → HTTP 429 with `Retry-After`).
+
+Two login methods; either or both can be configured:
+
+- **Password** — `RECOGN_ADMIN_PASSWORD_HASH`: an **argon2id hash** of the
+  admin password (PHC format), never the plaintext. Generate one with
+  `recogn hash-password` (trimmed; empty = unset):
+
+  ```sh
+  ./recogn hash-password                                # prompts (hidden input)
+  openssl rand -base64 18 | ./recogn hash-password      # or pipe one in
+  docker compose run --rm recogn hash-password          # inside Docker
+  # → set RECOGN_ADMIN_PASSWORD_HASH to the printed $argon2id$... value
+  ```
+
+  In the browser, the login modal exchanges the password for an HttpOnly
+  session cookie (`recogn_session`, `SameSite=Lax`, `Secure` over TLS).
+- **Passkey (WebAuthn)** — register in the UI's Passkeys modal while logged
+  in; credentials persist in `data/passkeys.json` (corrupt file refuses
+  startup). Passkey login needs a secure context: **HTTPS or localhost**.
+  The WebAuthn spec also forbids bare-IP hosts as RPID, so open the UI via
+  `localhost` or a domain (behind a proxy set `RECOGN_WEBAUTHN_RPID`) —
+  reaching the server as `127.0.0.1` cannot run passkey ceremonies.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `RECOGN_ADMIN_PASSWORD_HASH` | unset | enables password admin login (argon2id PHC from `recogn hash-password`) |
+| `RECOGN_SESSION_TTL` | `24h` | sliding session lifetime (Go duration); sessions are in-memory, so restarts log everyone out |
+| `RECOGN_WEBAUTHN_RPID` | unset | WebAuthn Relying Party ID (your domain) — recommended behind a reverse proxy/TLS |
+| `RECOGN_WEBAUTHN_ORIGIN` | unset | expected WebAuthn origin, e.g. `https://recogn.example.com` |
+| `RECOGN_WEBAUTHN_RP_NAME` | `recogn` | Relying Party display name |
+
+Scripts log in once and reuse the session:
+
+```sh
+# Login once, keep the cookie, call an admin endpoint with it
+curl -s -c cookies.txt -X POST http://localhost:8080/api/login \
+  -H 'Content-Type: application/json' -d '{"password":"change-me"}'
+curl -s -b cookies.txt -X POST http://localhost:8080/api/enroll
+
+# Or present the session token as a Bearer credential instead of the cookie
+# (the value of the recogn_session cookie):
+curl -s -X POST http://localhost:8080/api/enroll \
+  -H "Authorization: Bearer $(sed -n 's/.*recogn_session\s*//p' cookies.txt)"
+```
+
+**Passkey-only setup**: set a temporary `RECOGN_ADMIN_PASSWORD_HASH` → log
+in → register a passkey in the Passkeys modal → remove the hash env and
+restart; the passkey keeps working.
+
+**Security notes**: over plain HTTP the password crosses the wire in
+cleartext — put a TLS reverse proxy in front for anything remote. The people
+list and face thumbnails stay public by design.
 
 ## Expanding the database
 

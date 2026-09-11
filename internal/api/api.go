@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"recogn/internal/auth"
 	"recogn/internal/config"
 	"recogn/internal/db"
 	"recogn/internal/engine"
@@ -43,18 +44,32 @@ type Server struct {
 	cfg     config.Config
 	eng     Engine
 	db      *db.DB
+	auth    *auth.Service            // admin auth (sessions, passkeys, rate limit)
 	refresh func(e Engine, d *db.DB) // push DB identities into the engine
 	workers int                      // batch worker count (uploads, rescan)
 	mux     *http.ServeMux
 }
 
 // New builds a Server. refresh is called after any mutation to reload the
-// engine's identity set from the DB (may be nil).
-func New(cfg config.Config, eng Engine, database *db.DB, refresh func(Engine, *db.DB)) *Server {
-	s := &Server{cfg: cfg, eng: eng, db: database, refresh: refresh, workers: resolveWorkers(cfg)}
+// engine's identity set from the DB (may be nil). The admin auth service is
+// built here too: a corrupt passkeys.json fails startup loudly.
+func New(cfg config.Config, eng Engine, database *db.DB, refresh func(Engine, *db.DB)) (*Server, error) {
+	authSvc, err := auth.New(cfg)
+	if err != nil {
+		return nil, err
+	}
+	s := &Server{cfg: cfg, eng: eng, db: database, auth: authSvc, refresh: refresh, workers: resolveWorkers(cfg)}
 	s.routes()
-	return s
+	return s, nil
 }
+
+// Mode reports the effective admin-auth mode (see auth.Service.Mode): one of
+// "open", "password", "passkey" or "password+passkey". main logs it at
+// startup.
+func (s *Server) Mode() string { return s.auth.Mode() }
+
+// admin wraps a handler in the admin auth middleware.
+func (s *Server) admin(next http.Handler) http.Handler { return s.auth.Middleware(next) }
 
 // resolveWorkers returns the batch-worker count for a config: an explicit
 // positive RECOGN_CONCURRENCY wins, otherwise the engine default. (Mirrors
@@ -71,11 +86,23 @@ func (s *Server) routes() {
 	m.HandleFunc("/", s.handleIndex)
 	m.HandleFunc("/api/health", s.handleHealth)
 	m.HandleFunc("/api/recognize", s.handleRecognize)
-	m.HandleFunc("/api/people", s.handlePeople)           // GET list
-	m.HandleFunc("/api/people/", s.handlePersonSubroutes) // enroll/delete
-	m.HandleFunc("/api/enroll", s.handleEnrollFolder)     // rescan people/
-	m.HandleFunc("/api/config", s.handleConfig)           // GET/POST threshold
-	m.HandleFunc("/api/thumbs/", s.handleThumb)           // face thumbnails
+	m.HandleFunc("/api/people", s.handlePeople) // public read-only list
+	m.Handle("/api/people/", s.admin(http.HandlerFunc(s.handlePersonSubroutes)))
+	m.Handle("/api/enroll", s.admin(http.HandlerFunc(s.handleEnrollFolder)))
+	m.Handle("/api/config", s.admin(http.HandlerFunc(s.handleConfig)))
+	m.HandleFunc("/api/thumbs/", s.handleThumb) // face thumbnails
+	m.Handle("/api/login", s.auth.LoginHandler())
+	m.Handle("/api/logout", s.auth.LogoutHandler())
+	m.Handle("/api/auth/session", s.auth.SessionHandler())
+	// Passkey ceremonies: begin/finish are dispatched by path suffix inside
+	// the handlers, so each mount needs both the exact path and its subtree.
+	// Registration mutates credentials → admin-only; login is public.
+	m.Handle("/api/auth/passkey/register", s.admin(s.auth.PasskeyRegisterHandler()))
+	m.Handle("/api/auth/passkey/register/", s.admin(s.auth.PasskeyRegisterHandler()))
+	m.Handle("/api/auth/passkey/login", s.auth.PasskeyLoginHandler())
+	m.Handle("/api/auth/passkey/login/", s.auth.PasskeyLoginHandler())
+	m.Handle("/api/auth/passkeys", s.admin(s.auth.PasskeyListHandler()))
+	m.Handle("/api/auth/passkeys/", s.admin(s.auth.PasskeyListHandler()))
 	s.mux = m
 }
 
@@ -89,8 +116,12 @@ func (s *Server) ListenAndServe() error {
 }
 
 // loggingMiddleware logs one line per request: method, path, status, duration.
+// It also stamps conservative security headers on every response: the UI and
+// the photo/thumbnail files are never MIME-sniffed or framed by third pages.
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		start := time.Now()
 		next.ServeHTTP(sw, r)
@@ -133,6 +164,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"status":    "ok",
 		"people":    len(s.db.People()),
 		"threshold": s.eng.Threshold(),
+		"auth": map[string]bool{
+			"password": s.auth.PasswordEnabled(),
+			"passkey":  s.auth.PasskeyEnabled(),
+		},
 	})
 }
 
@@ -435,7 +470,8 @@ func (s *Server) handleSelectThumb(w http.ResponseWriter, r *http.Request, name 
 	var body struct {
 		Photo string `json:"photo"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
@@ -570,7 +606,8 @@ func (s *Server) handleRenamePerson(w http.ResponseWriter, r *http.Request, oldN
 	var body struct {
 		Name string `json:"name"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}

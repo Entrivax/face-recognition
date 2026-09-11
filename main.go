@@ -9,14 +9,19 @@
 //	recogn people                      list enrolled identities
 //	recogn export [--out path]         write the face database as JSON
 //	recogn serve [--addr :8080]        start the REST API + web UI
+//	recogn hash-password               generate an argon2id admin password hash
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -27,6 +32,7 @@ import (
 	"time"
 
 	"recogn/internal/api"
+	"recogn/internal/auth"
 	"recogn/internal/config"
 	"recogn/internal/db"
 	"recogn/internal/engine"
@@ -74,6 +80,11 @@ func main() {
 		fs := newFlagSet("serve")
 		cfg, set := parseFlags(fs, rest)
 		must(runServe(cfg, set["threshold"]))
+	case "hash-password":
+		fs := newFlagSet("hash-password")
+		pw := fs.String("password", "", "hash this password non-interactively instead of prompting (exposed in shell history and process lists — prefer the prompt or a stdin pipe)")
+		_ = fs.Parse(rest)
+		must(runHashPassword(*pw))
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -117,6 +128,9 @@ Usage:
   recogn people [--json]               list enrolled identities
   recogn export [--out path]           write the face database as JSON (embeddings.json)
   recogn serve [--addr :8080]          start the REST API and web UI
+  recogn hash-password [--password X]  print an argon2id hash for the admin password
+                                       (set RECOGN_ADMIN_PASSWORD_HASH to it; the plaintext
+                                       password itself is never stored)
 
 Shared flags (per subcommand):
   -addr string        listen address for serve (default ":8080")
@@ -467,6 +481,70 @@ func runExport(cfg config.Config, out string) error {
 	return nil
 }
 
+// runHashPassword prints an argon2id PHC hash of an admin password for
+// RECOGN_ADMIN_PASSWORD_HASH. The password comes from --password (scripts;
+// exposed in shell history and process lists), from a stdin pipe (e.g.
+// `openssl rand -base64 18 | recogn hash-password`), or from a hidden-input
+// prompt when run on a terminal. Only the hash goes to stdout so the output
+// can be captured directly (`RECOGN_ADMIN_PASSWORD_HASH=$(./recogn
+// hash-password ...)`); prompts and hints go to stderr. The command never
+// touches the engine, database or models.
+func runHashPassword(flagPassword string) error {
+	var password []byte // zeroed after hashing
+	if flagPassword != "" {
+		password = []byte(flagPassword)
+	} else if stdinIsTerminal() {
+		fmt.Fprintln(os.Stderr, "Enter admin password (input hidden):")
+		first, err := readPassword()
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(os.Stderr, "Confirm password:")
+		second, err := readPassword()
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(first, second) {
+			return fmt.Errorf("passwords do not match")
+		}
+		password = first
+	} else {
+		b, err := readPasswordLine()
+		if err != nil {
+			return err
+		}
+		password = b
+	}
+	if len(password) == 0 {
+		return fmt.Errorf("password is empty")
+	}
+	hash, err := auth.HashPassword(password)
+	for i := range password {
+		password[i] = 0 // best-effort scrub of the plaintext buffer
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Println(hash)
+	fmt.Fprintln(os.Stderr, "\nSet the hash as the admin password credential, e.g.:")
+	fmt.Fprintf(os.Stderr, "  RECOGN_ADMIN_PASSWORD_HASH=%s\n", hash)
+	return nil
+}
+
+// readPasswordLine reads one line from stdin without touching terminal
+// settings, trimming the trailing newline. It is the pipe path and the
+// fallback used when the terminal echo cannot be disabled.
+func readPasswordLine() ([]byte, error) {
+	b, err := bufio.NewReader(os.Stdin).ReadBytes('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	for len(b) > 0 && (b[len(b)-1] == '\n' || b[len(b)-1] == '\r') {
+		b = b[:len(b)-1]
+	}
+	return b, nil
+}
+
 func runServe(cfg config.Config, thresholdSet bool) error {
 	eng, database, err := openEngine(cfg, thresholdSet)
 	if err != nil {
@@ -499,11 +577,15 @@ func runServe(cfg config.Config, thresholdSet bool) error {
 		}
 	}
 
-	handler := api.New(cfg, eng, database, func(e api.Engine, d *db.DB) {
+	server, err := api.New(cfg, eng, database, func(e api.Engine, d *db.DB) {
 		if ce, ok := e.(*engine.Engine); ok {
 			refreshEngine(ce, d)
 		}
-	}).Handler()
+	})
+	if err != nil {
+		return err // e.g. corrupt passkeys.json must fail startup loudly
+	}
+	handler := server.Handler()
 
 	// Bind before announcing so the printed URLs match the real listener
 	// (resolves hostnames and fills in the port for a bare/zero port).
@@ -521,6 +603,12 @@ func runServe(cfg config.Config, thresholdSet bool) error {
 		IdleTimeout:       120 * time.Second,
 	}
 	printServing(ln.Addr().String(), len(database.People()), eng.Threshold())
+	fmt.Printf("Admin auth: %s\n", server.Mode())
+	if server.Mode() == "open" {
+		// Open mode is backward-compatible but worth one loud line: every
+		// endpoint, including enrollment and deletion, is public.
+		slog.Warn("admin authentication is disabled — all endpoints are public; set RECOGN_ADMIN_PASSWORD_HASH (see 'recogn hash-password') or register a passkey")
+	}
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()

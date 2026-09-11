@@ -22,6 +22,19 @@ services:
       # Tune recognition strictness (0..1). Higher = fewer false positives.
       RECOGN_THRESHOLD: "0.45"
       # RECOGN_ADDR: ":8080"        # listen address inside the container
+      #
+      # Admin login is optional: with none of the vars below set, the API
+      # stays fully open (current behavior). The password is stored only as
+      # an argon2id hash — generate one with:
+      #   docker compose run --rm recogn hash-password
+      # Browser login uses a session cookie; scripts send the session token
+      # as `Authorization: Bearer <session token>` (the password itself is
+      # never accepted as a Bearer credential). Passkey (WebAuthn) login
+      # needs HTTPS (or localhost) — put a TLS reverse proxy in front
+      # for anything remote and point RPID/ORIGIN at its public URL.
+      # RECOGN_ADMIN_PASSWORD_HASH: "$argon2id$v=19$m=65536,t=2,p=1$..."
+      # RECOGN_WEBAUTHN_RPID: "recogn.example.com"
+      # RECOGN_WEBAUTHN_ORIGIN: "https://recogn.example.com"
     volumes:
       # Your dataset: ./people/<Person Name>/*.jpg — mounted writable so
       # API/UI enrollments can save uploaded photos into it. The container

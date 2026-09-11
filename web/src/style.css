@@ -584,3 +584,44 @@ body.modal-open { overflow: hidden; }
 @media (prefers-reduced-motion: reduce) {
 	* { transition: none !important; animation: none !important; }
 }
+
+/* ---------- auth (topbar controls, login modal, passkeys manager) ---------- */
+/* right side of the topbar: the status pill plus the auth buttons */
+.topbar-auth {
+	display: flex; align-items: center; gap: 10px;
+}
+
+/* login modal — same input treatment as #enrollName */
+.login-form input[type="password"] {
+	width: 100%;
+	background: var(--bg-raise); border: 1px solid var(--line);
+	border-radius: 8px; color: var(--ink);
+	padding: 10px 12px; font-family: var(--display); font-size: 13.5px;
+}
+.login-form input[type="password"]:focus { outline: none; border-color: var(--accent); }
+.login-form input[type="password"]:disabled { opacity: 0.6; }
+.login-alt {
+	display: flex; justify-content: center;
+	margin-top: 4px;
+}
+
+/* passkeys manager rows */
+.passkey-list { list-style: none; margin: 14px 0 0; padding: 0; display: grid; gap: 8px; }
+.passkey-row {
+	display: flex; align-items: center; gap: 12px;
+	padding: 10px 12px;
+	border: 1px solid var(--line-soft); border-radius: 8px;
+	background: var(--bg-raise);
+}
+.passkey-id {
+	font-family: var(--mono); font-size: 12px;
+	white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.passkey-added {
+	margin-left: auto; flex-shrink: 0;
+	font-family: var(--mono); font-size: 11px; color: var(--ink-faint);
+}
+
+/* logged-out people rows: the name/thumb block is static text, not a button */
+.person-open.static, .person-avatar-holder { cursor: default; }
+.person-avatar-holder { display: flex; flex-shrink: 0; }
