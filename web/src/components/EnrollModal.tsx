@@ -247,6 +247,7 @@ export function EnrollModal(props: EnrollModalProps) {
 			titleId="enrollTitle"
 			title="Enroll a new person"
 			initialFocus={() => nameInputRef.current}
+			backdropClickDisabled={true}
 			onCloseRequest={close}
 			rootProps={{
 				onDragEnter: (e) => { e.preventDefault(); if (canDrop) setDropHint(true); },
