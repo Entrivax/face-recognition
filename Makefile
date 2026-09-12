@@ -53,8 +53,6 @@ build: ort ui
 #   Debian/Ubuntu : sudo apt install gcc-mingw-w64-x86-64
 #   Fedora        : sudo dnf install mingw64-gcc
 #   macOS (brew)  : brew install mingw-w64
-# The resulting recogn.exe needs onnxruntime.dll next to it (or on PATH).
-# `make dist-windows` bundles everything into a zip.
 build-windows: ort-win ui
 	GOOS=windows GOARCH=amd64 \
 	CC=$(WIN_CC) \
@@ -74,14 +72,6 @@ ort-win:
 	  rm -rf tmp; \
 	  echo "Windows ORT C ready in $(ORT_WIN_DIR)"; \
 	fi
-
-# Bundle the self-contained Windows binary into a distributable zip.
-# ORT is embedded, so no DLL or models folder is needed.
-dist-windows: build-windows
-	@mkdir -p dist/recogn-windows
-	cp $(WIN_BINARY) dist/recogn-windows/
-	cd dist && zip -r recogn-windows-x64.zip recogn-windows
-	@echo "Distributable: dist/recogn-windows-x64.zip"
 
 test: ort
 	go test ./...
