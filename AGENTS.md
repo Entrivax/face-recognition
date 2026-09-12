@@ -83,10 +83,16 @@ web/                     the front-end: Preact + TypeScript, built by Vite
     toast.tsx            ToastProvider + useToast context
     components/
       App.tsx            state owner: health, people, threshold, modal open
-                         state, paste routing, Escape keydown
+                         state, editor-open flag, paste routing, Escape keydown
       Topbar.tsx         brand + status pill
-      Stage.tsx          main stage: dropzone, preview, overlay, face rows
-                         (matches + "name this face" enroll form)
+      Stage.tsx          main stage: dropzone, preview, overlay, Edit /
+                         Cancel-edits buttons (open the photo editor / revert
+                         to the pristine original), face rows (matches +
+                         "name this face" enroll form)
+      EditModal.tsx      stage photo editor: rotate / crop / pad with
+                         multi-step undo–redo; always re-derives from the
+                         stage's pristine original and restores the last
+                         session per file (reset on any new upload)
       PeoplePanel.tsx    enrolled-people list, search, threshold slider, rescan
       Modal.tsx          shared modal shell: backdrop, focus trap, focus
                          save/restore, Escape-stack membership, busy lock

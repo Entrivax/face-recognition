@@ -38,6 +38,9 @@ export function App() {
 	const [checkView, setCheckView] = useState<CheckView | null>(null);
 	const [loginOpen, setLoginOpen] = useState(false);
 	const [passkeysOpen, setPasskeysOpen] = useState(false);
+	// The stage photo editor (owned by Stage) reports its visibility here so
+	// the scroll lock and the clipboard routing account for it.
+	const [editOpen, setEditOpen] = useState(false);
 
 	// Which admin-login methods the server has configured (none = open mode).
 	const authMethods = health?.auth ?? { password: false, passkey: false };
@@ -190,16 +193,18 @@ export function App() {
 	useEffect(() => {
 		document.body.classList.toggle(
 			"modal-open",
-			enrollVisible || photosPerson !== null || checkView !== null || loginOpen || passkeysOpen,
+			enrollVisible || photosPerson !== null || checkView !== null || loginOpen || passkeysOpen || editOpen,
 		);
-	}, [enrollVisible, photosPerson, checkView, loginOpen, passkeysOpen]);
+	}, [enrollVisible, photosPerson, checkView, loginOpen, passkeysOpen, editOpen]);
 
 	// ---- clipboard routing ----
 	// Ctrl+V / Cmd+V routes by context: with the enroll modal open, pasted
 	// images join the review list; with the photos manager open they upload
 	// straight into that person; otherwise (including when logged out — the
 	// admin targets are unavailable then) they are inspected on the stage.
-	// Plain-text pastes into inputs are never hijacked.
+	// While the stage photo editor is open, pasted images are swallowed —
+	// the editor sits over the stage and its session must not be reset under
+	// the user. Plain-text pastes into inputs are never hijacked.
 	useEffect(() => {
 		const onPaste = (e: ClipboardEvent) => {
 			const files = imageFilesFromClipboard(e.clipboardData);
@@ -212,6 +217,11 @@ export function App() {
 				return; // text field + text on the clipboard: default behaviour wins
 			}
 			e.preventDefault();
+
+			if (editOpen) {
+				toast.show("Close the editor to inspect a new photo.");
+				return;
+			}
 
 			const enroll = enrollPasteRef.current;
 			if (enrollVisible && enroll) {
@@ -229,7 +239,7 @@ export function App() {
 		};
 		document.addEventListener("paste", onPaste);
 		return () => document.removeEventListener("paste", onPaste);
-	}, [enrollVisible, photosPerson, toast]);
+	}, [enrollVisible, photosPerson, editOpen, toast]);
 
 	// A face check finished in the enroll modal: live-update the enlarged
 	// viewer when it is showing that photo.
@@ -250,7 +260,12 @@ export function App() {
 			/>
 
 			<main class="layout">
-				<Stage authed={authed} onEnrolled={refreshAll} registerInspect={registerInspect} />
+				<Stage
+					authed={authed}
+					onEnrolled={refreshAll}
+					registerInspect={registerInspect}
+					onEditOpenChange={setEditOpen}
+				/>
 				<PeoplePanel
 					authed={authed}
 					people={people}

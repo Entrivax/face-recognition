@@ -9,6 +9,7 @@ import * as api from "../api";
 import type { Face } from "../types";
 import { drawWhenReady } from "../overlay";
 import { useToast } from "../toast";
+import { EditModal } from "./EditModal";
 
 interface StageProps {
 	/** logged in? gates the per-face "name this person" enroll form */
@@ -17,9 +18,11 @@ interface StageProps {
 	onEnrolled: () => void;
 	/** register the paste-routing entry point (inspect a file on the stage) */
 	registerInspect: (fn: ((file: File) => void) | null) => void;
+	/** report editor visibility to App (body scroll lock + paste routing) */
+	onEditOpenChange: (open: boolean) => void;
 }
 
-export function Stage({ authed, onEnrolled, registerInspect }: StageProps) {
+export function Stage({ authed, onEnrolled, registerInspect, onEditOpenChange }: StageProps) {
 	const toast = useToast();
 
 	const [previewURL, setPreviewURL] = useState<string | null>(null);
@@ -27,6 +30,8 @@ export function Stage({ authed, onEnrolled, registerInspect }: StageProps) {
 	const [faces, setFaces] = useState<Face[] | null>(null);
 	const [enrolled, setEnrolled] = useState<Record<number, string>>({});
 	const [drag, setDrag] = useState(false);
+	// Source file while the photo editor is open (null = closed).
+	const [editSource, setEditSource] = useState<File | null>(null);
 
 	const fileInputRef = useRef<HTMLInputElement | null>(null);
 	const imgRef = useRef<HTMLImageElement | null>(null);
@@ -35,6 +40,12 @@ export function Stage({ authed, onEnrolled, registerInspect }: StageProps) {
 	// be enrolled via /api/people/{name}/enroll-face with the exact same
 	// bytes (detection order is deterministic, so face_index matches the row).
 	const currentFileRef = useRef<File | null>(null);
+	// The pristine original behind the inspected file when that file is an
+	// edit export (null = fresh upload). Lets every Edit round reopen the
+	// editor over the original with the committed history restored, and
+	// backs the "Cancel edits" button (re-inspect the original); any new
+	// upload resets it, so the edit session resets with the photo.
+	const editOriginalRef = useRef<File | null>(null);
 	// Object URL of the current stage preview; revoked when replaced or
 	// cleared — otherwise every inspected photo would stay pinned in memory.
 	const stageURLRef = useRef<string | null>(null);
@@ -50,16 +61,21 @@ export function Stage({ authed, onEnrolled, registerInspect }: StageProps) {
 		setMeta("");
 		setEnrolled({});
 		currentFileRef.current = null;
+		editOriginalRef.current = null;
 	}, []);
 
 	// Inspect one image file: show the preview immediately, then run
-	// recognition and render the face rows.
-	const handleFile = useCallback(async (file: File) => {
+	// recognition and render the face rows. `editedFrom` marks the file as an
+	// edit export of `editedFrom` (the pristine original) so the editor can
+	// reopen over the original; fresh uploads pass nothing and reset the
+	// edit session.
+	const handleFile = useCallback(async (file: File, editedFrom?: File) => {
 		if (!file.type.startsWith("image/")) {
 			toast.show("That file isn't an image.", "err");
 			return;
 		}
 		currentFileRef.current = file;
+		editOriginalRef.current = editedFrom ?? null;
 		const seq = ++reqSeq.current;
 		// Show the preview immediately (revoking the previous object URL).
 		const url = URL.createObjectURL(file);
@@ -87,12 +103,29 @@ export function Stage({ authed, onEnrolled, registerInspect }: StageProps) {
 		return () => registerInspect(null);
 	}, [handleFile, registerInspect]);
 
+	// Editor visibility goes up to App: it owns the body scroll lock and the
+	// paste routing that must not swap the stage photo under an open editor.
+	useEffect(() => {
+		onEditOpenChange(editSource !== null);
+		return () => onEditOpenChange(false);
+	}, [editSource, onEditOpenChange]);
+
 	// Draw the overlay once both the image and the faces are ready.
 	useEffect(() => {
 		if (previewURL && faces && imgRef.current && canvasRef.current) {
 			drawWhenReady(canvasRef.current, imgRef.current, faces, { labels: true });
 		}
 	}, [previewURL, faces]);
+
+	// "Use this image": re-inspect the exported file like any fresh upload
+	// (preview + recognition re-run, same reqSeq guard), while remembering
+	// which pristine original it came from — the next Edit round reopens the
+	// editor over that original with the committed history restored.
+	const applyEdited = useCallback((exported: File) => {
+		const original = editOriginalRef.current ?? currentFileRef.current;
+		setEditSource(null);
+		if (original) void handleFile(exported, original);
+	}, [handleFile]);
 
 	const onDropzoneClick = () => {
 		if (previewURL === null) openPicker();
@@ -184,6 +217,34 @@ export function Stage({ authed, onEnrolled, registerInspect }: StageProps) {
 			</div>
 
 			<div class="stage-actions">
+				<button
+					id="editBtn"
+					class="btn"
+					hidden={previewURL === null}
+					onClick={(e) => {
+						e.stopPropagation();
+						// Edit the pristine original (or the fresh upload) — never
+						// the previously exported bytes.
+						setEditSource(editOriginalRef.current ?? currentFileRef.current);
+					}}
+				>
+					Edit
+				</button>
+				<button
+					id="cancelEditsBtn"
+					class="btn btn-ghost"
+					hidden={editOriginalRef.current === null}
+					onClick={(e) => {
+						e.stopPropagation();
+						// Back to the pristine original: re-inspecting it without
+						// the edit lineage resets the editor session and re-runs
+						// recognition on the untouched bytes.
+						const original = editOriginalRef.current;
+						if (original) void handleFile(original);
+					}}
+				>
+					Cancel edits
+				</button>
 				<button id="clearBtn" class="btn btn-ghost" hidden={previewURL === null} onClick={resetStage}>Clear</button>
 				<button
 					id="againBtn"
@@ -214,6 +275,12 @@ export function Stage({ authed, onEnrolled, registerInspect }: StageProps) {
 					</ul>
 				</div>
 			)}
+
+			<EditModal
+				source={editSource}
+				onCloseRequest={() => setEditSource(null)}
+				onUse={applyEdited}
+			/>
 		</section>
 	);
 }

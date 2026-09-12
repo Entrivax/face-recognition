@@ -625,3 +625,111 @@ body.modal-open { overflow: hidden; }
 /* logged-out people rows: the name/thumb block is static text, not a button */
 .person-open.static, .person-avatar-holder { cursor: default; }
 .person-avatar-holder { display: flex; flex-shrink: 0; }
+
+/* ---------- stage photo editor (edit modal) ---------- */
+/* segmented tool tabs — mono uppercase, active state in the match cyan */
+.edit-tools {
+	display: flex; align-items: center; gap: 6px;
+	margin-top: 14px;
+}
+.edit-tool {
+	font-family: var(--mono); font-size: 10.5px; font-weight: 500;
+	text-transform: uppercase; letter-spacing: 1.2px;
+	padding: 6px 13px; border-radius: 999px;
+	border: 1px solid var(--line); background: transparent;
+	color: var(--ink-dim); cursor: pointer;
+	transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+.edit-tool:hover { border-color: var(--accent); color: var(--ink); }
+.edit-tool[aria-pressed="true"] {
+	color: var(--match); border-color: var(--match); background: var(--match-dim);
+}
+.edit-dims {
+	margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--ink-faint);
+}
+
+/* the working canvas sits on an inset dark field, like the inspection stage */
+.edit-stage {
+	display: grid; place-items: center;
+	margin-top: 12px;
+	padding: 14px;
+	border: 1px solid var(--line-soft); border-radius: 8px;
+	background: var(--bg);
+}
+.edit-canvas-wrap { position: relative; width: fit-content; max-width: 100%; }
+.edit-canvas {
+	display: block;
+	max-width: 100%; max-height: 56vh; width: auto; height: auto;
+	border-radius: 6px;
+}
+/* the crop overlay exactly covers the displayed canvas; only the crop tool
+	 lets it catch the pointer */
+.edit-overlay {
+	position: absolute; inset: 0; width: 100%; height: 100%;
+	pointer-events: none; touch-action: none;
+}
+.edit-canvas-wrap[data-cropping="true"] .edit-overlay {
+	pointer-events: auto; cursor: crosshair;
+}
+.edit-loading {
+	margin: 0; padding: 60px 0;
+	font-family: var(--mono); font-size: 11px; color: var(--ink-faint);
+}
+
+/* slider rows — the threshold slider's treatment, reused */
+.edit-slider-row {
+	display: flex; align-items: center; gap: 10px;
+	margin-top: 12px; padding: 10px 12px;
+	border: 1px solid var(--line-soft); border-radius: 8px;
+	background: var(--bg-raise);
+}
+.edit-slider-row input[type="range"] { flex: 1; min-width: 120px; accent-color: var(--accent); }
+.edit-slider-label {
+	font-family: var(--mono); font-size: 10.5px; font-weight: 500;
+	text-transform: uppercase; letter-spacing: 1.2px;
+	color: var(--ink-faint); flex-shrink: 0;
+}
+.edit-slider-value {
+	font-family: var(--mono); font-size: 12px; color: var(--match);
+	min-width: 38px; text-align: right; flex-shrink: 0;
+}
+
+/* pad fill swatches (black / white) */
+.edit-swatches { display: flex; gap: 6px; flex-shrink: 0; }
+.edit-swatch {
+	width: 22px; height: 22px; padding: 0;
+	border: 1px solid var(--line); border-radius: 6px; cursor: pointer;
+}
+.edit-swatch.black { background: #000; }
+.edit-swatch.white { background: #fff; }
+.edit-swatch[aria-pressed="true"] { outline: 2px solid var(--match); outline-offset: 2px; }
+
+/* crop tool row: hint/readout on the left, actions pushed right */
+.edit-crop-row {
+	display: flex; align-items: center; gap: 10px;
+	margin-top: 12px; padding: 10px 12px;
+	border: 1px solid var(--line-soft); border-radius: 8px;
+	background: var(--bg-raise);
+	font-family: var(--mono); font-size: 11px; color: var(--ink-dim);
+}
+.edit-crop-row .btn-accent { margin-left: auto; flex-shrink: 0; }
+
+.edit-hint {
+	margin: 10px 0 0;
+	font-family: var(--mono); font-size: 11px; color: var(--ink-faint);
+}
+
+/* footer: undo/redo/reset on the left, cancel/use on the right */
+.edit-foot {
+	display: flex; align-items: center; gap: 10px;
+	margin-top: 16px; padding-top: 14px;
+	border-top: 1px solid var(--line-soft);
+}
+.edit-history { display: flex; gap: 8px; }
+.edit-actions { margin-left: auto; display: flex; gap: 10px; }
+
+/* busy lock: dim the editor surfaces (footer buttons disable themselves) */
+.modal.locked .edit-stage, .modal.locked .edit-tools,
+.modal.locked .edit-slider-row, .modal.locked .edit-crop-row {
+	opacity: 0.55; pointer-events: none;
+}
