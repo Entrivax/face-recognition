@@ -247,10 +247,12 @@
 		hint.className = "rcg-shield-hint";
 		hint.textContent = "recogn capture mode — click an image or video to scan · Alt+R to exit";
 		shield.appendChild(hint);
-		shield.addEventListener("click", (e) => {
+		shield.addEventListener("mousedown", (e) => {
 			if (e.button !== 0) return; // no scan on right/middle click
 			captureAt(e.clientX, e.clientY);
-		});
+			e.preventDefault();
+			e.stopPropagation();
+		}, { capture: true });
 		document.documentElement.appendChild(shield);
 	}
 
