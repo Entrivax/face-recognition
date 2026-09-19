@@ -223,7 +223,7 @@ html, body {
 .face-enroll-input:disabled { opacity: 0.55; }
 
 /* ---------- people panel ---------- */
-.people-actions { margin-top: 16px; }
+.people-actions { margin-top: 16px; display: grid; gap: 8px; }
 .people-actions .btn { width: 100%; }
 
 /* threshold slider — POSTs to /api/config, which persists it server-side */
@@ -566,6 +566,88 @@ body.modal-open { overflow: hidden; }
 	margin-top: 20px; padding-top: 16px;
 	border-top: 1px solid var(--line-soft);
 }
+
+/* ---------- compare modal (admin) ---------- */
+.compare-intro {
+	margin: 0 0 12px;
+	font-family: var(--mono); font-size: 11px; color: var(--ink-faint);
+}
+.compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.compare-slot {
+	position: relative;
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	background: var(--bg-raise);
+	padding: 8px;
+	display: flex; flex-direction: column;
+	min-width: 0;
+}
+.compare-slot-label {
+	font-family: var(--mono); font-size: 10.5px; font-weight: 500;
+	text-transform: uppercase; letter-spacing: 1.2px;
+	color: var(--ink-faint);
+	padding: 0 2px 6px;
+}
+.compare-slot .thumb-wrap img {
+	display: block; width: 100%; height: auto; border-radius: 6px;
+}
+.compare-slot .thumb-wrap canvas { border-radius: 6px; }
+.compare-slot.disabled { opacity: 0.55; pointer-events: none; }
+.modal.locked .compare-grid { opacity: 0.55; pointer-events: none; }
+.compare-slot-meta {
+	display: flex; align-items: baseline; gap: 8px; min-width: 0;
+	padding: 6px 2px 0;
+	font-family: var(--mono); font-size: 10px; color: var(--ink-dim);
+}
+.compare-slot-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.compare-slot-size { margin-left: auto; flex-shrink: 0; color: var(--ink-faint); }
+.compare-slot .enroll-thumb-del { z-index: 2; }
+/* empty slot = compact drop target */
+.compare-empty {
+	position: relative;
+	flex: 1; min-height: 180px;
+	display: flex; flex-direction: column; align-items: center; justify-content: center;
+	text-align: center; color: var(--ink-dim);
+	border: 1.5px dashed var(--line);
+	border-radius: 8px;
+	cursor: pointer; outline: none;
+	transition: border-color 0.18s ease, background 0.18s ease;
+}
+.compare-empty:hover, .compare-empty:focus-visible { border-color: var(--accent); }
+.compare-empty .edz-icon { margin-bottom: 8px; }
+.compare-empty .edz-primary { font-size: 12.5px; }
+/* corner brackets while dragging over the modal / when a paste lands */
+.compare-empty::before, .compare-empty::after {
+	content: ""; position: absolute; width: 14px; height: 14px;
+	border: 2px solid var(--match);
+	opacity: 0; transition: opacity 0.15s ease;
+	pointer-events: none;
+}
+.compare-empty::before { top: 6px; left: 6px; border-right: 0; border-bottom: 0; border-top-left-radius: 6px; }
+.compare-empty::after { bottom: 6px; right: 6px; border-left: 0; border-top: 0; border-bottom-right-radius: 6px; }
+.compare-grid.drag .compare-slot:not(.filled) .compare-empty,
+.compare-slot.pulse .compare-empty { border-color: var(--match); background: var(--match-dim); }
+.compare-grid.drag .compare-slot:not(.filled) .compare-empty::before,
+.compare-grid.drag .compare-slot:not(.filled) .compare-empty::after,
+.compare-slot.pulse .compare-empty::before,
+.compare-slot.pulse .compare-empty::after { opacity: 1; }
+
+/* the comparison outcome */
+.compare-result {
+	margin-top: 16px;
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	background: var(--bg-panel);
+	padding: 14px 16px;
+}
+.compare-score-row { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+.compare-score { font-size: 34px; font-weight: 700; letter-spacing: 0.3px; }
+.compare-score.ok, .compare-verdict.ok { color: var(--match); }
+.compare-score.warn, .compare-verdict.warn { color: var(--unknown); }
+.compare-verdict { font-size: 14px; font-weight: 600; }
+.conf-bar.compare-meter { width: 100%; margin: 10px 0 0; height: 4px; }
+.compare-notes { margin: 10px 0 0; font-family: var(--mono); font-size: 11px; color: var(--ink-faint); }
+@media (max-width: 640px) { .compare-grid { grid-template-columns: 1fr; } }
 
 /* ---------- toast ---------- */
 .toast {

@@ -91,6 +91,28 @@ export interface DetectResponse {
 	faces: Face[];
 }
 
+/** One detected face in a compared photo (POST /api/compare). */
+export interface CompareFaceInfo {
+	index: number; // 1-based detection order
+	bbox: [number, number, number, number]; // x, y, width, height
+	score: number; // detector confidence 0..1
+	used: boolean; // the largest face — the one the comparison embedded
+}
+
+/** The faces found in one of the two compared photos. */
+export interface CompareImageInfo {
+	count: number;
+	faces: CompareFaceInfo[];
+}
+
+/** POST /api/compare — cosine similarity of the two photos' largest faces. */
+export interface CompareResponse {
+	similarity: number; // cosine similarity, roughly -1..1 (practically 0..1)
+	threshold: number; // recognizer's match threshold, as a reference for the verdict
+	image1: CompareImageInfo;
+	image2: CompareImageInfo;
+}
+
 export interface EnrollResponse {
 	person: string;
 	added: number;

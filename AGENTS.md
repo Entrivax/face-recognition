@@ -99,6 +99,8 @@ web/                     the front-end: Preact + TypeScript, built by Vite
       EnrollModal.tsx    enroll modal + pre-submit face-check chain
       PhotosModal.tsx    photos manager (grid + detail, add/delete/avatar/rename)
       FaceCheckModal.tsx enlarged face-check viewer (read-only, stacked)
+      CompareModal.tsx   admin compare tool: two photo slots → face-to-face
+                         cosine similarity (no identity DB; POST /api/compare)
       Avatar.tsx         thumbnail img with initials fallback
 third_party/onnxruntime/ ORT C header + libonnxruntime.so (via `make ort`)
 models/                  det_10g.onnx, w600k_r50.onnx  (gitignored; downloaded)
@@ -280,12 +282,14 @@ command hits a permission error.
 - Embeddings are stripped from API/CLI JSON output (`Face.Embedding` is `json:"-"`
   or nil-ed) — don't leak 512-float arrays to clients.
 - **API request bodies are capped**: 32 MiB (`maxUpload`) on `/api/recognize`
-  and the enroll endpoints (multipart images), 1 MiB on JSON bodies
+  and the enroll endpoints (multipart images; `/api/compare` caps the whole
+  two-photo body the same way), 1 MiB on JSON bodies
   (`POST /api/config`, `POST /api/people/{name}/rename`, …). Wrap new
   handlers' bodies in `http.MaxBytesReader`/`io.LimitReader` the same way.
 - **Admin auth** (`internal/auth`): `api.New` returns `(*Server, error)` and
   builds the auth service; admin routes (enroll, people/photo mutations,
-  `POST /api/config`, full-res photo serving) sit behind an auth middleware.
+  `POST /api/config`, face comparison, full-res photo serving) sit behind an
+  auth middleware.
   Public: `/api/recognize`, `GET /api/people`, `/api/thumbs/{id}.jpg`,
   `/api/health`, and the auth endpoints. Passkey credentials persist in
   `data/passkeys.json` (corrupt file refuses startup); sessions are in-memory.

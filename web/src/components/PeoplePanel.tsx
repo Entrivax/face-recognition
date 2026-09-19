@@ -21,6 +21,7 @@ interface PeoplePanelProps {
 	onOpenPhotos: (name: string) => void;
 	onRemove: (name: string) => void;
 	onEnrollClick: () => void;
+	onCompareClick: () => void;
 }
 
 export function PeoplePanel(props: PeoplePanelProps) {
@@ -96,6 +97,9 @@ export function PeoplePanel(props: PeoplePanelProps) {
 				<div class="people-actions">
 					<button id="enrollBtn" class="btn btn-accent" aria-haspopup="dialog" onClick={props.onEnrollClick}>
 						Enroll new person
+					</button>
+					<button id="compareBtn" class="btn" aria-haspopup="dialog" onClick={props.onCompareClick}>
+						Compare two photos
 					</button>
 				</div>
 			)}

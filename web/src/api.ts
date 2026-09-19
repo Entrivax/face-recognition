@@ -5,6 +5,7 @@
 // via setOnUnauthorized) so the UI can flip to logged-out on session expiry.
 
 import type {
+	CompareResponse,
 	Config,
 	CredentialCreationOptionsJSON,
 	CredentialRequestOptionsJSON,
@@ -93,6 +94,18 @@ export async function recognize(file: File): Promise<RecognizeResponse> {
 	fd.append("image", file, file.name);
 	const r = await fetch("/api/recognize", { method: "POST", body: fd });
 	return expectJSON(r, "recognition failed");
+}
+
+// Face-to-face comparison of two arbitrary photos (admin): the server embeds
+// the largest face of each and returns their cosine similarity. No identity
+// database involved. 422 (no face in a photo) is thrown like any other error;
+// the message names the offending photo.
+export async function compareFaces(a: File, b: File): Promise<CompareResponse> {
+	const fd = new FormData();
+	fd.append("image1", a, a.name || "photo-a.jpg");
+	fd.append("image2", b, b.name || "photo-b.jpg");
+	const r = await fetch("/api/compare", { method: "POST", body: fd });
+	return expectJSON(r, "comparison failed");
 }
 
 export async function deletePerson(name: string): Promise<DeletePersonResponse> {

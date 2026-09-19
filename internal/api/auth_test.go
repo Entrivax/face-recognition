@@ -181,6 +181,7 @@ func TestAuthAnonymousAdminRoutesReturn401(t *testing.T) {
 	os.WriteFile(filepath.Join(s.cfg.PeopleDir, "Alice", photo), img, 0o644)
 
 	body, ct := multipartBody(t, "images", "x.jpg", []byte("img"))
+	cmpBody, cmpCT := compareBody(t, []byte("a"), []byte("b"))
 	cases := []struct {
 		name   string
 		method string
@@ -198,6 +199,7 @@ func TestAuthAnonymousAdminRoutesReturn401(t *testing.T) {
 		{"delete photo", http.MethodDelete, "/api/people/Alice/photos/" + photo, nil, ""},
 		{"delete person", http.MethodDelete, "/api/people/Alice", nil, ""},
 		{"enroll folder", http.MethodPost, "/api/enroll", nil, ""},
+		{"compare", http.MethodPost, "/api/compare", cmpBody, cmpCT},
 		{"config GET", http.MethodGet, "/api/config", nil, ""},
 		{"config POST", http.MethodPost, "/api/config", bytes.NewBufferString(`{"threshold":0.5}`), "application/json"},
 	}

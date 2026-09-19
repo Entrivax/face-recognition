@@ -15,6 +15,7 @@ import { PeoplePanel } from "./PeoplePanel";
 import { EnrollModal, type EnrollPasteTarget } from "./EnrollModal";
 import { PhotosModal } from "./PhotosModal";
 import { FaceCheckModal } from "./FaceCheckModal";
+import { CompareModal, type ComparePasteTarget } from "./CompareModal";
 import { LoginModal } from "./LoginModal";
 import { PasskeysModal } from "./PasskeysModal";
 
@@ -34,6 +35,7 @@ export function App() {
 
 	// ---- modal state ----
 	const [enrollOpen, setEnrollOpen] = useState(false);
+	const [compareOpen, setCompareOpen] = useState(false);
 	const [photosName, setPhotosName] = useState<string | null>(null);
 	const [checkView, setCheckView] = useState<CheckView | null>(null);
 	const [loginOpen, setLoginOpen] = useState(false);
@@ -46,12 +48,14 @@ export function App() {
 	const authMethods = health?.auth ?? { password: false, passkey: false };
 	// Admin-only surfaces render only while logged in.
 	const enrollVisible = enrollOpen && authed;
+	const compareVisible = compareOpen && authed;
 	const photosPerson = authed ? photosName : null;
 
 	// Clipboard routing targets registered by the children.
 	const inspectRef = useRef<((file: File) => void) | null>(null);
 	const photosAddRef = useRef<((files: FileList | File[]) => void) | null>(null);
 	const enrollPasteRef = useRef<EnrollPasteTarget | null>(null);
+	const comparePasteRef = useRef<ComparePasteTarget | null>(null);
 
 	const registerInspect = useCallback((fn: ((file: File) => void) | null) => {
 		inspectRef.current = fn;
@@ -61,6 +65,9 @@ export function App() {
 	}, []);
 	const registerPasteTarget = useCallback((t: EnrollPasteTarget | null) => {
 		enrollPasteRef.current = t;
+	}, []);
+	const registerComparePaste = useCallback((t: ComparePasteTarget | null) => {
+		comparePasteRef.current = t;
 	}, []);
 
 	// ---- data loading ----
@@ -193,15 +200,16 @@ export function App() {
 	useEffect(() => {
 		document.body.classList.toggle(
 			"modal-open",
-			enrollVisible || photosPerson !== null || checkView !== null || loginOpen || passkeysOpen || editOpen,
+			enrollVisible || compareVisible || photosPerson !== null || checkView !== null || loginOpen || passkeysOpen || editOpen,
 		);
-	}, [enrollVisible, photosPerson, checkView, loginOpen, passkeysOpen, editOpen]);
+	}, [enrollVisible, compareVisible, photosPerson, checkView, loginOpen, passkeysOpen, editOpen]);
 
 	// ---- clipboard routing ----
 	// Ctrl+V / Cmd+V routes by context: with the enroll modal open, pasted
 	// images join the review list; with the photos manager open they upload
-	// straight into that person; otherwise (including when logged out — the
-	// admin targets are unavailable then) they are inspected on the stage.
+	// straight into that person; with the compare modal open they fill its
+	// photo slots; otherwise (including when logged out — the admin targets
+	// are unavailable then) they are inspected on the stage.
 	// While the stage photo editor is open, pasted images are swallowed —
 	// the editor sits over the stage and its session must not be reset under
 	// the user. Plain-text pastes into inputs are never hijacked.
@@ -232,6 +240,9 @@ export function App() {
 				toast.show(`Added ${plural(files.length)} from clipboard.`, "ok");
 			} else if (photosPerson !== null && photosAddRef.current) {
 				photosAddRef.current(files);
+			} else if (compareVisible && comparePasteRef.current) {
+				if (comparePasteRef.current.isBusy()) return;
+				comparePasteRef.current.addFiles(files);
 			} else {
 				inspectRef.current?.(files[0]);
 				if (files.length > 1) toast.show("Clipboard had several images — inspecting the first.");
@@ -239,7 +250,7 @@ export function App() {
 		};
 		document.addEventListener("paste", onPaste);
 		return () => document.removeEventListener("paste", onPaste);
-	}, [enrollVisible, photosPerson, editOpen, toast]);
+	}, [enrollVisible, photosPerson, compareVisible, editOpen, toast]);
 
 	// A face check finished in the enroll modal: live-update the enlarged
 	// viewer when it is showing that photo.
@@ -276,6 +287,7 @@ export function App() {
 					onOpenPhotos={setPhotosName}
 					onRemove={removePerson}
 					onEnrollClick={() => setEnrollOpen(true)}
+					onCompareClick={() => setCompareOpen(true)}
 				/>
 			</main>
 
@@ -295,6 +307,12 @@ export function App() {
 				onRenamed={setPhotosName}
 				onChange={refreshAll}
 				registerAddFiles={registerAddFiles}
+			/>
+
+			<CompareModal
+				open={compareVisible}
+				onCloseRequest={() => setCompareOpen(false)}
+				registerPasteTarget={registerComparePaste}
 			/>
 
 			<FaceCheckModal view={checkView} onCloseRequest={() => setCheckView(null)} />

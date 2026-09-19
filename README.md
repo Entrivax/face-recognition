@@ -194,6 +194,14 @@ list ("Enroll" under an unknown face enrolls that specific face — matched by
 its row number, which the canvas overlay also shows next to the name). The
 people panel has a filter box and a threshold slider (persisted server-side).
 
+**Compare two photos** (admin): the people panel has a *Compare two photos*
+button that opens a face-to-face comparison tool — drop in any two photos and
+it reports how similar their faces are. The largest face of each photo is
+detected, aligned and embedded, and the two embeddings' **cosine similarity**
+is shown with a "likely same / different person" verdict against the match
+threshold. This works entirely without the enrolled-people database, so you
+can e.g. check whether two `unknown` photos show the same person.
+
 #### REST API
 
 | Method | Endpoint | Description |
@@ -211,6 +219,7 @@ people panel has a filter box and a threshold slider (persisted server-side).
 | `GET`  | `/api/thumbs/{id}.jpg` | a person's face thumbnail (square face crop; `?v=` cache-buster follows the chosen photo) |
 | `DELETE` | `/api/people/{name}` | remove a person |
 | `POST` | `/api/enroll?force=true` | re-scan the `people/` folder (incremental unless `force`); `?prune=true` also drops DB photo entries whose files are missing (CLI: `recogn enroll --prune`) |
+| `POST` | `/api/compare` | compare the faces of two photos without the identity DB — multipart `image1` + `image2` → `{similarity, threshold, image1: {count, faces: [{index, bbox, score, used}]}, image2: {…}}`; the largest face of each photo is embedded and their cosine similarity returned (`used` marks the compared face; `threshold` is the recognizer's match threshold, for the same-person verdict) |
 | `GET`/`POST` | `/api/config` | read/set the match threshold; POSTed values are persisted in the DB and survive restarts (an explicit `--threshold` flag still wins) |
 | `GET`  | `/api/health` | status, people count, threshold, configured admin auth (`"auth":{"password":…,"passkey":…}`) |
 
@@ -218,9 +227,10 @@ Example:
 
 ```sh
 curl -F "image=@photo.jpg" http://localhost:8080/api/recognize
+curl -F "image1=@a.jpg" -F "image2=@b.jpg" http://localhost:8080/api/compare
 ```
 
-Admin endpoints (enroll, people/photo edits, threshold config) require a login
+Admin endpoints (enroll, people/photo edits, face comparison, threshold config) require a login
 once admin auth is configured — see [Securing the admin
 interface](#securing-the-admin-interface).
 
@@ -234,7 +244,7 @@ configured**. With no auth configured the server behaves exactly as before
 | Access | Routes |
 |--------|--------|
 | Public | UI recognize stage, `POST /api/recognize`, `GET /api/people` (read-only list incl. `thumb` URLs), `GET /api/thumbs/{id}.jpg`, `GET /api/health`, auth endpoints below |
-| Admin (login) | everything else: enroll/rescan, add/rename/delete people, photo add/delete/detect, thumbnail regen, `GET`/`POST /api/config`, full-resolution enrolled photo files, passkey management |
+| Admin (login) | everything else: enroll/rescan, add/rename/delete people, photo add/delete/detect, thumbnail regen, face comparison (`POST /api/compare`), `GET`/`POST /api/config`, full-resolution enrolled photo files, passkey management |
 
 Auth endpoints: `POST /api/login`, `POST /api/logout`, `GET /api/auth/session`,
 `POST /api/auth/passkey/register/begin|finish` (admin),
