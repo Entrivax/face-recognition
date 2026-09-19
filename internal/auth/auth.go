@@ -3,7 +3,9 @@
 // RECOGN_ADMIN_PASSWORD_HASH) and/or registered WebAuthn passkeys gate the
 // mutating admin routes behind a session cookie or a Bearer session token.
 // When neither method is configured the middleware is a pass-through (open
-// mode) and the server behaves exactly as before.
+// mode) and the server behaves exactly as before — except that passkey
+// registration is refused (403), so a fresh deployment cannot be captured by
+// the first network peer to reach it (SECURITY-REVIEW.md H2).
 //
 // The password itself is only ever compared inside POST /api/login (against
 // its argon2id hash, rate-limited); it is never accepted as a Bearer
@@ -18,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -214,11 +217,28 @@ func (s *Service) SessionHandler() http.Handler {
 
 // PasskeyRegisterHandler handles POST /api/auth/passkey/register[/begin|/finish].
 // Mounted behind the admin middleware: only an authenticated admin may add a
-// credential. The path suffix selects the ceremony phase.
+// credential. The path suffix selects the ceremony phase. In open mode — no
+// password hash configured and zero registered passkeys — the middleware is
+// a pass-through, so this handler itself refuses (SECURITY-REVIEW.md H2).
 func (s *Service) PasskeyRegisterHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "POST required")
+			return
+		}
+		// Open-mode bootstrap guard: with no admin credential at all, the
+		// middleware above lets every request through, which made public
+		// passkey registration first-come-first-served — the first network
+		// peer to complete a ceremony would own admin permanently (the
+		// store keeps every registered credential; only an admin could
+		// remove one). Refuse until a credential exists; bootstrap a
+		// passkey-only install with a temporary RECOGN_ADMIN_PASSWORD_HASH
+		// instead (log in, register the passkey, remove the hash, restart).
+		if !s.Enabled() {
+			slog.Warn("passkey registration refused in open mode",
+				"remote", remoteIP(r))
+			writeError(w, http.StatusForbidden,
+				"passkey registration is disabled until admin authentication is configured — set RECOGN_ADMIN_PASSWORD_HASH (generate one with 'recogn hash-password'), log in, then register passkeys")
 			return
 		}
 		rest := strings.TrimPrefix(r.URL.Path, "/api/auth/passkey/register")

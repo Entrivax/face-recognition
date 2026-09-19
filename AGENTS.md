@@ -194,8 +194,12 @@ the web UI with Vite (`node:22-bookworm-slim`, `npm ci && npm run build`),
 `EXPOSE 8080`, `VOLUME /data/db`. `docker-compose.yml` mounts `./people`
 writable at `/data/people` (API enrollments save uploaded photos back into
 it), persists the DB via `./data` → `/data/db`, sets `RECOGN_THRESHOLD`,
-healthcheck via `curl /api/health`. `.dockerignore` excludes `people/`,
-`models/`, `data/`, `third_party/`, `python/`, caches, `web/node_modules/`,
+healthcheck via `curl /api/health`. The sample ships **secure by default**:
+`RECOGN_ADMIN_PASSWORD_HASH` must be replaced (the placeholder fails startup
+loudly — auth.New rejects non-PHC strings) and the port binds to `127.0.0.1`
+only (a commented `8080:8080` line documents the all-interfaces
+switch). `.dockerignore` excludes `people/`, `models/`, `data/`,
+`third_party/`, `python/`, caches, `web/node_modules/`,
 and the host `internal/web/dist/` (the image builds its own bundle).
 
 **Docker CLI commands need elevated sandbox permissions** (the daemon socket and
@@ -226,6 +230,13 @@ command hits a permission error.
   in `data/passkeys.json`). `RECOGN_SESSION_TTL` (default 24h, sliding) bounds
   in-memory sessions — restarts log everyone out. With neither method
   configured, every route stays public and a warning is logged at startup.
+  Passkey registration is **refused (403) in open mode** (no password hash AND
+  zero registered passkeys) — otherwise a fresh deployment would hand admin to
+  the first network peer to complete a ceremony (regression tests
+  `internal/auth/bootstrap_test.go`, `TestAuthOpenModePasskeyRegisterRefused`).
+  Bootstrap a passkey-only install with a temporary password hash: set
+  `RECOGN_ADMIN_PASSWORD_HASH` → log in → register the passkey →
+  remove the hash → restart.
 - **Run the server**: `make serve` (or `./recogn serve --addr :8080` with the
   env exports above). Auto-enrolls if the DB is empty and `people/` exists.
 - **Re-verify the dataset pipeline**: `RECOGN_DATASET=1 go test ./internal/engine/
@@ -303,7 +314,9 @@ command hits a permission error.
   `POST /api/config`, face comparison, full-res photo serving) sit behind an
   auth middleware.
   Public: `/api/recognize`, `GET /api/people`, `/api/thumbs/{id}.jpg`,
-  `/api/health`, and the auth endpoints. Passkey credentials persist in
+  `/api/health`, and the auth endpoints — but passkey **registration** is
+  refused (403) while open mode lasts (see "Secure the admin surface" above).
+  Passkey credentials persist in
   `data/passkeys.json` (corrupt file refuses startup); sessions are in-memory.
 - Enrollment stores **one embedding per photo** (largest face) and matches
   per-person by best similarity. Photos with no detectable face are skipped with

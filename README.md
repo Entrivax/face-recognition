@@ -58,9 +58,18 @@ The image is all-in-one: the CGO-enabled Go binary, the ONNX Runtime library,
 and the models — no Python. You only need Docker.
 
 ```sh
-docker compose up --build      # build and start
-# open http://localhost:8080
+docker compose run --rm recogn hash-password   # 1. choose an admin password
+# 2. paste the printed $argon2id$... hash over the placeholder in docker-compose.yml
+docker compose up --build                      # 3. build and start
+# open http://localhost:8080 and log in
 ```
+
+The compose sample ships **secure by default**: it publishes the port on
+`127.0.0.1` only and refuses to start until `RECOGN_ADMIN_PASSWORD_HASH` is
+replaced (the placeholder hash makes the container exit with an error — see
+`docker compose logs`), so a fresh deployment is never exposed unauthenticated.
+To serve other machines, point a TLS reverse proxy at it (or switch the
+commented `8080:8080` binding) once the hash is set.
 
 On first start, if the face DB is empty, the container **auto-enrolls** from
 the mounted `./people` folder before serving. The generated database lives in a
@@ -250,7 +259,10 @@ Auth endpoints: `POST /api/login`, `POST /api/logout`, `GET /api/auth/session`,
 `POST /api/auth/passkey/register/begin|finish` (admin),
 `POST /api/auth/passkey/login/begin|finish` (public),
 `GET|DELETE /api/auth/passkeys` (admin). Failed logins are rate-limited per IP
-(10 failures / 5 min → HTTP 429 with `Retry-After`).
+(10 failures / 5 min → HTTP 429 with `Retry-After`). Passkey **registration**
+is refused with HTTP 403 while no admin credential exists at all (open mode) —
+otherwise the first visitor could register themselves as admin; see the
+passkey-only setup below for the bootstrap path.
 
 Two login methods; either or both can be configured:
 
@@ -298,7 +310,10 @@ curl -s -X POST http://localhost:8080/api/enroll \
 
 **Passkey-only setup**: set a temporary `RECOGN_ADMIN_PASSWORD_HASH` → log
 in → register a passkey in the Passkeys modal → remove the hash env and
-restart; the passkey keeps working.
+restart; the passkey keeps working. This temporary hash is the only way to
+bootstrap a passkey-only install: with no admin credential configured at all
+the server refuses passkey registration (403), so a fresh deployment cannot
+be captured by the first network peer to reach it.
 
 **Security notes**: over plain HTTP the password crosses the wire in
 cleartext — put a TLS reverse proxy in front for anything remote. The people

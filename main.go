@@ -615,8 +615,10 @@ func runServe(cfg config.Config, thresholdSet bool) error {
 	fmt.Printf("Admin auth: %s\n", server.Mode())
 	if server.Mode() == "open" {
 		// Open mode is backward-compatible but worth one loud line: every
-		// endpoint, including enrollment and deletion, is public.
-		slog.Warn("admin authentication is disabled — all endpoints are public; set RECOGN_ADMIN_PASSWORD_HASH (see 'recogn hash-password') or register a passkey")
+		// endpoint, including enrollment and deletion, is public — and
+		// passkey registration is refused there, so the only way to secure
+		// the server is to set a password hash (SECURITY-REVIEW.md H2/H3).
+		slog.Warn("admin authentication is disabled — all endpoints are public and passkey registration is refused; set RECOGN_ADMIN_PASSWORD_HASH (generate one with 'recogn hash-password') to secure the admin surface")
 	}
 
 	errCh := make(chan error, 1)
