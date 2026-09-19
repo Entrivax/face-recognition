@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 
 	_ "golang.org/x/image/bmp"
 	_ "golang.org/x/image/webp"
@@ -89,7 +90,14 @@ type inferencer interface {
 // concurrent use; the underlying inferencer bounds model Runs with a
 // concurrency gate (see cgoInferencer) rather than serialising them.
 type Engine struct {
-	inf    inferencer
+	inf inferencer
+
+	// mu guards known and thresh. HTTP traffic writes both while readers run:
+	// POST /api/config → SetThreshold and every mutation handler's reload →
+	// SetKnown race public recognize traffic. SetKnown is copy-on-write: it
+	// replaces the slice wholesale and nothing ever mutates a published
+	// backing array, so readers can iterate a snapshot taken under RLock.
+	mu     sync.RWMutex
 	known  []KnownPerson
 	thresh float64
 }
@@ -123,17 +131,51 @@ func NewWithInferencer(inf inferencer, thresh float64) *Engine {
 // Close shuts the engine (and its inference backend) down.
 func (e *Engine) Close() { e.inf.close() }
 
-// SetThreshold updates the match threshold.
-func (e *Engine) SetThreshold(t float64) { e.thresh = t }
+// SetThreshold updates the match threshold. Safe for concurrent use.
+func (e *Engine) SetThreshold(t float64) {
+	e.mu.Lock()
+	e.thresh = t
+	e.mu.Unlock()
+}
 
-// Threshold returns the current match threshold.
-func (e *Engine) Threshold() float64 { return e.thresh }
+// Threshold returns the current match threshold. Safe for concurrent use.
+func (e *Engine) Threshold() float64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.thresh
+}
 
-// SetKnown replaces the in-memory identity set.
-func (e *Engine) SetKnown(people []KnownPerson) { e.known = people }
+// SetKnown replaces the in-memory identity set. The caller must not mutate
+// people (or its Embeddings) afterwards: the engine publishes the slice
+// as-is and relies on its immutability (copy-on-write). Production callers
+// build a fresh slice per call. Safe for concurrent use.
+func (e *Engine) SetKnown(people []KnownPerson) {
+	e.mu.Lock()
+	e.known = people
+	e.mu.Unlock()
+}
 
-// Known returns the current identity set.
-func (e *Engine) Known() []KnownPerson { return e.known }
+// Known returns the current identity set as a shallow copy, so callers may
+// mutate the returned slice without touching the engine's set (element
+// Embeddings are shared and must stay read-only). Safe for concurrent use.
+func (e *Engine) Known() []KnownPerson {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([]KnownPerson, len(e.known))
+	copy(out, e.known)
+	return out
+}
+
+// knownSnapshot returns the identity set for matching: the slice header is
+// copied under RLock, and iterating it outside the lock is race-free because
+// SetKnown only ever replaces the slice wholesale (copy-on-write contract on
+// SetKnown), so a published backing array is never written again.
+func (e *Engine) knownSnapshot() []KnownPerson {
+	e.mu.RLock()
+	known := e.known
+	e.mu.RUnlock()
+	return known
+}
 
 // Ping warms up the inference backend and verifies models load.
 func (e *Engine) Ping() error { return e.inf.ping() }
@@ -163,7 +205,7 @@ func (e *Engine) MatchEmbedding(emb []float32) (Match, bool) {
 			best = m
 		}
 	}
-	return best, best.Score >= e.thresh
+	return best, best.Score >= e.Threshold()
 }
 
 // bestPerPerson computes every known person's best cosine similarity to emb
@@ -171,9 +213,10 @@ func (e *Engine) MatchEmbedding(emb []float32) (Match, bool) {
 // computed once here (see cosineWithNorm) instead of once per enrolled
 // embedding.
 func (e *Engine) bestPerPerson(emb []float32) map[string]Match {
-	best := make(map[string]Match, len(e.known))
+	known := e.knownSnapshot()
+	best := make(map[string]Match, len(known))
 	sqrtNa := sqrtNorm(emb)
-	for _, p := range e.known {
+	for _, p := range known {
 		m := Match{PersonID: p.ID, Name: p.Name, Score: -1}
 		for _, pe := range p.Embeddings {
 			if s := cosineWithNorm(emb, pe, sqrtNa); s > m.Score {
@@ -210,7 +253,7 @@ func matchesAboveThreshold(all map[string]Match, thresh float64) []Match {
 // per person: a person with several enrolled photos contributes only their
 // best-scoring embedding.
 func (e *Engine) MatchAll(emb []float32) []Match {
-	return matchesAboveThreshold(e.bestPerPerson(emb), e.thresh)
+	return matchesAboveThreshold(e.bestPerPerson(emb), e.Threshold())
 }
 
 // LargestFace returns the face with the largest bounding-box area and whether
@@ -294,7 +337,7 @@ func (e *Engine) Recognize(imgBytes []byte) ([]Face, error) {
 		// One bestPerPerson pass feeds both the threshold-filtered Matches and
 		// (when nothing clears the threshold) the near-miss confidence hint.
 		all := e.bestPerPerson(emb)
-		matches := matchesAboveThreshold(all, e.thresh)
+		matches := matchesAboveThreshold(all, e.Threshold())
 		faces[i].Matches = matches
 		if len(matches) > 0 {
 			faces[i].Confidence = math.Max(0, matches[0].Score)

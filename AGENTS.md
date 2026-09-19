@@ -264,7 +264,9 @@ command hits a permission error.
   goroutine) and ORT's CPU execution provider is thread-safe for concurrent
   Runs on one session, enforced by `TestConcurrentRunParity` (run
   `make test-race` after touching anything parallel). Only the Run holds a
-  slot; Go-side pre/post-processing stays outside the gate. `close()` drains
+  slot; Go-side pre/post-processing stays outside the gate. Slot release is
+  deferred (`gatedRun`), so a panic inside a Run cannot leak its slot and
+  wedge all inference (pinned by `TestGateSlotReleasedOnPanic`). `close()` drains
   every slot before closing the sessions.
 - **DB storage is bbolt** (`data/faces.db`, dep `go.etcd.io/bbolt`) with an
   in-memory mirror behind the DB RWMutex — reads never touch the file. Every
