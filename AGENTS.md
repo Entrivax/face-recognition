@@ -234,9 +234,27 @@ command hits a permission error.
   zero registered passkeys) — otherwise a fresh deployment would hand admin to
   the first network peer to complete a ceremony (regression tests
   `internal/auth/bootstrap_test.go`, `TestAuthOpenModePasskeyRegisterRefused`).
+  Deleting the **last** passkey while no password hash is configured is
+  likewise refused (409) — that would silently flip the server to open mode
+  (the deliberate reset path is deleting
+  `data/passkeys.json`). Pending WebAuthn ceremonies are capped at 256;
+  `/begin` beyond the cap answers 429 + `Retry-After` until the 5-min TTL
+  purge frees slots (M3).
   Bootstrap a passkey-only install with a temporary password hash: set
   `RECOGN_ADMIN_PASSWORD_HASH` → log in → register the passkey →
   remove the hash → restart.
+- **Behind a reverse proxy — client-IP keying** (optional): rate limiting
+  (login lockout, recognize admission) keys on the network peer address by
+  default and ignores `X-Forwarded-For` (client-controlled). Behind a proxy
+  that appends the client IP, set `RECOGN_TRUSTED_PROXY_CIDR`
+  (comma-separated CIDRs, e.g. `10.0.0.0/8,192.168.0.0/16`): when a request's
+  direct peer is inside a trusted CIDR, the key becomes the rightmost
+  non-trusted X-Forwarded-For entry (spoofed entries further left cannot
+  steer the key; unparsable chains fail closed to the peer). The proxy must
+  APPEND client IPs (the standard behaviour); misconfiguring a public peer as
+  trusted lets clients mint arbitrary rate-limit keys. An invalid CIDR fails
+  startup loudly. Without the variable, behaviour is unchanged: every client
+  behind one proxy shares one lockout bucket (the M4 tradeoff).
 - **Run the server**: `make serve` (or `./recogn serve --addr :8080` with the
   env exports above). Auto-enrolls if the DB is empty and `people/` exists.
 - **Re-verify the dataset pipeline**: `RECOGN_DATASET=1 go test ./internal/engine/
@@ -292,6 +310,13 @@ command hits a permission error.
   `db.Export`/`recogn export` (people name-sorted for byte-stable diffs).
   Photo records on disk: `uvarint hashLen + hash + uvarint dim + dim×float32
   LE` (`encodePhoto`/`decodePhoto`; decode rejects size mismatches).
+  **People returned by the accessors are deep copies** (`copyPersonLocked`):
+  `People`/`Get`/`GetByID`/`ExportTo` hand out their own `Photos` slice so
+  readers never race the in-place mirror writes (element replace, sort,
+  append-shift, pinned by `internal/db/alias_test.go`
+  incl. a `-race` probe). `Photo.Embedding` backing arrays stay shared —
+  the store never mutates an embedding after the Photo is created; keep it
+  that way or the copies stop being safe.
 - Embeddings are stripped from API/CLI JSON output (`Face.Embedding` is `json:"-"`
   or nil-ed) — don't leak 512-float arrays to clients.
 - **API request bodies are capped**: 32 MiB (`maxUpload`) on `/api/recognize`
@@ -299,11 +324,24 @@ command hits a permission error.
   two-photo body the same way), 1 MiB on JSON bodies
   (`POST /api/config`, `POST /api/people/{name}/rename`, …). Wrap new
   handlers' bodies in `http.MaxBytesReader`/`io.LimitReader` the same way.
+  Multipart **parse memory is 10 MiB** (`multipartMemory`, not `maxUpload`):
+  larger file parts spill to OS temp files instead of sitting RAM-resident
+  for the request's lifetime.
+- **Admission control on the inference endpoints** (`internal/api/admission.go`):
+  `/api/recognize` (public) is rate-limited per client
+  IP — token bucket, burst 30, refill 1/s → 429 + `Retry-After` — and both
+  recognize and `/api/compare` share a **non-blocking in-flight gate** sized
+  `2 × resolveWorkers` (floor 2); a full gate answers 503 + `Retry-After: 2`.
+  Requests are deliberately never queued: queueing pins waiting memory, the
+  failure mode being prevented. The limiter keys on `auth.Service.ClientIP`
+  (same keying as login — see `RECOGN_TRUSTED_PROXY_CIDR` below). When adding
+  another inference-heavy route, wrap it in `s.inflight.tryAcquire()`/`release`
+  and pin a test in `internal/api/admission_test.go`.
 - **Image decodes are pixel-gated** (`internal/engine/decode.go`): every
   engine-side decode of image bytes goes through `decodeLimited`, which reads
   only the header first and rejects images declaring more than
   `maxDecodePixels` (50 MP) before `image.Decode` allocates pixels —
-  decompression-bomb guard (SECURITY-REVIEW.md C1; the 32 MiB body cap bounds
+  decompression-bomb guard (the 32 MiB body cap bounds
   compressed bytes only). Errors carry `engine.ErrImageTooLarge`, which the
   API maps to HTTP 400. Never call `image.Decode` on untrusted bytes in the
   engine; larger local photos are skipped with a warning at enrollment.

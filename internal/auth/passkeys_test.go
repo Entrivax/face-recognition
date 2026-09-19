@@ -2,6 +2,9 @@ package auth
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -201,6 +204,84 @@ func TestPendingCeremoniesTTL(t *testing.T) {
 	}
 	if len(p.sessions) != 0 {
 		t.Fatalf("expired ceremonies not purged: %d remain", len(p.sessions))
+	}
+}
+
+// TestPendingCeremoniesCapped pins the M3 fix (SECURITY-REVIEW.md): the
+// pending map must refuse to grow past maxPendingCeremonies — unbounded, a
+// flood of public /begin requests was a memory DoS. Refused puts store
+// nothing; a TTL purge frees slots again.
+func TestPendingCeremoniesCapped(t *testing.T) {
+	now, advance := fakeClock(time.Unix(1700000000, 0))
+	p := newPendingCeremonies(now)
+
+	for i := 0; i < maxPendingCeremonies; i++ {
+		ok, retry := p.put(&webauthn.SessionData{Challenge: fmt.Sprintf("ch-%d", i)})
+		if !ok {
+			t.Fatalf("put %d refused (retry=%d), want accepted", i+1, retry)
+		}
+	}
+	ok, retry := p.put(&webauthn.SessionData{Challenge: "overflow"})
+	if ok {
+		t.Fatal("put beyond the cap must be refused")
+	}
+	if retry < 1 || retry > rateMaxRetryAfter {
+		t.Fatalf("refusal retry = %d, want within [1,%d]", retry, rateMaxRetryAfter)
+	}
+	if _, ok := p.take("overflow"); ok {
+		t.Fatal("a refused ceremony must not be stored")
+	}
+	if len(p.sessions) != maxPendingCeremonies {
+		t.Fatalf("map size %d, want the cap %d", len(p.sessions), maxPendingCeremonies)
+	}
+
+	// Once the ceremonies expire, the purge frees slots for new begins.
+	advance(ceremonyTTL + time.Second)
+	if ok, _ := p.put(&webauthn.SessionData{Challenge: "fresh"}); !ok {
+		t.Fatal("purged ceremonies must free slots")
+	}
+}
+
+// TestPasskeyBeginRefusedWhenPendingFull pins the handler-level behaviour:
+// both public/admin begin endpoints answer 429 + Retry-After once the
+// ceremony cap is reached, and begin working again after the TTL.
+func TestPasskeyBeginRefusedWhenPendingFull(t *testing.T) {
+	s := newTestService(t, "sekret")
+	s.store.add(sampleCredential("k1")) // passkey mode: login begin reachable
+	now, advance := fakeClock(time.Unix(1700000000, 0))
+	s.pending = newPendingCeremonies(now)
+
+	// Fill the map: login begin (public) is the cheap attacker path.
+	for i := 0; i < maxPendingCeremonies; i++ {
+		rec := httptest.NewRecorder()
+		s.PasskeyLoginHandler().ServeHTTP(rec, newTestRequest("POST", "/api/auth/passkey/login/begin"))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("login begin %d: got %d (%s), want 200", i+1, rec.Code, rec.Body.String())
+		}
+	}
+
+	// Beyond the cap both ceremonies are refused with 429 + Retry-After.
+	for _, tc := range []struct {
+		name, path string
+		handler    http.Handler
+	}{{"login", "/api/auth/passkey/login/begin", s.PasskeyLoginHandler()},
+		{"register", "/api/auth/passkey/register/begin", s.PasskeyRegisterHandler()}} {
+		rec := httptest.NewRecorder()
+		tc.handler.ServeHTTP(rec, newTestRequest("POST", tc.path))
+		if rec.Code != http.StatusTooManyRequests {
+			t.Fatalf("%s begin beyond cap: got %d (%s), want 429", tc.name, rec.Code, rec.Body.String())
+		}
+		if ra := rec.Header().Get("Retry-After"); ra == "" {
+			t.Fatalf("%s 429 must carry Retry-After", tc.name)
+		}
+	}
+
+	// After the TTL, ceremonies are accepted again.
+	advance(ceremonyTTL + time.Second)
+	rec := httptest.NewRecorder()
+	s.PasskeyLoginHandler().ServeHTTP(rec, newTestRequest("POST", "/api/auth/passkey/login/begin"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login begin after purge: got %d (%s), want 200", rec.Code, rec.Body.String())
 	}
 }
 

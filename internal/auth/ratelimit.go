@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -133,3 +134,76 @@ func remoteIP(r *http.Request) string {
 	}
 	return host
 }
+
+// parseTrustedProxies turns a comma-separated CIDR list (RECOGN_TRUSTED_PROXY_CIDR)
+// into networks the login limiter may trust for client-IP extraction. An
+// empty spec disables the feature entirely (the safe default).
+func parseTrustedProxies(spec string) ([]*net.IPNet, error) {
+	if strings.TrimSpace(spec) == "" {
+		return nil, nil
+	}
+	var out []*net.IPNet
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		_, ipnet, err := net.ParseCIDR(part)
+		if err != nil {
+			return nil, fmt.Errorf("parse %q: %w", part, err)
+		}
+		out = append(out, ipnet)
+	}
+	return out, nil
+}
+
+func containsIP(cidrs []*net.IPNet, ip net.IP) bool {
+	for _, n := range cidrs {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// clientIP returns the address rate limiting keys on. Default (no trusted
+// proxies configured): the network peer, with X-Forwarded-For ignored.
+//
+// When the direct peer is inside a configured trusted CIDR, the rightmost
+// non-trusted entry of X-Forwarded-For is used instead — the client IP the
+// nearest trusted proxy observed (SECURITY-REVIEW.md M4). Walking right to
+// left and stopping at the first non-trusted, parseable address means spoofed
+// entries to the LEFT of the real client hop cannot steer the key, and a
+// chain of trusted proxies is handled too. Anything missing or unparsable
+// falls back to the peer (fail closed).
+func (s *Service) clientIP(r *http.Request) string {
+	peer := remoteIP(r)
+	if len(s.trusted) == 0 {
+		return peer
+	}
+	peerIP := net.ParseIP(peer)
+	if peerIP == nil || !containsIP(s.trusted, peerIP) {
+		return peer
+	}
+	xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For"))
+	if xff == "" {
+		return peer
+	}
+	parts := strings.Split(xff, ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		ip := net.ParseIP(strings.TrimSpace(parts[i]))
+		if ip == nil {
+			return peer // a corrupted hop poisons the chain: fail closed
+		}
+		if containsIP(s.trusted, ip) {
+			continue // another trusted proxy hop
+		}
+		return ip.String()
+	}
+	return peer
+}
+
+// ClientIP is the exported proxy-aware client key, shared with the API
+// package's own admission limiter so both rate limits agree on who the
+// client is (SECURITY-REVIEW.md M1/M4).
+func (s *Service) ClientIP(r *http.Request) string { return s.clientIP(r) }

@@ -293,6 +293,7 @@ Two login methods; either or both can be configured:
 | `RECOGN_WEBAUTHN_RPID` | unset | WebAuthn Relying Party ID (your domain) — recommended behind a reverse proxy/TLS |
 | `RECOGN_WEBAUTHN_ORIGIN` | unset | expected WebAuthn origin, e.g. `https://recogn.example.com` |
 | `RECOGN_WEBAUTHN_RP_NAME` | `recogn` | Relying Party display name |
+| `RECOGN_TRUSTED_PROXY_CIDR` | unset | comma-separated reverse-proxy CIDRs trusted for client-IP extraction (e.g. `10.0.0.0/8`) — gives each proxied client its own login rate-limit bucket; the proxy must append client IPs. Unset (default) keys rate limiting on the peer address and ignores `X-Forwarded-For`, so all clients behind one proxy share a bucket |
 
 Scripts log in once and reuse the session:
 

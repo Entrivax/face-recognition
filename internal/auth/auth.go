@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -49,6 +50,7 @@ type Service struct {
 	limiter  *RateLimiter
 	store    *passkeyStore
 	pending  *pendingCeremonies
+	trusted  []*net.IPNet // trusted reverse-proxy CIDRs for client-IP extraction (M4)
 }
 
 // New builds the auth service from cfg, loading any previously registered
@@ -66,12 +68,17 @@ func New(cfg config.Config) (*Service, error) {
 			return nil, fmt.Errorf("invalid RECOGN_ADMIN_PASSWORD_HASH: %w (generate one with 'recogn hash-password')", err)
 		}
 	}
+	trusted, err := parseTrustedProxies(cfg.TrustedProxyCIDRs)
+	if err != nil {
+		return nil, fmt.Errorf("invalid RECOGN_TRUSTED_PROXY_CIDR: %w", err)
+	}
 	return &Service{
 		cfg:      cfg,
 		sessions: newSessionStore(cfg.SessionTTL, defaultNow),
 		limiter:  newRateLimiter(defaultNow),
 		pending:  newPendingCeremonies(defaultNow),
 		store:    store,
+		trusted:  trusted,
 	}, nil
 }
 
@@ -155,7 +162,10 @@ func (s *Service) LoginHandler() http.Handler {
 			writeError(w, http.StatusUnauthorized, "admin authentication is not configured")
 			return
 		}
-		ip := remoteIP(r)
+		// M4: behind a configured trusted proxy, key on the X-Forwarded-For
+		// client IP so clients don't share one lockout bucket; otherwise the
+		// network peer with XFF ignored (anti-spoofing default).
+		ip := s.clientIP(r)
 		if ok, retry := s.limiter.Allow(ip); !ok {
 			w.Header().Set("Retry-After", strconv.Itoa(retry))
 			writeError(w, http.StatusTooManyRequests, "too many attempts")
@@ -274,7 +284,13 @@ func (s *Service) passkeyRegisterBegin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "begin registration: "+err.Error())
 		return
 	}
-	s.pending.put(session)
+	if ok, retry := s.pending.put(session); !ok {
+		// M3: too many pending ceremonies — shed the request instead of
+		// growing the map without bound.
+		w.Header().Set("Retry-After", strconv.Itoa(retry))
+		writeError(w, http.StatusTooManyRequests, "too many pending ceremonies; try again shortly")
+		return
+	}
 	writeJSON(w, http.StatusOK, creation)
 }
 
@@ -345,7 +361,13 @@ func (s *Service) passkeyLoginBegin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "begin login: "+err.Error())
 		return
 	}
-	s.pending.put(session)
+	if ok, retry := s.pending.put(session); !ok {
+		// M3: same cap as registration — the login begin endpoint is public,
+		// so it is the ceremony flood's natural target.
+		w.Header().Set("Retry-After", strconv.Itoa(retry))
+		writeError(w, http.StatusTooManyRequests, "too many pending ceremonies; try again shortly")
+		return
+	}
 	writeJSON(w, http.StatusOK, assertion)
 }
 
@@ -429,6 +451,17 @@ func (s *Service) passkeyList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) passkeyDelete(w http.ResponseWriter, r *http.Request, id string) {
+	// M5: removing the only credential while no password hash is configured
+	// would silently flip the server to open mode (Enabled() → false, admin
+	// routes public, nothing logged). Refuse; the deliberate reset stays
+	// possible by deleting data/passkeys.json (documented recovery path).
+	if s.cfg.AdminPasswordHash == "" && s.store.count() == 1 {
+		slog.Warn("passkey delete refused: last admin credential",
+			"remote", remoteIP(r))
+		writeError(w, http.StatusConflict,
+			"cannot remove the last admin passkey while no password hash is configured — set RECOGN_ADMIN_PASSWORD_HASH (generate one with 'recogn hash-password'), log in, then manage passkeys; or delete data/passkeys.json to reset auth entirely")
+		return
+	}
 	removed, err := s.store.removeByID(id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "persist passkeys: "+err.Error())

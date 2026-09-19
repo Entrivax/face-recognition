@@ -287,8 +287,10 @@ func (d *DB) ExportTo(path string) (string, error) {
 	d.mu.RLock()
 	doc := fileFormat{Version: d.data.Version, Threshold: d.data.Threshold, People: make([]*Person, len(d.data.People))}
 	for i, p := range d.data.People {
-		cp := *p
-		doc.People[i] = &cp
+		// Deep copy (not just the struct): the JSON is marshalled after the
+		// lock is released, so the Photos slice must not alias the live
+		// mirror a concurrent writer may sort or shift (M6).
+		doc.People[i] = copyPersonLocked(p)
 	}
 	d.mu.RUnlock()
 	sort.Slice(doc.People, func(i, j int) bool {
@@ -338,20 +340,33 @@ func (d *DB) SetThreshold(t float64) error {
 	return nil
 }
 
+// copyPersonLocked returns a deep copy of p for handing to callers: the
+// Photos slice gets its own backing array, so a reader iterating (or
+// mutating) the copy never races the in-place writes addPhoto/RemovePhoto
+// perform on the live mirror (SECURITY-REVIEW.md M6). The caller must hold
+// d.mu (at least RLock). Embedding backing arrays stay shared on purpose:
+// the store never mutates an embedding after the Photo is created.
+func copyPersonLocked(p *Person) *Person {
+	cp := *p
+	cp.Photos = append([]Photo(nil), p.Photos...)
+	return &cp
+}
+
 // People returns a copy of all people, sorted by name.
 func (d *DB) People() []Person {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	out := make([]Person, 0, len(d.data.People))
 	for _, p := range d.data.People {
-		out = append(out, *p)
+		out = append(out, *copyPersonLocked(p))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
 // Get returns a person by name (case-insensitive), or nil. The returned
-// pointer refers to a copy: mutating it never affects the stored record.
+// pointer refers to a deep copy: mutating it (including its Photos slice)
+// never affects the stored record.
 func (d *DB) Get(name string) *Person {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -359,8 +374,7 @@ func (d *DB) Get(name string) *Person {
 	if p == nil {
 		return nil
 	}
-	cp := *p
-	return &cp
+	return copyPersonLocked(p)
 }
 
 func (d *DB) findLocked(name string) *Person {
@@ -373,7 +387,8 @@ func (d *DB) findLocked(name string) *Person {
 }
 
 // GetByID returns a person by ID, or nil. The returned pointer refers to a
-// copy: mutating it never affects the stored record.
+// deep copy: mutating it (including its Photos slice) never affects the
+// stored record.
 func (d *DB) GetByID(id string) *Person {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -381,8 +396,7 @@ func (d *DB) GetByID(id string) *Person {
 	if p == nil {
 		return nil
 	}
-	cp := *p
-	return &cp
+	return copyPersonLocked(p)
 }
 
 func (d *DB) findByIDLocked(id string) *Person {
