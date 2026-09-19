@@ -99,7 +99,7 @@ docker run -p 8080:8080 -v "$PWD/people:/data/people" -v recogn-db:/data/db reco
 
 ### Prerequisites
 
-- Go 1.22+
+- Go 1.27.1+
 - A C toolchain (`gcc`) — inference uses CGO
 - Node.js 20+ with npm — the web UI (Preact + TypeScript) is built by Vite
 - The ONNX Runtime C library + header (fetched into `third_party/onnxruntime` by `make ort`)
