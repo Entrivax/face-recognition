@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"bytes"
 	"fmt"
 	"image"
 	"math"
@@ -90,18 +89,30 @@ func (c *cgoInferencer) takeSlot() { c.slots <- struct{}{} }
 // releaseSlot frees the Run slot.
 func (c *cgoInferencer) releaseSlot() { <-c.slots }
 
+// gatedRun holds one concurrency-gate slot for the duration of a single model
+// Run. The release is deferred, so a panic inside Run (e.g. a failed tensor
+// allocation) cannot leak its slot: net/http recovers handler panics, and a
+// leaked slot would permanently wedge every future inference call once all
+// slots were gone. Only the Run itself is inside the gate; Go-side
+// pre/post-processing stays outside it (see the type doc comment).
+func (c *cgoInferencer) gatedRun(run func() ([]onnxrt.Tensor, error)) ([]onnxrt.Tensor, error) {
+	c.takeSlot()
+	defer c.releaseSlot()
+	return run()
+}
+
 func (c *cgoInferencer) ping() error {
 	// Models are opened at construction, so a trivial detector run on a blank
 	// tensor confirms the runtime is functional.
-	c.takeSlot()
-	defer c.releaseSlot()
 	blank := make([]float32, 3*detInputSize*detInputSize)
-	_, err := c.det.Run(blank, []int64{1, 3, detInputSize, detInputSize})
+	_, err := c.gatedRun(func() ([]onnxrt.Tensor, error) {
+		return c.det.Run(blank, []int64{1, 3, detInputSize, detInputSize})
+	})
 	return err
 }
 
 func (c *cgoInferencer) detect(imgBytes []byte) ([]Face, error) {
-	src, _, err := image.Decode(bytes.NewReader(imgBytes))
+	src, err := decodeLimited(imgBytes)
 	if err != nil {
 		return nil, fmt.Errorf("decode image: %w", err)
 	}
@@ -115,9 +126,9 @@ func (c *cgoInferencer) detectFromImage(src image.Image) ([]Face, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.takeSlot()
-	outs, err := c.det.Run(lb.tensor, []int64{1, 3, detInputSize, detInputSize})
-	c.releaseSlot()
+	outs, err := c.gatedRun(func() ([]onnxrt.Tensor, error) {
+		return c.det.Run(lb.tensor, []int64{1, 3, detInputSize, detInputSize})
+	})
 	if err != nil {
 		return nil, fmt.Errorf("detect run: %w", err)
 	}
@@ -133,9 +144,9 @@ func (c *cgoInferencer) detectFromImage(src image.Image) ([]Face, error) {
 
 func (c *cgoInferencer) embedImage(aligned *image.NRGBA) ([]float32, error) {
 	tensor := preprocessFace(aligned)
-	c.takeSlot()
-	outs, err := c.emb.Run(tensor, []int64{1, 3, 112, 112})
-	c.releaseSlot()
+	outs, err := c.gatedRun(func() ([]onnxrt.Tensor, error) {
+		return c.emb.Run(tensor, []int64{1, 3, 112, 112})
+	})
 	if err != nil {
 		return nil, fmt.Errorf("embed run: %w", err)
 	}

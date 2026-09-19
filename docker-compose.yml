@@ -1,15 +1,24 @@
 # recogn — basic compose setup.
 #
-#   docker compose up --build        # build the image and start the API + UI
-#   open http://localhost:8080
+#   1. docker compose run --rm recogn hash-password   # prompts for an admin password
+#   2. paste the printed $argon2id$... hash over the CHANGE-ME placeholder below
+#   3. docker compose up --build                      # build and start
+#   4. open http://localhost:8080 and log in
+#
+# The password hash below is REQUIRED: while the placeholder is unchanged the
+# server refuses to start (the container exits with
+# "invalid RECOGN_ADMIN_PASSWORD_HASH: …" — visible in `docker compose logs`).
+# A deployment without admin auth would expose enrollment, person deletion and
+# configuration to anyone who can reach the port (SECURITY-REVIEW.md H3).
 #
 # On first start, if the face DB is empty and a people/ dataset is mounted,
 # the server enrolls everyone automatically before serving.
 #
 # To add someone new: drop people/<Name>/*.jpg into ./people and either
-# restart, hit POST /api/enroll, or use the "Rescan people folder" button.
-# Photos enrolled through the API/UI are saved back into ./people (as
-# <Name>/<sha1>.<ext>), so the mount below must stay writable.
+# restart, hit POST /api/enroll (admin-authenticated), or use the "Rescan
+# people folder" button. Photos enrolled through the API/UI are saved back
+# into ./people (as <Name>/<sha1>.<ext>), so the mount below must stay
+# writable.
 
 services:
   recogn:
@@ -17,22 +26,26 @@ services:
     image: recogn:latest
     container_name: recogn
     ports:
-      - "8080:8080"
+      # Loopback-only by default: the UI/API stay reachable from this machine
+      # (and through an SSH tunnel or reverse proxy). To serve your LAN or the
+      # public internet, switch to "8080:8080" — only after admin auth is
+      # configured (below) and ideally behind a TLS reverse proxy.
+      - "127.0.0.1:8080:8080"
+      # - "8080:8080"
     environment:
       # Tune recognition strictness (0..1). Higher = fewer false positives.
       RECOGN_THRESHOLD: "0.45"
       # RECOGN_ADDR: ":8080"        # listen address inside the container
       #
-      # Admin login is optional: with none of the vars below set, the API
-      # stays fully open (current behavior). The password is stored only as
-      # an argon2id hash — generate one with:
-      #   docker compose run --rm recogn hash-password
-      # Browser login uses a session cookie; scripts send the session token
-      # as `Authorization: Bearer <session token>` (the password itself is
-      # never accepted as a Bearer credential). Passkey (WebAuthn) login
-      # needs HTTPS (or localhost) — put a TLS reverse proxy in front
-      # for anything remote and point RPID/ORIGIN at its public URL.
-      # RECOGN_ADMIN_PASSWORD_HASH: "$argon2id$v=19$m=65536,t=2,p=1$..."
+      # REQUIRED — replace the placeholder with a real argon2id hash
+      # (see the 3-step first run in the header comment):
+      RECOGN_ADMIN_PASSWORD_HASH: "CHANGE-ME-paste-argon2id-hash"
+      #
+      # Passkey (WebAuthn) login is the second method: register passkeys in
+      # the UI's Passkeys modal while logged in (open mode refuses passkey
+      # registration — SECURITY-REVIEW.md H2). Passkeys need HTTPS or
+      # localhost; behind a TLS reverse proxy point RPID/ORIGIN at its
+      # public URL:
       # RECOGN_WEBAUTHN_RPID: "recogn.example.com"
       # RECOGN_WEBAUTHN_ORIGIN: "https://recogn.example.com"
     volumes:

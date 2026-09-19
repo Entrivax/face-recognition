@@ -218,6 +218,12 @@ func (u *adminUser) WebAuthnCredentials() []webauthn.Credential { return u.creds
 // stays valid before the client must restart it.
 const ceremonyTTL = 5 * time.Minute
 
+// maxPendingCeremonies caps the pending map (SECURITY-REVIEW.md M3): the
+// login begin endpoint is public, and without a cap a flood of begins pinned
+// one ceremony each in memory for ceremonyTTL. Past the cap new begins are
+// refused with 429 until the purge frees slots.
+const maxPendingCeremonies = 256
+
 // pendingCeremonies holds the in-flight WebAuthn ceremonies, keyed by the
 // random challenge generated in the begin step (the client echoes it back in
 // the finish body, which is the lookup key). Entries expire after
@@ -235,16 +241,40 @@ func newPendingCeremonies(now func() time.Time) *pendingCeremonies {
 	return &pendingCeremonies{now: now, sessions: make(map[string]webauthn.SessionData)}
 }
 
-// put records a begun ceremony under its challenge.
-func (p *pendingCeremonies) put(session *webauthn.SessionData) {
+// put records a begun ceremony under its challenge. It reports whether the
+// ceremony was accepted: once maxPendingCeremonies unexpired ceremonies are
+// pending, further puts are refused (ok=false) with a Retry-After hint in
+// seconds — the caller turns that into a 429.
+func (p *pendingCeremonies) put(session *webauthn.SessionData) (accepted bool, retryAfter int) {
 	if session == nil || session.Challenge == "" {
-		return
+		return true, 0 // nothing to track; nothing to bound
 	}
-	session.Expires = p.now().Add(ceremonyTTL)
+	now := p.now()
+	session.Expires = now.Add(ceremonyTTL)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.purgeLocked(p.now())
+	p.purgeLocked(now)
+	if len(p.sessions) >= maxPendingCeremonies {
+		// Refuse. The next slot frees when the oldest pending ceremony
+		// expires; advertise its remaining lifetime, clamped like the login
+		// limiter's Retry-After.
+		var oldest time.Time
+		for _, s := range p.sessions {
+			if oldest.IsZero() || s.Expires.Before(oldest) {
+				oldest = s.Expires
+			}
+		}
+		seconds := int(oldest.Sub(now) / time.Second)
+		if seconds < 1 {
+			seconds = 1
+		}
+		if seconds > rateMaxRetryAfter {
+			seconds = rateMaxRetryAfter
+		}
+		return false, seconds
+	}
 	p.sessions[session.Challenge] = *session
+	return true, 0
 }
 
 // take pops a pending ceremony by challenge. Unknown or expired challenges

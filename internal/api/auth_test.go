@@ -580,3 +580,46 @@ func TestAuthCorruptPasskeyStoreFailsStartup(t *testing.T) {
 		t.Fatal("a corrupt passkeys.json must fail startup")
 	}
 }
+
+// TestAuthOpenModePasskeyRegisterRefused pins the route-level behaviour of the
+// H2 fix (SECURITY-REVIEW.md): in open mode the admin middleware passes
+// through, so the refusal must come from the auth handler itself — passkey
+// registration used to be first-come-first-served admin takeover. Everything
+// else about open mode stays exactly as before.
+func TestAuthOpenModePasskeyRegisterRefused(t *testing.T) {
+	eng := &stubEngine{}
+	s, _ := newTestServer(t, eng)
+
+	// Register begin/finish: refused with guidance (was 200 before the fix).
+	for _, path := range []string{"/api/auth/passkey/register/begin", "/api/auth/passkey/register/finish"} {
+		req := authReq(t, s, http.MethodPost, path, "8.8.8.8", nil, nil)
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("open-mode %s: got %d (%s), want 403", path, rec.Code, rec.Body.String())
+		}
+		var body map[string]string
+		json.NewDecoder(rec.Body).Decode(&body)
+		if !strings.Contains(body["error"], "RECOGN_ADMIN_PASSWORD_HASH") {
+			t.Fatalf("%s: error body must name the env var, got %q", path, body["error"])
+		}
+	}
+
+	// Open-mode semantics are otherwise unchanged.
+	var session struct {
+		Authenticated bool            `json:"authenticated"`
+		Methods       map[string]bool `json:"methods"`
+	}
+	if r := getJSON(t, s, "/api/auth/session", &session); r.Code != http.StatusOK {
+		t.Fatalf("session: got %d", r.Code)
+	}
+	if !session.Authenticated || session.Methods["password"] || session.Methods["passkey"] {
+		t.Fatalf("open-mode session shape: %+v", session)
+	}
+	if code := getJSON(t, s, "/api/health", nil).Code; code != http.StatusOK {
+		t.Errorf("health: got %d", code)
+	}
+	if code := getJSON(t, s, "/api/people", nil).Code; code != http.StatusOK {
+		t.Errorf("people: got %d", code)
+	}
+}

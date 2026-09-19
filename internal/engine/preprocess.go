@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"bytes"
 	"fmt"
 	"image"
 )
@@ -31,9 +30,10 @@ type detLetterbox struct {
 	newH   int
 }
 
-// preprocessDetect decodes imgBytes and builds the SCRFD input tensor.
+// preprocessDetect decodes imgBytes (pixel-count gated, like every engine
+// decode) and builds the SCRFD input tensor.
 func preprocessDetect(imgBytes []byte) (*detLetterbox, error) {
-	src, _, err := image.Decode(bytes.NewReader(imgBytes))
+	src, err := decodeLimited(imgBytes)
 	if err != nil {
 		return nil, fmt.Errorf("decode image: %w", err)
 	}

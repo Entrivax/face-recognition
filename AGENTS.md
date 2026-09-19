@@ -194,8 +194,12 @@ the web UI with Vite (`node:22-bookworm-slim`, `npm ci && npm run build`),
 `EXPOSE 8080`, `VOLUME /data/db`. `docker-compose.yml` mounts `./people`
 writable at `/data/people` (API enrollments save uploaded photos back into
 it), persists the DB via `./data` → `/data/db`, sets `RECOGN_THRESHOLD`,
-healthcheck via `curl /api/health`. `.dockerignore` excludes `people/`,
-`models/`, `data/`, `third_party/`, `python/`, caches, `web/node_modules/`,
+healthcheck via `curl /api/health`. The sample ships **secure by default**:
+`RECOGN_ADMIN_PASSWORD_HASH` must be replaced (the placeholder fails startup
+loudly — auth.New rejects non-PHC strings) and the port binds to `127.0.0.1`
+only (a commented `8080:8080` line documents the all-interfaces
+switch). `.dockerignore` excludes `people/`, `models/`, `data/`,
+`third_party/`, `python/`, caches, `web/node_modules/`,
 and the host `internal/web/dist/` (the image builds its own bundle).
 
 **Docker CLI commands need elevated sandbox permissions** (the daemon socket and
@@ -226,6 +230,31 @@ command hits a permission error.
   in `data/passkeys.json`). `RECOGN_SESSION_TTL` (default 24h, sliding) bounds
   in-memory sessions — restarts log everyone out. With neither method
   configured, every route stays public and a warning is logged at startup.
+  Passkey registration is **refused (403) in open mode** (no password hash AND
+  zero registered passkeys) — otherwise a fresh deployment would hand admin to
+  the first network peer to complete a ceremony (regression tests
+  `internal/auth/bootstrap_test.go`, `TestAuthOpenModePasskeyRegisterRefused`).
+  Deleting the **last** passkey while no password hash is configured is
+  likewise refused (409) — that would silently flip the server to open mode
+  (the deliberate reset path is deleting
+  `data/passkeys.json`). Pending WebAuthn ceremonies are capped at 256;
+  `/begin` beyond the cap answers 429 + `Retry-After` until the 5-min TTL
+  purge frees slots (M3).
+  Bootstrap a passkey-only install with a temporary password hash: set
+  `RECOGN_ADMIN_PASSWORD_HASH` → log in → register the passkey →
+  remove the hash → restart.
+- **Behind a reverse proxy — client-IP keying** (optional): rate limiting
+  (login lockout, recognize admission) keys on the network peer address by
+  default and ignores `X-Forwarded-For` (client-controlled). Behind a proxy
+  that appends the client IP, set `RECOGN_TRUSTED_PROXY_CIDR`
+  (comma-separated CIDRs, e.g. `10.0.0.0/8,192.168.0.0/16`): when a request's
+  direct peer is inside a trusted CIDR, the key becomes the rightmost
+  non-trusted X-Forwarded-For entry (spoofed entries further left cannot
+  steer the key; unparsable chains fail closed to the peer). The proxy must
+  APPEND client IPs (the standard behaviour); misconfiguring a public peer as
+  trusted lets clients mint arbitrary rate-limit keys. An invalid CIDR fails
+  startup loudly. Without the variable, behaviour is unchanged: every client
+  behind one proxy shares one lockout bucket (the M4 tradeoff).
 - **Run the server**: `make serve` (or `./recogn serve --addr :8080` with the
   env exports above). Auto-enrolls if the DB is empty and `people/` exists.
 - **Re-verify the dataset pipeline**: `RECOGN_DATASET=1 go test ./internal/engine/
@@ -264,7 +293,9 @@ command hits a permission error.
   goroutine) and ORT's CPU execution provider is thread-safe for concurrent
   Runs on one session, enforced by `TestConcurrentRunParity` (run
   `make test-race` after touching anything parallel). Only the Run holds a
-  slot; Go-side pre/post-processing stays outside the gate. `close()` drains
+  slot; Go-side pre/post-processing stays outside the gate. Slot release is
+  deferred (`gatedRun`), so a panic inside a Run cannot leak its slot and
+  wedge all inference (pinned by `TestGateSlotReleasedOnPanic`). `close()` drains
   every slot before closing the sessions.
 - **DB storage is bbolt** (`data/faces.db`, dep `go.etcd.io/bbolt`) with an
   in-memory mirror behind the DB RWMutex — reads never touch the file. Every
@@ -279,6 +310,13 @@ command hits a permission error.
   `db.Export`/`recogn export` (people name-sorted for byte-stable diffs).
   Photo records on disk: `uvarint hashLen + hash + uvarint dim + dim×float32
   LE` (`encodePhoto`/`decodePhoto`; decode rejects size mismatches).
+  **People returned by the accessors are deep copies** (`copyPersonLocked`):
+  `People`/`Get`/`GetByID`/`ExportTo` hand out their own `Photos` slice so
+  readers never race the in-place mirror writes (element replace, sort,
+  append-shift, pinned by `internal/db/alias_test.go`
+  incl. a `-race` probe). `Photo.Embedding` backing arrays stay shared —
+  the store never mutates an embedding after the Photo is created; keep it
+  that way or the copies stop being safe.
 - Embeddings are stripped from API/CLI JSON output (`Face.Embedding` is `json:"-"`
   or nil-ed) — don't leak 512-float arrays to clients.
 - **API request bodies are capped**: 32 MiB (`maxUpload`) on `/api/recognize`
@@ -286,12 +324,37 @@ command hits a permission error.
   two-photo body the same way), 1 MiB on JSON bodies
   (`POST /api/config`, `POST /api/people/{name}/rename`, …). Wrap new
   handlers' bodies in `http.MaxBytesReader`/`io.LimitReader` the same way.
+  Multipart **parse memory is 10 MiB** (`multipartMemory`, not `maxUpload`):
+  larger file parts spill to OS temp files instead of sitting RAM-resident
+  for the request's lifetime.
+- **Admission control on the inference endpoints** (`internal/api/admission.go`):
+  `/api/recognize` (public) is rate-limited per client
+  IP — token bucket, burst 30, refill 1/s → 429 + `Retry-After` — and both
+  recognize and `/api/compare` share a **non-blocking in-flight gate** sized
+  `2 × resolveWorkers` (floor 2); a full gate answers 503 + `Retry-After: 2`.
+  Requests are deliberately never queued: queueing pins waiting memory, the
+  failure mode being prevented. The limiter keys on `auth.Service.ClientIP`
+  (same keying as login — see `RECOGN_TRUSTED_PROXY_CIDR` below). When adding
+  another inference-heavy route, wrap it in `s.inflight.tryAcquire()`/`release`
+  and pin a test in `internal/api/admission_test.go`.
+- **Image decodes are pixel-gated** (`internal/engine/decode.go`): every
+  engine-side decode of image bytes goes through `decodeLimited`, which reads
+  only the header first and rejects images declaring more than
+  `maxDecodePixels` (50 MP) before `image.Decode` allocates pixels —
+  decompression-bomb guard (the 32 MiB body cap bounds
+  compressed bytes only). Errors carry `engine.ErrImageTooLarge`, which the
+  API maps to HTTP 400. Never call `image.Decode` on untrusted bytes in the
+  engine; larger local photos are skipped with a warning at enrollment.
+  `runServe` also sets a 4 GiB soft memory limit (unless `GOMEMLIMIT` is set)
+  as a backstop.
 - **Admin auth** (`internal/auth`): `api.New` returns `(*Server, error)` and
   builds the auth service; admin routes (enroll, people/photo mutations,
   `POST /api/config`, face comparison, full-res photo serving) sit behind an
   auth middleware.
   Public: `/api/recognize`, `GET /api/people`, `/api/thumbs/{id}.jpg`,
-  `/api/health`, and the auth endpoints. Passkey credentials persist in
+  `/api/health`, and the auth endpoints — but passkey **registration** is
+  refused (403) while open mode lasts (see "Secure the admin surface" above).
+  Passkey credentials persist in
   `data/passkeys.json` (corrupt file refuses startup); sessions are in-memory.
 - Enrollment stores **one embedding per photo** (largest face) and matches
   per-person by best similarity. Photos with no detectable face are skipped with

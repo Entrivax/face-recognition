@@ -3,7 +3,9 @@
 // RECOGN_ADMIN_PASSWORD_HASH) and/or registered WebAuthn passkeys gate the
 // mutating admin routes behind a session cookie or a Bearer session token.
 // When neither method is configured the middleware is a pass-through (open
-// mode) and the server behaves exactly as before.
+// mode) and the server behaves exactly as before — except that passkey
+// registration is refused (403), so a fresh deployment cannot be captured by
+// the first network peer to reach it (SECURITY-REVIEW.md H2).
 //
 // The password itself is only ever compared inside POST /api/login (against
 // its argon2id hash, rate-limited); it is never accepted as a Bearer
@@ -18,6 +20,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -46,6 +50,7 @@ type Service struct {
 	limiter  *RateLimiter
 	store    *passkeyStore
 	pending  *pendingCeremonies
+	trusted  []*net.IPNet // trusted reverse-proxy CIDRs for client-IP extraction (M4)
 }
 
 // New builds the auth service from cfg, loading any previously registered
@@ -63,12 +68,17 @@ func New(cfg config.Config) (*Service, error) {
 			return nil, fmt.Errorf("invalid RECOGN_ADMIN_PASSWORD_HASH: %w (generate one with 'recogn hash-password')", err)
 		}
 	}
+	trusted, err := parseTrustedProxies(cfg.TrustedProxyCIDRs)
+	if err != nil {
+		return nil, fmt.Errorf("invalid RECOGN_TRUSTED_PROXY_CIDR: %w", err)
+	}
 	return &Service{
 		cfg:      cfg,
 		sessions: newSessionStore(cfg.SessionTTL, defaultNow),
 		limiter:  newRateLimiter(defaultNow),
 		pending:  newPendingCeremonies(defaultNow),
 		store:    store,
+		trusted:  trusted,
 	}, nil
 }
 
@@ -152,7 +162,10 @@ func (s *Service) LoginHandler() http.Handler {
 			writeError(w, http.StatusUnauthorized, "admin authentication is not configured")
 			return
 		}
-		ip := remoteIP(r)
+		// M4: behind a configured trusted proxy, key on the X-Forwarded-For
+		// client IP so clients don't share one lockout bucket; otherwise the
+		// network peer with XFF ignored (anti-spoofing default).
+		ip := s.clientIP(r)
 		if ok, retry := s.limiter.Allow(ip); !ok {
 			w.Header().Set("Retry-After", strconv.Itoa(retry))
 			writeError(w, http.StatusTooManyRequests, "too many attempts")
@@ -214,11 +227,28 @@ func (s *Service) SessionHandler() http.Handler {
 
 // PasskeyRegisterHandler handles POST /api/auth/passkey/register[/begin|/finish].
 // Mounted behind the admin middleware: only an authenticated admin may add a
-// credential. The path suffix selects the ceremony phase.
+// credential. The path suffix selects the ceremony phase. In open mode — no
+// password hash configured and zero registered passkeys — the middleware is
+// a pass-through, so this handler itself refuses (SECURITY-REVIEW.md H2).
 func (s *Service) PasskeyRegisterHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "POST required")
+			return
+		}
+		// Open-mode bootstrap guard: with no admin credential at all, the
+		// middleware above lets every request through, which made public
+		// passkey registration first-come-first-served — the first network
+		// peer to complete a ceremony would own admin permanently (the
+		// store keeps every registered credential; only an admin could
+		// remove one). Refuse until a credential exists; bootstrap a
+		// passkey-only install with a temporary RECOGN_ADMIN_PASSWORD_HASH
+		// instead (log in, register the passkey, remove the hash, restart).
+		if !s.Enabled() {
+			slog.Warn("passkey registration refused in open mode",
+				"remote", remoteIP(r))
+			writeError(w, http.StatusForbidden,
+				"passkey registration is disabled until admin authentication is configured — set RECOGN_ADMIN_PASSWORD_HASH (generate one with 'recogn hash-password'), log in, then register passkeys")
 			return
 		}
 		rest := strings.TrimPrefix(r.URL.Path, "/api/auth/passkey/register")
@@ -254,7 +284,13 @@ func (s *Service) passkeyRegisterBegin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "begin registration: "+err.Error())
 		return
 	}
-	s.pending.put(session)
+	if ok, retry := s.pending.put(session); !ok {
+		// M3: too many pending ceremonies — shed the request instead of
+		// growing the map without bound.
+		w.Header().Set("Retry-After", strconv.Itoa(retry))
+		writeError(w, http.StatusTooManyRequests, "too many pending ceremonies; try again shortly")
+		return
+	}
 	writeJSON(w, http.StatusOK, creation)
 }
 
@@ -325,7 +361,13 @@ func (s *Service) passkeyLoginBegin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "begin login: "+err.Error())
 		return
 	}
-	s.pending.put(session)
+	if ok, retry := s.pending.put(session); !ok {
+		// M3: same cap as registration — the login begin endpoint is public,
+		// so it is the ceremony flood's natural target.
+		w.Header().Set("Retry-After", strconv.Itoa(retry))
+		writeError(w, http.StatusTooManyRequests, "too many pending ceremonies; try again shortly")
+		return
+	}
 	writeJSON(w, http.StatusOK, assertion)
 }
 
@@ -409,6 +451,17 @@ func (s *Service) passkeyList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) passkeyDelete(w http.ResponseWriter, r *http.Request, id string) {
+	// M5: removing the only credential while no password hash is configured
+	// would silently flip the server to open mode (Enabled() → false, admin
+	// routes public, nothing logged). Refuse; the deliberate reset stays
+	// possible by deleting data/passkeys.json (documented recovery path).
+	if s.cfg.AdminPasswordHash == "" && s.store.count() == 1 {
+		slog.Warn("passkey delete refused: last admin credential",
+			"remote", remoteIP(r))
+		writeError(w, http.StatusConflict,
+			"cannot remove the last admin passkey while no password hash is configured — set RECOGN_ADMIN_PASSWORD_HASH (generate one with 'recogn hash-password'), log in, then manage passkeys; or delete data/passkeys.json to reset auth entirely")
+		return
+	}
 	removed, err := s.store.removeByID(id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "persist passkeys: "+err.Error())

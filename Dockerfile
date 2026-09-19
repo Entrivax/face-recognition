@@ -54,7 +54,7 @@ COPY web/ ./
 RUN npm run build
 
 # ---- Stage 4: build the CGO-enabled Go binary ------------------------------
-FROM golang:1.26-bookworm AS gobuild
+FROM golang:1.27.1-bookworm AS gobuild
 # CGO needs a C toolchain.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends gcc libc6-dev \

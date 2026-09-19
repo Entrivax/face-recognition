@@ -47,7 +47,12 @@ type Server struct {
 	auth    *auth.Service            // admin auth (sessions, passkeys, rate limit)
 	refresh func(e Engine, d *db.DB) // push DB identities into the engine
 	workers int                      // batch worker count (uploads, rescan)
-	mux     *http.ServeMux
+	// Admission control for the inference-heavy endpoints (M1): the
+	// recognize token bucket and the shared recognize/compare in-flight
+	// gate. See admission.go.
+	inflight      *inflightGate
+	recognLimiter *ipRateLimiter
+	mux           *http.ServeMux
 }
 
 // New builds a Server. refresh is called after any mutation to reload the
@@ -59,6 +64,10 @@ func New(cfg config.Config, eng Engine, database *db.DB, refresh func(Engine, *d
 		return nil, err
 	}
 	s := &Server{cfg: cfg, eng: eng, db: database, auth: authSvc, refresh: refresh, workers: resolveWorkers(cfg)}
+	// M1 admission control: capacity scales with the inference concurrency
+	// so a slow CPU gets a proportionally smaller memory-exposure window.
+	s.inflight = newInflightGate(max(s.workers*admitPerWorker, minAdmitSlots))
+	s.recognLimiter = newIPRateLimiter(nil, recognizeRefillPerSec, recognizeBurst)
 	s.routes()
 	return s, nil
 }
@@ -179,6 +188,20 @@ func (s *Server) handleRecognize(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "POST required")
 		return
 	}
+	// M1 admission control (public route): rate-limit the client first so
+	// 429s never consume an in-flight slot, then take a decode/inference
+	// slot — full gate sheds with 503 instead of queueing memory up.
+	if ok, retry := s.recognLimiter.allow(s.auth.ClientIP(r)); !ok {
+		w.Header().Set("Retry-After", strconv.Itoa(retry))
+		writeErr(w, http.StatusTooManyRequests, "rate limit exceeded; retry later")
+		return
+	}
+	if !s.inflight.tryAcquire() {
+		w.Header().Set("Retry-After", strconv.Itoa(admitRetryAfter))
+		writeErr(w, http.StatusServiceUnavailable, "server busy; try again shortly")
+		return
+	}
+	defer s.inflight.release()
 	img, err := readImage(w, r)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -186,7 +209,7 @@ func (s *Server) handleRecognize(w http.ResponseWriter, r *http.Request) {
 	}
 	faces, err := s.eng.Recognize(img)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "recognition failed: "+err.Error())
+		writeErr(w, engineErrStatus(err), "recognition failed: "+err.Error())
 		return
 	}
 	for i := range faces {
@@ -238,8 +261,16 @@ func (s *Server) handleCompare(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "POST required")
 		return
 	}
+	// M1: compare runs two detections and two embeddings per request, so it
+	// shares the recognize in-flight budget (rate limit not needed: admin-only).
+	if !s.inflight.tryAcquire() {
+		w.Header().Set("Retry-After", strconv.Itoa(admitRetryAfter))
+		writeErr(w, http.StatusServiceUnavailable, "server busy; try again shortly")
+		return
+	}
+	defer s.inflight.release()
 	r.Body = http.MaxBytesReader(w, r.Body, maxUpload)
-	if err := r.ParseMultipartForm(maxUpload); err != nil {
+	if err := r.ParseMultipartForm(multipartMemory); err != nil {
 		writeErr(w, http.StatusBadRequest, "parse form: "+err.Error())
 		return
 	}
@@ -255,12 +286,12 @@ func (s *Server) handleCompare(w http.ResponseWriter, r *http.Request) {
 	}
 	facesA, err := s.eng.Detect(imgA)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "detect failed (first photo): "+err.Error())
+		writeErr(w, engineErrStatus(err), "detect failed (first photo): "+err.Error())
 		return
 	}
 	facesB, err := s.eng.Detect(imgB)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "detect failed (second photo): "+err.Error())
+		writeErr(w, engineErrStatus(err), "detect failed (second photo): "+err.Error())
 		return
 	}
 	if len(facesA) == 0 {
@@ -277,12 +308,12 @@ func (s *Server) handleCompare(w http.ResponseWriter, r *http.Request) {
 	bestB, _ := engine.LargestFace(facesB)
 	embA, err := s.eng.EmbedFace(imgA, bestA)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "embed failed (first photo): "+err.Error())
+		writeErr(w, engineErrStatus(err), "embed failed (first photo): "+err.Error())
 		return
 	}
 	embB, err := s.eng.EmbedFace(imgB, bestB)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "embed failed (second photo): "+err.Error())
+		writeErr(w, engineErrStatus(err), "embed failed (second photo): "+err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -457,7 +488,7 @@ func (s *Server) handlePersonPhotoDetect(w http.ResponseWriter, r *http.Request,
 	}
 	faces, err := s.eng.Recognize(b)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "recognition failed: "+err.Error())
+		writeErr(w, engineErrStatus(err), "recognition failed: "+err.Error())
 		return
 	}
 	for i := range faces {
@@ -586,7 +617,7 @@ func (s *Server) handleSelectThumb(w http.ResponseWriter, r *http.Request, name 
 	}
 	faces, err := s.eng.Detect(b)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "detect failed: "+err.Error())
+		writeErr(w, engineErrStatus(err), "detect failed: "+err.Error())
 		return
 	}
 	if len(faces) == 0 {
@@ -782,7 +813,7 @@ func (s *Server) handleEnrollPerson(w http.ResponseWriter, r *http.Request, name
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxUpload)
-	if err := r.ParseMultipartForm(maxUpload); err != nil {
+	if err := r.ParseMultipartForm(multipartMemory); err != nil {
 		writeErr(w, http.StatusBadRequest, "parse form: "+err.Error())
 		return
 	}
@@ -891,7 +922,7 @@ func (s *Server) handleEnrollFace(w http.ResponseWriter, r *http.Request, name s
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxUpload)
-	if err := r.ParseMultipartForm(maxUpload); err != nil {
+	if err := r.ParseMultipartForm(multipartMemory); err != nil {
 		writeErr(w, http.StatusBadRequest, "parse form: "+err.Error())
 		return
 	}
@@ -912,6 +943,9 @@ func (s *Server) handleEnrollFace(w http.ResponseWriter, r *http.Request, name s
 			writeErr(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, enroll.ErrNoFace):
 			writeErr(w, http.StatusUnprocessableEntity, err.Error())
+		case errors.Is(err, engine.ErrImageTooLarge):
+			// The photo's declared dimensions exceed the decode pixel cap.
+			writeErr(w, http.StatusBadRequest, err.Error())
 		default:
 			writeErr(w, http.StatusInternalServerError, err.Error())
 		}
@@ -1055,7 +1089,9 @@ func readImage(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxUpload)
 	ct := r.Header.Get("Content-Type")
 	if strings.HasPrefix(ct, "multipart/form-data") {
-		if err := r.ParseMultipartForm(maxUpload); err != nil {
+		// multipartMemory (not maxUpload): big parts spill to OS temp files
+		// instead of being buffered RAM-resident for the whole request (M1).
+		if err := r.ParseMultipartForm(multipartMemory); err != nil {
 			return nil, fmt.Errorf("parse multipart: %w", err)
 		}
 		for _, field := range []string{"image", "file", "photo"} {
@@ -1090,4 +1126,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"error": msg})
+}
+
+// engineErrStatus picks the HTTP status for an engine error: images whose
+// declared dimensions exceed the decode pixel cap (decompression-bomb guard,
+// engine.ErrImageTooLarge) are the client's fault → 400; everything else is a
+// backend failure → 502.
+func engineErrStatus(err error) int {
+	if errors.Is(err, engine.ErrImageTooLarge) {
+		return http.StatusBadRequest
+	}
+	return http.StatusBadGateway
 }

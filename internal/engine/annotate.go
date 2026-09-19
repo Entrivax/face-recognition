@@ -20,7 +20,7 @@ import (
 // amber for unknown). faces must be in the order the results list showed
 // them; NN in the label is the 1-based index. Returns JPEG bytes.
 func Annotate(imgBytes []byte, faces []Face) ([]byte, error) {
-	src, _, err := image.Decode(bytes.NewReader(imgBytes))
+	src, err := decodeLimited(imgBytes)
 	if err != nil {
 		return nil, fmt.Errorf("decode source image: %w", err)
 	}
