@@ -286,6 +286,16 @@ command hits a permission error.
   two-photo body the same way), 1 MiB on JSON bodies
   (`POST /api/config`, `POST /api/people/{name}/rename`, …). Wrap new
   handlers' bodies in `http.MaxBytesReader`/`io.LimitReader` the same way.
+- **Image decodes are pixel-gated** (`internal/engine/decode.go`): every
+  engine-side decode of image bytes goes through `decodeLimited`, which reads
+  only the header first and rejects images declaring more than
+  `maxDecodePixels` (50 MP) before `image.Decode` allocates pixels —
+  decompression-bomb guard (SECURITY-REVIEW.md C1; the 32 MiB body cap bounds
+  compressed bytes only). Errors carry `engine.ErrImageTooLarge`, which the
+  API maps to HTTP 400. Never call `image.Decode` on untrusted bytes in the
+  engine; larger local photos are skipped with a warning at enrollment.
+  `runServe` also sets a 4 GiB soft memory limit (unless `GOMEMLIMIT` is set)
+  as a backstop.
 - **Admin auth** (`internal/auth`): `api.New` returns `(*Server, error)` and
   builds the auth service; admin routes (enroll, people/photo mutations,
   `POST /api/config`, face comparison, full-res photo serving) sit behind an

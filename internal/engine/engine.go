@@ -242,8 +242,10 @@ func LargestFace(faces []Face) (Face, bool) {
 // per-face Runs across the concurrency gate, so multi-face photos use
 // several cores.
 func (e *Engine) Recognize(imgBytes []byte) ([]Face, error) {
-	// Decode once for detection and all alignments below.
-	src, _, err := image.Decode(bytes.NewReader(imgBytes))
+	// Decode once for detection and all alignments below. decodeLimited
+	// gates the declared pixel count first: a decompression bomb would
+	// otherwise allocate its full RGBA size here.
+	src, err := decodeLimited(imgBytes)
 	if err != nil {
 		return nil, fmt.Errorf("decode source image: %w", err)
 	}
@@ -367,7 +369,7 @@ func cosineWithNorm(a, b []float32, sqrtNa float64) float64 {
 // alignFaceImage warps the face described by f's 5-point landmarks into a
 // 112x112 crop matching the ArcFace reference template, returning the image.
 func alignFaceImage(imgBytes []byte, f Face) (*image.NRGBA, error) {
-	src, _, err := image.Decode(bytes.NewReader(imgBytes))
+	src, err := decodeLimited(imgBytes)
 	if err != nil {
 		return nil, fmt.Errorf("decode source image: %w", err)
 	}
@@ -417,7 +419,7 @@ func cropBBoxImage(src image.Image, bb [4]float64) (*image.NRGBA, error) {
 // the image), resized to size x size, and JPEG-encoded. It is meant for UI
 // avatars — not for recognition, which uses the aligned ArcFace crop.
 func FaceThumb(imgBytes []byte, f Face, size int) ([]byte, error) {
-	src, _, err := image.Decode(bytes.NewReader(imgBytes))
+	src, err := decodeLimited(imgBytes)
 	if err != nil {
 		return nil, fmt.Errorf("decode source image: %w", err)
 	}

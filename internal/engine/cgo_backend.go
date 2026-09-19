@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"bytes"
 	"fmt"
 	"image"
 	"math"
@@ -101,7 +100,7 @@ func (c *cgoInferencer) ping() error {
 }
 
 func (c *cgoInferencer) detect(imgBytes []byte) ([]Face, error) {
-	src, _, err := image.Decode(bytes.NewReader(imgBytes))
+	src, err := decodeLimited(imgBytes)
 	if err != nil {
 		return nil, fmt.Errorf("decode image: %w", err)
 	}

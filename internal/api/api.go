@@ -186,7 +186,7 @@ func (s *Server) handleRecognize(w http.ResponseWriter, r *http.Request) {
 	}
 	faces, err := s.eng.Recognize(img)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "recognition failed: "+err.Error())
+		writeErr(w, engineErrStatus(err), "recognition failed: "+err.Error())
 		return
 	}
 	for i := range faces {
@@ -255,12 +255,12 @@ func (s *Server) handleCompare(w http.ResponseWriter, r *http.Request) {
 	}
 	facesA, err := s.eng.Detect(imgA)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "detect failed (first photo): "+err.Error())
+		writeErr(w, engineErrStatus(err), "detect failed (first photo): "+err.Error())
 		return
 	}
 	facesB, err := s.eng.Detect(imgB)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "detect failed (second photo): "+err.Error())
+		writeErr(w, engineErrStatus(err), "detect failed (second photo): "+err.Error())
 		return
 	}
 	if len(facesA) == 0 {
@@ -277,12 +277,12 @@ func (s *Server) handleCompare(w http.ResponseWriter, r *http.Request) {
 	bestB, _ := engine.LargestFace(facesB)
 	embA, err := s.eng.EmbedFace(imgA, bestA)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "embed failed (first photo): "+err.Error())
+		writeErr(w, engineErrStatus(err), "embed failed (first photo): "+err.Error())
 		return
 	}
 	embB, err := s.eng.EmbedFace(imgB, bestB)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "embed failed (second photo): "+err.Error())
+		writeErr(w, engineErrStatus(err), "embed failed (second photo): "+err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -457,7 +457,7 @@ func (s *Server) handlePersonPhotoDetect(w http.ResponseWriter, r *http.Request,
 	}
 	faces, err := s.eng.Recognize(b)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "recognition failed: "+err.Error())
+		writeErr(w, engineErrStatus(err), "recognition failed: "+err.Error())
 		return
 	}
 	for i := range faces {
@@ -586,7 +586,7 @@ func (s *Server) handleSelectThumb(w http.ResponseWriter, r *http.Request, name 
 	}
 	faces, err := s.eng.Detect(b)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "detect failed: "+err.Error())
+		writeErr(w, engineErrStatus(err), "detect failed: "+err.Error())
 		return
 	}
 	if len(faces) == 0 {
@@ -912,6 +912,9 @@ func (s *Server) handleEnrollFace(w http.ResponseWriter, r *http.Request, name s
 			writeErr(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, enroll.ErrNoFace):
 			writeErr(w, http.StatusUnprocessableEntity, err.Error())
+		case errors.Is(err, engine.ErrImageTooLarge):
+			// The photo's declared dimensions exceed the decode pixel cap.
+			writeErr(w, http.StatusBadRequest, err.Error())
 		default:
 			writeErr(w, http.StatusInternalServerError, err.Error())
 		}
@@ -1090,4 +1093,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"error": msg})
+}
+
+// engineErrStatus picks the HTTP status for an engine error: images whose
+// declared dimensions exceed the decode pixel cap (decompression-bomb guard,
+// engine.ErrImageTooLarge) are the client's fault → 400; everything else is a
+// backend failure → 502.
+func engineErrStatus(err error) int {
+	if errors.Is(err, engine.ErrImageTooLarge) {
+		return http.StatusBadRequest
+	}
+	return http.StatusBadGateway
 }

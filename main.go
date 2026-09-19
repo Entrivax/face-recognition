@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -546,6 +547,14 @@ func readPasswordLine() ([]byte, error) {
 }
 
 func runServe(cfg config.Config, thresholdSet bool) error {
+	// Soft memory limit as a backstop against unbounded allocation (e.g. a
+	// regression reintroducing a decode bomb): the GC runs harder as the Go
+	// heap approaches the limit instead of letting RSS balloon until the
+	// kernel OOM-kills the process. Legit workloads peak far below it. An
+	// operator-set GOMEMLIMIT wins.
+	if os.Getenv("GOMEMLIMIT") == "" {
+		debug.SetMemoryLimit(4 << 30) // 4 GiB
+	}
 	eng, database, err := openEngine(cfg, thresholdSet)
 	if err != nil {
 		return err

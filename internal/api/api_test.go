@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -22,11 +23,12 @@ import (
 
 // stubEngine implements the Engine interface without any real inference.
 type stubEngine struct {
-	faces     []engine.Face
-	threshold float64
+	faces        []engine.Face
+	threshold    float64
+	recognizeErr error // when set, Recognize returns it (tests the error mapping)
 }
 
-func (s *stubEngine) Recognize(b []byte) ([]engine.Face, error) { return s.faces, nil }
+func (s *stubEngine) Recognize(b []byte) ([]engine.Face, error) { return s.faces, s.recognizeErr }
 func (s *stubEngine) Detect(b []byte) ([]engine.Face, error)    { return s.faces, nil }
 func (s *stubEngine) EmbedFace(b []byte, f engine.Face) ([]float32, error) {
 	return []float32{0.1, 0.2}, nil
@@ -165,6 +167,35 @@ func TestRecognizeEmpty(t *testing.T) {
 	json.NewDecoder(rec.Body).Decode(&resp)
 	if resp["count"].(float64) != 0 {
 		t.Errorf("expected count 0, got %v", resp["count"])
+	}
+}
+
+// TestRecognizeRejectsOversizedImage pins the C1 HTTP contract: an image whose
+// declared dimensions exceed the decode pixel cap is a client error (400),
+// not a 502 after a multi-GB decode attempt. The stub returns the error the
+// real engine produces for such an image (sentinel + wrap, as errors.Is sees
+// it through Recognize's %w wrapping).
+func TestRecognizeRejectsOversizedImage(t *testing.T) {
+	eng := &stubEngine{
+		recognizeErr: fmt.Errorf("decode source image: %w", engine.ErrImageTooLarge),
+	}
+	s, _ := newTestServer(t, eng)
+	body, ct := multipartBody(t, "image", "photo.jpg", []byte("tiny"))
+	req := httptest.NewRequest(http.MethodPost, "/api/recognize", body)
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("oversized image: got %d (%s), want 400", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if resp.Error == "" {
+		t.Errorf("expected an error message in the response body")
 	}
 }
 
