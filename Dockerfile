@@ -18,18 +18,16 @@
 # ---------------------------------------------------------------------------
 
 # ---- Stage 1: ONNX Runtime C library + headers ----------------------------
+# Reuses the repo's `make ort` recipe instead of duplicating the
+# download/extract steps here; the ORT version is pinned in the Makefile.
+# (tar + gzip ship with debian-slim; only make/curl/ca-certificates are added.)
 FROM debian:bookworm-slim AS ort
-ARG ORT_VER=1.23.2
-ARG ORT_URL=https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VER}/onnxruntime-linux-x64-${ORT_VER}.tgz
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl ca-certificates \
+ && apt-get install -y --no-install-recommends make curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
-RUN curl -fSL -o /tmp/ort.tgz "$ORT_URL" \
- && mkdir -p /ort \
- && tar xzf /tmp/ort.tgz -C /tmp \
- && mv /tmp/onnxruntime-linux-x64-${ORT_VER}/include /ort/include \
- && mv /tmp/onnxruntime-linux-x64-${ORT_VER}/lib /ort/lib \
- && rm -rf /tmp/ort.tgz /tmp/onnxruntime-linux-x64-${ORT_VER}
+WORKDIR /ort
+COPY Makefile .
+RUN make ort
 
 # ---- Stage 2: ONNX models --------------------------------------------------
 # Baked into the image so the container is self-contained (no runtime
@@ -61,8 +59,10 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 
-# ORT C library + headers for the cgo build.
-COPY --from=ort /ort /third_party/onnxruntime
+# ORT C library + headers for the cgo build, inside the module tree so the
+# go:embed pattern in ort_embed_linux.go (relative to /src) matches and the
+# #cgo ${SRCDIR} include path resolves.
+COPY --from=ort /ort/third_party/onnxruntime /src/third_party/onnxruntime
 
 # Cache module downloads separately from source changes.
 COPY go.mod go.sum* ./
@@ -74,7 +74,7 @@ COPY . .
 COPY --from=ui /src/internal/web/dist ./internal/web/dist
 
 ENV CGO_ENABLED=1 \
-    CGO_CFLAGS="-I/third_party/onnxruntime/include" \
+    CGO_CFLAGS="-I/src/third_party/onnxruntime/include" \
     CGO_LDFLAGS="-ldl"
 RUN go build -trimpath -ldflags="-s -w" -o /out/recogn .
 

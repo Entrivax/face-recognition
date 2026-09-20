@@ -156,11 +156,15 @@ export GOPATH=$PWD/.gopath GOMODCACHE=$PWD/.gomodcache GOCACHE=$PWD/.gocache \
 `make build`/`serve`/`test` depend on `ui`, which needs **Node ≥ 20 + npm**
 (see web/package.json); it skips `npm ci` when `web/node_modules` exists.
 
-- **CGO is required** (`CGO_ENABLED=1`) and needs `gcc`. The ORT C lib+header
-  must exist in `third_party/onnxruntime` — `make ort` fetches them (needs
-  network once). The Go `#cgo` directive bakes an rpath of
-  `$ORIGIN/third_party/onnxruntime/lib`, so the binary runs in place; keep
-  `third_party/` next to the binary.
+- **CGO is required** (`CGO_ENABLED=1`) and needs `gcc`. The ORT C header must
+  exist in `third_party/onnxruntime` at build/test time — `make ort` fetches
+  it (needs network once). The shared library is **not linked at build time**:
+  the main package embeds it via `go:embed` (`ort_embed_*.go`; the pattern is
+  relative to the repo root) and the first session extracts it to a per-version
+  cache dir and dlopens it (`internal/onnxrt/embed.go`; fallbacks:
+  `RECOGN_ORT_LIBRARY`, the system loader path, the repo `third_party/`
+  layout). `third_party/` is only needed where the **build** runs, not next
+  to the deployed binary.
 - `GOPROXY=off` works because the Go module deps (`golang.org/x/image`,
   `go.etcd.io/bbolt`) are in the local module cache; adding a new Go dep needs
   network (`GOPROXY=https://proxy.golang.org,direct`) + in-workspace `GOPATH`
@@ -186,11 +190,15 @@ export GOPATH=$PWD/.gopath GOMODCACHE=$PWD/.gomodcache GOCACHE=$PWD/.gocache \
 
 ## Docker
 
-`Dockerfile` is multi-stage: (1) fetch ORT C lib, (2) fetch models, (3) build
+`Dockerfile` is multi-stage: (1) run `make ort` inside the image (reuses the
+Makefile recipe; ORT version pinned there), (2) fetch models, (3) build
 the web UI with Vite (`node:22-bookworm-slim`, `npm ci && npm run build`),
-(4) build the CGO binary with `gcc` + ORT (rpath set to `/usr/lib/recogn`),
-(5) slim `debian:bookworm-slim` runtime with `libonnxruntime` in
-`/usr/lib/recogn` + `ldconfig`, `curl` for the healthcheck, non-root user,
+(4) build the CGO binary with `gcc`; the ORT tree is copied to
+`/src/third_party/onnxruntime` so the `go:embed` pattern in
+`ort_embed_linux.go` matches (embed paths resolve relative to the module dir)
+and the binary dlopens the embedded library at runtime,
+(5) slim `debian:bookworm-slim` runtime with just the self-contained binary +
+models, `curl` for the healthcheck, non-root user,
 `EXPOSE 8080`, `VOLUME /data/db`. `docker-compose.yml` mounts `./people`
 writable at `/data/people` (API enrollments save uploaded photos back into
 it), persists the DB via `./data` → `/data/db`, sets `RECOGN_THRESHOLD`,
