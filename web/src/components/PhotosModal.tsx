@@ -4,6 +4,11 @@
 // detail view, which runs detection on the stored photo and draws the faces
 // over it so the user can judge the photo's quality. The header carries an
 // inline rename editor; saving renames everything server-side.
+//
+// Any two enrolled photos of this person can be compared face-to-face: each
+// grid tile has a compare button (the detail view has a "Compare faces…"
+// button) — the first pick marks the photo (A), the second pick loads both
+// photos and launches the compare modal, auto-running the similarity check.
 
 import { useEffect, useRef, useState } from "preact/hooks";
 import type { TargetedEvent } from "preact";
@@ -21,6 +26,8 @@ interface PhotosModalProps {
 	onRenamed: (name: string) => void;
 	/** photos added/removed or avatar changed → refresh people + health */
 	onChange: () => void;
+	/** compare two enrolled photos face-to-face (opens the compare modal) */
+	onComparePhotos: (a: File, b: File) => void;
 	registerAddFiles: (fn: ((files: FileList | File[]) => void) | null) => void;
 }
 
@@ -36,6 +43,8 @@ export function PhotosModal(props: PhotosModalProps) {
 	const [renaming, setRenaming] = useState(false);
 	const [renameVal, setRenameVal] = useState("");
 	const [dropHint, setDropHint] = useState(false);
+	// Enrolled photo currently marked as photo A of a comparison (path).
+	const [cmpPath, setCmpPath] = useState<string | null>(null);
 
 	const personRef = useRef<string | null>(props.person);
 	const detailRef = useRef<string | null>(null);
@@ -62,6 +71,7 @@ export function PhotosModal(props: PhotosModalProps) {
 		detailRef.current = null;
 		setDetailPath(null);
 		setRenaming(false);
+		setCmpPath(null);
 		setPhotos(null);
 		setHint("Loading photos…");
 		loadGrid(props.person);
@@ -83,9 +93,11 @@ export function PhotosModal(props: PhotosModalProps) {
 		props.onCloseRequest();
 	};
 
-	// Escape cancels the inline rename edit first, then closes.
+	// Escape cancels the inline rename edit, then a pending compare pick,
+	// then closes.
 	const onEscape = () => {
 		if (renaming) cancelRename();
+		else if (cmpPath) setCmpPath(null);
 		else close();
 	};
 
@@ -216,6 +228,63 @@ export function PhotosModal(props: PhotosModalProps) {
 		setDetailPath(null);
 	}
 
+	// ---- compare two enrolled photos ----
+	// First pick marks the photo as photo A; picking the marked photo again
+	// cancels; picking a different photo loads both photos' bytes and hands
+	// them to the compare modal, which fills its slots and auto-runs the
+	// similarity check. Works from the grid's per-tile buttons and from the
+	// detail view's "Compare faces…" button alike.
+	function pickComparePath(path: string) {
+		if (busyRef.current) return;
+		if (!cmpPath) {
+			setCmpPath(path);
+			toast.show(`${path} set as photo A — pick another photo to compare.`, "ok");
+			return;
+		}
+		if (cmpPath === path) {
+			setCmpPath(null);
+			return;
+		}
+		launchCompare(cmpPath, path);
+	}
+
+	async function launchCompare(aPath: string, bPath: string) {
+		const person = personRef.current;
+		if (busyRef.current || !person) return;
+		setBusy(true);
+		try {
+			const [a, b] = await Promise.all([
+				api.fetchPhotoFile(person, aPath),
+				api.fetchPhotoFile(person, bPath),
+			]);
+			setCmpPath(null);
+			props.onComparePhotos(a, b);
+		} catch (e) {
+			setCmpPath(null);
+			toast.show((e as Error).message || "Could not load the photos for comparison.", "err");
+		} finally {
+			setBusy(false);
+		}
+	}
+
+	// Detail-view trigger: a fresh pick marks this photo as A and shows the
+	// grid so another photo can be picked; with A already marked it follows
+	// the usual rule (click the marked photo again = cancel, otherwise launch).
+	function compareFromDetail() {
+		if (busyRef.current || !detailPath) return;
+		if (cmpPath && cmpPath !== detailPath) {
+			launchCompare(cmpPath, detailPath);
+			return;
+		}
+		if (!cmpPath) {
+			setCmpPath(detailPath);
+			backToGrid();
+			toast.show(`${detailPath} set as photo A — pick another photo to compare.`, "ok");
+			return;
+		}
+		setCmpPath(null); // the detail photo was the marked one — cancel
+	}
+
 	async function deletePhoto(photoPath: string) {
 		const person = personRef.current;
 		if (busyRef.current || !person) return;
@@ -228,6 +297,7 @@ export function PhotosModal(props: PhotosModalProps) {
 				detailRef.current = null;
 				setDetailPath(null); // the photo under inspection is gone — back to the grid
 			}
+			if (cmpPath === photoPath) setCmpPath(null); // was marked for comparison
 			loadGrid(person);
 			props.onChange();
 		} catch (e) {
@@ -278,6 +348,10 @@ export function PhotosModal(props: PhotosModalProps) {
 	}
 
 	const canDrop = !busy && detailPath === null;
+	// While a photo is marked for comparison the hint line guides the pick.
+	const hintShown = cmpPath
+		? `Pick another photo to compare with "${cmpPath}" — or click its compare button again to cancel.`
+		: hint;
 
 	return (
 		<Modal
@@ -339,7 +413,7 @@ export function PhotosModal(props: PhotosModalProps) {
 			}}
 			body={
 				<div class="modal-body">
-					<p class="field-hint" id="photoHint">{hint}</p>
+					<p class={"field-hint" + (cmpPath ? " cmp-hint" : "")} id="photoHint">{hintShown}</p>
 
 					{/* grid view */}
 					{detailPath === null && (
@@ -350,8 +424,10 @@ export function PhotosModal(props: PhotosModalProps) {
 										key={ph.path}
 										person={props.person ?? ""}
 										ph={ph}
+										cmpMark={cmpPath === ph.path}
 										onOpen={() => openDetail(ph.path)}
 										onDelete={() => deletePhoto(ph.path)}
+										onCompare={() => pickComparePath(ph.path)}
 									/>
 								))}
 							</ul>
@@ -398,6 +474,17 @@ export function PhotosModal(props: PhotosModalProps) {
 							<p class={"photo-verdict" + (verdictWarn ? " warn" : "")} id="photoVerdict" aria-live="polite">{verdict}</p>
 							<div class="photo-actions">
 								<button type="button" class="btn btn-ghost" id="photoThumbBtn" onClick={setAsAvatar}>Set as avatar</button>
+								<button
+									type="button"
+									class="btn btn-ghost"
+									id="photoCompareBtn"
+									title={cmpPath === detailPath
+										? "Photo A selected — click again to cancel"
+										: "Compare this photo with another enrolled photo"}
+									onClick={compareFromDetail}
+								>
+									Compare faces…
+								</button>
 								<button type="button" class="btn btn-ghost photo-remove" id="photoDelBtn" onClick={() => detailPath && deletePhoto(detailPath)}>Remove photo</button>
 							</div>
 						</div>
@@ -413,17 +500,20 @@ export function PhotosModal(props: PhotosModalProps) {
 }
 
 // One grid tile; a photo missing from the people folder (legacy DB entry)
-// degrades to a disabled "unavailable" tile.
+// degrades to a disabled "unavailable" tile. The compare button marks the
+// photo as photo A of a face-to-face comparison (second pick launches).
 function PhotoTile(props: {
 	person: string;
 	ph: PersonPhoto;
+	cmpMark: boolean;
 	onOpen: () => void;
 	onDelete: () => void;
+	onCompare: () => void;
 }) {
 	const [broken, setBroken] = useState(false);
 	const ph = props.ph;
 	return (
-		<li class="photo-tile">
+		<li class={"photo-tile" + (props.cmpMark ? " cmp-mark" : "")}>
 			<button
 				type="button"
 				class="photo-tile"
@@ -435,6 +525,29 @@ function PhotoTile(props: {
 					? "unavailable"
 					: <img alt={ph.path} src={api.photoURL(props.person, ph.path)} onError={() => setBroken(true)} />}
 			</button>
+			<button
+				type="button"
+				class="photo-tile-cmp"
+				aria-label={`Compare ${ph.path} with another photo`}
+				aria-pressed={props.cmpMark}
+				title={props.cmpMark
+					? "Photo A selected — click again to cancel, or pick another photo"
+					: "Compare with another photo"}
+				onClick={(e) => { e.stopPropagation(); props.onCompare(); }}
+			>
+				<svg viewBox="0 0 48 48" aria-hidden="true">
+					<path
+						d="M15 8h-5a2 2 0 0 0-2 2v5M33 8h5a2 2 0 0 1 2 2v5M15 40h-5a2 2 0 0 1-2-2v-5M33 40h5a2 2 0 0 0 2-2v-5"
+						fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"
+					/>
+					<circle cx="24" cy="21" r="5" fill="none" stroke="currentColor" stroke-width="2.6" />
+					<path
+						d="M15 36c2-4.5 5.4-6 9-6s7 1.6 9 6"
+						fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"
+					/>
+				</svg>
+			</button>
+			{props.cmpMark && <span class="cmp-badge">A</span>}
 			<button
 				type="button"
 				class="photo-tile-del"

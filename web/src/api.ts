@@ -128,6 +128,20 @@ export function photoURL(name: string, path: string): string {
 	return `/api/people/${encodeURIComponent(name)}/photos/${encodeURIComponent(path)}`;
 }
 
+// Fetch an enrolled photo's bytes as a File (admin route; 401-aware) so
+// server-side photos can feed tools that upload files, e.g. the compare tool.
+// Photo paths are folder-relative basenames, so the File name is meaningful.
+export async function fetchPhotoFile(name: string, path: string): Promise<File> {
+	const r = await fetch(photoURL(name, path));
+	if (r.status === 401) {
+		onUnauthorized?.();
+		throw new UnauthorizedError("authentication required");
+	}
+	if (!r.ok) throw new Error("could not load the photo");
+	const blob = await r.blob();
+	return new File([blob], path, { type: blob.type || "image/jpeg" });
+}
+
 export async function detectPhoto(name: string, path: string): Promise<DetectResponse> {
 	const r = await fetch(photoURL(name, path) + "/detect");
 	return expectJSON(r, "detection failed");

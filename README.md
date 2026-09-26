@@ -209,7 +209,12 @@ it reports how similar their faces are. The largest face of each photo is
 detected, aligned and embedded, and the two embeddings' **cosine similarity**
 is shown with a "likely same / different person" verdict against the match
 threshold. This works entirely without the enrolled-people database, so you
-can e.g. check whether two `unknown` photos show the same person.
+can e.g. check whether two `unknown` photos show the same person. The same
+check can be launched straight from the enrollment modal (compare buttons on
+the pending-photo thumbnails) and from the photos manager (compare buttons on
+the photo tiles and a *Compare faces…* button in the photo detail view): the
+first pick marks photo A, the second pick runs the comparison — both photos
+always come from the photos the modal currently shows.
 
 #### REST API
 

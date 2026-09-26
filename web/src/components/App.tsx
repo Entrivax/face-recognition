@@ -15,7 +15,7 @@ import { PeoplePanel } from "./PeoplePanel";
 import { EnrollModal, type EnrollPasteTarget } from "./EnrollModal";
 import { PhotosModal } from "./PhotosModal";
 import { FaceCheckModal } from "./FaceCheckModal";
-import { CompareModal, type ComparePasteTarget } from "./CompareModal";
+import { CompareModal, type ComparePasteTarget, type CompareSeed } from "./CompareModal";
 import { LoginModal } from "./LoginModal";
 import { PasskeysModal } from "./PasskeysModal";
 
@@ -36,6 +36,9 @@ export function App() {
 	// ---- modal state ----
 	const [enrollOpen, setEnrollOpen] = useState(false);
 	const [compareOpen, setCompareOpen] = useState(false);
+	// Both photos of a comparison launched from the enroll or photos modal
+	// (picked there); CompareModal consumes the seed when it opens.
+	const [compareSeed, setCompareSeed] = useState<CompareSeed | null>(null);
 	const [photosName, setPhotosName] = useState<string | null>(null);
 	const [checkView, setCheckView] = useState<CheckView | null>(null);
 	const [loginOpen, setLoginOpen] = useState(false);
@@ -187,6 +190,14 @@ export function App() {
 		}
 	};
 
+	// A comparison launched from another modal (enroll pending thumbs /
+	// photos-manager grid): both photos were picked there and are handed
+	// over as a seed — CompareModal fills its slots and auto-runs.
+	const openCompareSeeded = useCallback((a: File, b: File) => {
+		setCompareSeed({ a, b });
+		setCompareOpen(true);
+	}, []);
+
 	// ---- keyboard: Escape closes the topmost open dialog ----
 	useEffect(() => {
 		const onKey = (e: KeyboardEvent) => {
@@ -205,11 +216,12 @@ export function App() {
 	}, [enrollVisible, compareVisible, photosPerson, checkView, loginOpen, passkeysOpen, editOpen]);
 
 	// ---- clipboard routing ----
-	// Ctrl+V / Cmd+V routes by context: with the enroll modal open, pasted
-	// images join the review list; with the photos manager open they upload
-	// straight into that person; with the compare modal open they fill its
-	// photo slots; otherwise (including when logged out — the admin targets
-	// are unavailable then) they are inspected on the stage.
+	// Ctrl+V / Cmd+V routes by context: with the compare modal open it sits
+	// on top of whichever modal launched it (or standalone), so it wins the
+	// clipboard; with the enroll modal open, pasted images join the review
+	// list; with the photos manager open they upload straight into that
+	// person; otherwise (including when logged out — the admin targets are
+	// unavailable then) they are inspected on the stage.
 	// While the stage photo editor is open, pasted images are swallowed —
 	// the editor sits over the stage and its session must not be reset under
 	// the user. Plain-text pastes into inputs are never hijacked.
@@ -232,7 +244,10 @@ export function App() {
 			}
 
 			const enroll = enrollPasteRef.current;
-			if (enrollVisible && enroll) {
+			if (compareVisible && comparePasteRef.current) {
+				if (comparePasteRef.current.isBusy()) return;
+				comparePasteRef.current.addFiles(files);
+			} else if (enrollVisible && enroll) {
 				if (enroll.isBusy()) return;
 				enroll.addPending(files);
 				enroll.pulseDrop();
@@ -240,9 +255,6 @@ export function App() {
 				toast.show(`Added ${plural(files.length)} from clipboard.`, "ok");
 			} else if (photosPerson !== null && photosAddRef.current) {
 				photosAddRef.current(files);
-			} else if (compareVisible && comparePasteRef.current) {
-				if (comparePasteRef.current.isBusy()) return;
-				comparePasteRef.current.addFiles(files);
 			} else {
 				inspectRef.current?.(files[0]);
 				if (files.length > 1) toast.show("Clipboard had several images — inspecting the first.");
@@ -298,6 +310,7 @@ export function App() {
 				onChange={refreshAll}
 				onCheck={setCheckView}
 				onCheckFaces={onCheckFaces}
+				onComparePhotos={openCompareSeeded}
 				registerPasteTarget={registerPasteTarget}
 			/>
 
@@ -306,6 +319,7 @@ export function App() {
 				onCloseRequest={() => setPhotosName(null)}
 				onRenamed={setPhotosName}
 				onChange={refreshAll}
+				onComparePhotos={openCompareSeeded}
 				registerAddFiles={registerAddFiles}
 			/>
 
@@ -313,6 +327,8 @@ export function App() {
 				open={compareVisible}
 				onCloseRequest={() => setCompareOpen(false)}
 				registerPasteTarget={registerComparePaste}
+				seed={compareSeed}
+				onSeedConsumed={() => setCompareSeed(null)}
 			/>
 
 			<FaceCheckModal view={checkView} onCloseRequest={() => setCheckView(null)} />

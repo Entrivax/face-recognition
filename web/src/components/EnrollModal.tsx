@@ -5,6 +5,10 @@
 // pending photo immediately gets a server-side face check (sequential —
 // inference is a single serialized stream) so the user sees the detected
 // faces before committing to enrollment.
+//
+// Any two pending photos can also be compared face-to-face: each thumb has
+// a compare button — the first click marks the photo (A), the second pick
+// launches the compare modal with both, auto-running the similarity check.
 
 import { useEffect, useRef, useState } from "preact/hooks";
 import type { TargetedEvent } from "preact";
@@ -45,6 +49,8 @@ interface EnrollModalProps {
 	onCheck: (view: CheckView) => void;
 	/** live-update the viewer when a check finishes for the photo it shows */
 	onCheckFaces: (src: string, faces: Face[]) => void;
+	/** compare two pending photos face-to-face (opens the compare modal) */
+	onComparePhotos: (a: File, b: File) => void;
 	registerPasteTarget: (t: EnrollPasteTarget | null) => void;
 }
 
@@ -60,6 +66,10 @@ export function EnrollModal(props: EnrollModalProps) {
 
 	const pendingRef = useRef<PendingPhoto[]>([]);
 	const enrollingRef = useRef(false);
+	// Pending photo currently marked as photo A of a comparison (ref mirrors
+	// the state for imperative closures, as with pending).
+	const cmpKeyRef = useRef<string | null>(null);
+	const [cmpKey, setCmpKey] = useState<string | null>(null);
 	const nameInputRef = useRef<HTMLInputElement | null>(null);
 	const dropInputRef = useRef<HTMLInputElement | null>(null);
 	const thumbsRef = useRef<HTMLUListElement | null>(null);
@@ -82,6 +92,11 @@ export function EnrollModal(props: EnrollModalProps) {
 		setPending([]);
 	};
 
+	const setCmpKeyBoth = (key: string | null) => {
+		cmpKeyRef.current = key;
+		setCmpKey(key);
+	};
+
 	const setBusy = (b: boolean) => {
 		enrollingRef.current = b;
 		setEnrolling(b);
@@ -91,6 +106,7 @@ export function EnrollModal(props: EnrollModalProps) {
 	useEffect(() => {
 		clearPending();
 		setSubmitMeta(null);
+		setCmpKeyBoth(null);
 		if (props.open) setName("");
 	}, [props.open]);
 
@@ -161,7 +177,28 @@ export function EnrollModal(props: EnrollModalProps) {
 		const i = pendingRef.current.findIndex((p) => p.file === file);
 		if (i < 0) return;
 		URL.revokeObjectURL(pendingRef.current[i].url);
+		if (cmpKeyRef.current === pendingRef.current[i].key) setCmpKeyBoth(null);
 		setPendingBoth((prev) => prev.filter((p) => p.file !== file));
+	}
+
+	// ---- compare two pending photos ----
+	// First pick marks the photo as photo A; picking the marked photo again
+	// cancels; picking a different photo hands both to the compare modal,
+	// which fills its slots and auto-runs the similarity check.
+	function pickCompare(p: PendingPhoto) {
+		if (enrollingRef.current) return;
+		if (!cmpKeyRef.current) {
+			setCmpKeyBoth(p.key);
+			toast.show(`${p.file.name} set as photo A — pick another photo to compare.`, "ok");
+			return;
+		}
+		if (cmpKeyRef.current === p.key) {
+			setCmpKeyBoth(null);
+			return;
+		}
+		const a = pendingRef.current.find((x) => x.key === cmpKeyRef.current);
+		setCmpKeyBoth(null);
+		if (a) props.onComparePhotos(a.file, p.file);
 	}
 
 	const close = () => {
@@ -323,8 +360,10 @@ export function EnrollModal(props: EnrollModalProps) {
 							<EnrollThumb
 								key={p.key}
 								p={p}
+								cmpMark={cmpKey === p.key}
 								onRemove={() => removePending(p.file)}
 								onInspect={() => props.onCheck({ src: p.url, title: p.file.name, faces: p.faces })}
+								onCompare={() => pickCompare(p)}
 							/>
 						))}
 					</ul>
@@ -343,11 +382,15 @@ export function EnrollModal(props: EnrollModalProps) {
 }
 
 // One pending-photo tile: preview with a face-check overlay canvas, status
-// badge, and remove button. Clicking the tile inspects the faces full-size.
+// badge, compare button (marks the photo as photo A of a face-to-face
+// comparison) and remove button. Clicking the tile inspects the faces
+// full-size; clicks on the corner buttons never trigger the inspect action.
 function EnrollThumb(props: {
 	p: PendingPhoto;
+	cmpMark: boolean;
 	onRemove: () => void;
 	onInspect: () => void;
+	onCompare: () => void;
 }) {
 	const { p } = props;
 	const imgRef = useRef<HTMLImageElement | null>(null);
@@ -378,14 +421,15 @@ function EnrollThumb(props: {
 
 	return (
 		<li
-			class={"enroll-thumb" + (p.failed ? " failed" : "")}
+			class={"enroll-thumb" + (p.failed ? " failed" : "") + (props.cmpMark ? " cmp-mark" : "")}
 			tabIndex={0}
 			title="Click to inspect faces"
 			onClick={(e) => {
-				if ((e.target as Element).closest?.(".enroll-thumb-del")) return;
+				if ((e.target as Element).closest?.(".enroll-thumb-del, .enroll-thumb-cmp")) return;
 				props.onInspect();
 			}}
 			onKeyDown={(e) => {
+				if ((e.target as Element).closest?.(".enroll-thumb-del, .enroll-thumb-cmp")) return;
 				if (e.key === "Enter" || e.key === " ") { e.preventDefault(); props.onInspect(); }
 			}}
 		>
@@ -394,6 +438,29 @@ function EnrollThumb(props: {
 				<canvas ref={canvasRef} />
 			</div>
 			<span class={badgeCls}>{badgeText}</span>
+			<button
+				type="button"
+				class="enroll-thumb-cmp"
+				aria-label={`Compare ${p.file.name} with another photo`}
+				aria-pressed={props.cmpMark}
+				title={props.cmpMark
+					? "Photo A selected — click again to cancel, or pick another photo"
+					: "Compare with another pending photo"}
+				onClick={props.onCompare}
+			>
+				<svg viewBox="0 0 48 48" aria-hidden="true">
+					<path
+						d="M15 8h-5a2 2 0 0 0-2 2v5M33 8h5a2 2 0 0 1 2 2v5M15 40h-5a2 2 0 0 1-2-2v-5M33 40h5a2 2 0 0 0 2-2v-5"
+						fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"
+					/>
+					<circle cx="24" cy="21" r="5" fill="none" stroke="currentColor" stroke-width="2.6" />
+					<path
+						d="M15 36c2-4.5 5.4-6 9-6s7 1.6 9 6"
+						fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"
+					/>
+				</svg>
+			</button>
+			{props.cmpMark && <span class="cmp-badge">A</span>}
 			<button
 				type="button"
 				class="enroll-thumb-del"

@@ -4,6 +4,9 @@
 // matched against the enrolled-people database. Photos can be added by
 // browse, drag & drop, or paste; the result shows the similarity, a meter,
 // and a "same person?" verdict against the recognizer's threshold.
+// The tool is also opened seeded from the enroll and photos modals: both
+// photos are picked there (pending thumbs / enrolled grid) and handed over
+// as a { a, b } seed — the comparison auto-runs when the modal opens.
 
 import { useEffect, useRef, useState } from "preact/hooks";
 import * as api from "../api";
@@ -19,10 +22,22 @@ export interface ComparePasteTarget {
 	isBusy: () => boolean;
 }
 
+// Both photos of a comparison launched from another modal (enroll pending
+// thumbs / photos-manager grid). Compare builds its own preview URLs from
+// these and revokes them when the modal closes.
+export interface CompareSeed {
+	a: File;
+	b: File;
+}
+
 interface CompareModalProps {
 	open: boolean;
 	onCloseRequest: () => void;
 	registerPasteTarget: (t: ComparePasteTarget | null) => void;
+	/** photos picked in the opening modal; consumed once on open */
+	seed?: CompareSeed | null;
+	/** clears App's seed state after it has been applied */
+	onSeedConsumed?: () => void;
 }
 
 interface Slot {
@@ -62,6 +77,8 @@ export function CompareModal(props: CompareModalProps) {
 	};
 
 	// Fresh tool each time the modal opens; revoke the previews when it closes.
+	// A seeded open (both photos picked in the launching modal) fills both
+	// slots immediately and auto-runs the comparison.
 	useEffect(() => {
 		if (!props.open) {
 			revoke(slotsRef.current.a);
@@ -69,7 +86,17 @@ export function CompareModal(props: CompareModalProps) {
 			setSlotsBoth({ a: null, b: null });
 			setResult(null);
 			setBusyBoth(false);
+			return;
 		}
+		const seed = props.seed;
+		if (!seed || !seed.a || !seed.b) return;
+		setSlotsBoth({
+			a: { file: seed.a, url: URL.createObjectURL(seed.a) },
+			b: { file: seed.b, url: URL.createObjectURL(seed.b) },
+		});
+		setResult(null);
+		props.onSeedConsumed?.();
+		compare(); // slotsRef was set synchronously above
 	}, [props.open]);
 
 	// Replace one slot's contents (null removes). Any change invalidates the
