@@ -110,6 +110,17 @@ export function EnrollModal(props: EnrollModalProps) {
 		if (props.open) setName("");
 	}, [props.open]);
 
+	const dirty = props.open && (pending.length > 0 || name.trim() !== "");
+	useEffect(() => {
+		if (!dirty) return;
+		const onUnload = (e: BeforeUnloadEvent) => {
+			e.preventDefault();
+			e.returnValue = ""; // legacy Chrome/Safari; modern engines ignore custom text
+		};
+		window.addEventListener("beforeunload", onUnload);
+		return () => window.removeEventListener("beforeunload", onUnload);
+	}, [dirty]);
+
 	// ---- paste/drop routing surface (registered with App) ----
 	useEffect(() => {
 		props.registerPasteTarget({
