@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         recogn — hover capture
 // @namespace    recogn.hover-capture
-// @version      1.3.1
+// @version      1.4.0
 // @description  Press Alt+R for full-screen capture mode: click any image or video to send its current frame to your local recogn server; recognised faces are drawn over the element until you clear them.
 // @author       recogn
 // @license      MIT
@@ -29,8 +29,11 @@
  * click: the current frame is drawn to a canvas and POSTed to your local
  * recogn server (POST /api/recognize, JPEG body), and every recognised face
  * is drawn over that element with the web UI's corner-bracket style. The
- * shield stays up for scanning several media in a row; clicking an
- * already-annotated one re-scans it in place (e.g. a fresh video frame).
+ * hit-test descends into open shadow roots, so media rendered by web
+ * components is scanned like any other (closed roots are hidden from script
+ * and stay out of reach). The shield stays up for scanning several media in
+ * a row; clicking an already-annotated one re-scans it in place (e.g. a
+ * fresh video frame).
  * While a scan is in flight a pixel shimmer (ported from the repo's
  * shimmer-animation.html demo) blooms over the media being scanned and
  * shrinks away when the pill resolves; prefers-reduced-motion skips it.
@@ -70,6 +73,11 @@
  *      away when the pill resolves (result or error); re-clicking restarts
  *      it; squares fade with proximity to the centre; prefers-reduced-motion
  *      skips it.
+ *  10. Web components: media rendered inside an open shadow root scans like
+ *      light-DOM media (nested shadow roots included); boxes and pill track
+ *      the inner element, and object-fit/crop handling carries over.
+ *  11. Typing in a shadow-DOM input: Escape there must not clear overlays
+ *      and Alt+R must not toggle capture mode while the field keeps the keys.
  */
 
 (function () {
@@ -280,9 +288,13 @@
 	}
 
 	function onKeyDown(e) {
+		// Shadow retargeting: seen from outside a shadow tree, e.target is the
+		// host — composedPath()[0] is the real deepest target, so isEditable
+		// also catches editors living inside web components.
+		const real = (e.composedPath && e.composedPath()[0]) || e.target;
 		if (e.key === "Escape") {
 			// Full reset: leave capture mode and clear every result overlay.
-			if ((overlays.size || shield) && !isEditable(e.target)) {
+			if ((overlays.size || shield) && !isEditable(real)) {
 				e.preventDefault();
 				e.stopPropagation();
 				clearAllOverlays();
@@ -290,7 +302,7 @@
 			}
 			return;
 		}
-		if (e.repeat || !hotkeyMatches(e) || isEditable(e.target)) return;
+		if (e.repeat || !hotkeyMatches(e) || isEditable(real)) return;
 		e.preventDefault();
 		e.stopPropagation();
 		toggleShield();
@@ -298,18 +310,59 @@
 
 	// ---- target lookup ----
 
-	// elementsFromPoint lists everything under the point, topmost first; walk
-	// past the shield, decorations and our own HUD to the first real IMG/VIDEO.
+	// Readiness checks shared by the hit-walk and its fallback.
+	function mediaReady(el) {
+		if (el.tagName === "IMG") return el.complete && el.naturalWidth > 0 && el.clientWidth > 0;
+		if (el.tagName === "VIDEO") return el.readyState >= 2 && el.videoWidth > 0 && el.clientWidth > 0;
+		return false;
+	}
+
+	// document.elementsFromPoint retargets at shadow boundaries: over content
+	// a web component rendered into its shadow tree it hands back only the
+	// host. To reach that media, descend into every open shadowRoot along the
+	// way — each root has its own elementsFromPoint — pushing a host's shadow
+	// hits before the host itself, since shadow content paints above it. The
+	// result is the full hit stack in paint order. Closed roots can't be
+	// pierced (shadowRoot is null to script), so their media stays out of
+	// reach; roots without elementsFromPoint fall back to a containment scan.
+	function elementsAt(x, y) {
+		const seen = new Set();
+		const out = [];
+		const visit = (root) => {
+			if (typeof root.elementsFromPoint === "function") {
+				let stack;
+				try { stack = root.elementsFromPoint(x, y) || []; } catch (_) { return; }
+				for (const el of stack) {
+					if (!el || seen.has(el)) continue;
+					seen.add(el);
+					if (el.shadowRoot) visit(el.shadowRoot);
+					out.push(el);
+				}
+			} else if (root !== document) {
+				// Engines without ShadowRoot.elementsFromPoint: approximate —
+				// ready media whose rect contains the point, tree order
+				// standing in for the paint order we can't observe.
+				for (const el of root.querySelectorAll("img, video")) {
+					if (seen.has(el) || !mediaReady(el)) continue;
+					const r = el.getBoundingClientRect();
+					if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+						seen.add(el);
+						out.push(el);
+					}
+				}
+			}
+		};
+		visit(document);
+		return out;
+	}
+
+	// Walk the stack past the shield, decorations and our own HUD to the
+	// first real IMG/VIDEO.
 	function findTarget(x, y) {
 		if (x < 0 || y < 0) return null;
-		const stack = document.elementsFromPoint(x, y) || [];
-		for (const el of stack) {
+		for (const el of elementsAt(x, y)) {
 			if (!el || el.closest(".rcg-hud, .rcg-shield, .rcg-toasts")) continue;
-			if (el.tagName === "IMG") {
-				if (el.complete && el.naturalWidth > 0 && el.clientWidth > 0) return el;
-			} else if (el.tagName === "VIDEO") {
-				if (el.readyState >= 2 && el.videoWidth > 0 && el.clientWidth > 0) return el;
-			}
+			if (mediaReady(el)) return el;
 		}
 		return null;
 	}
