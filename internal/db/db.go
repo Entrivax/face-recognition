@@ -39,13 +39,48 @@ type Photo struct {
 	Embedding []float32 `json:"embedding"` // 512-d ArcFace embedding
 }
 
+// BirthDate is a partially-known birthdate: any component may be nil when
+// unknown (pointers, not zero sentinels, so stored values survive
+// round-trips). Range and calendar validation happens in the API layer; the
+// store is deliberately permissive.
+type BirthDate struct {
+	Year  *int `json:"year,omitempty"`
+	Month *int `json:"month,omitempty"`
+	Day   *int `json:"day,omitempty"`
+}
+
+// PersonMeta is the optional descriptive metadata kept for a person and
+// consulted by the UI's details view. Everything is optional; a meta with no
+// content at all is stored as nil so records stay clean. It travels on the
+// Person record (same bbolt bucket / JSON interchange), which means a rescan
+// or photo change cannot lose it, a rename keeps it, and removing the person
+// removes it with the record.
+type PersonMeta struct {
+	Aliases     []string   `json:"aliases,omitempty"`
+	Birth       *BirthDate `json:"birthdate,omitempty"`
+	URLs        []string   `json:"urls,omitempty"`
+	Description string     `json:"description,omitempty"`
+}
+
+// IsEmpty reports whether m carries no content at all.
+func (m *PersonMeta) IsEmpty() bool {
+	if m == nil {
+		return true
+	}
+	if m.Birth != nil && (m.Birth.Year != nil || m.Birth.Month != nil || m.Birth.Day != nil) {
+		return false
+	}
+	return m.Description == "" && len(m.Aliases) == 0 && len(m.URLs) == 0
+}
+
 // Person is one enrolled identity.
 type Person struct {
-	ID       string  `json:"id"`
-	Name     string  `json:"name"`
-	Photos   []Photo `json:"photos"`
-	Thumb    string  `json:"thumb,omitempty"`     // face thumbnail sidecar file name in ThumbDir
-	ThumbSrc string  `json:"thumb_src,omitempty"` // enrolled photo the thumbnail was generated from
+	ID       string      `json:"id"`
+	Name     string      `json:"name"`
+	Photos   []Photo     `json:"photos"`
+	Thumb    string      `json:"thumb,omitempty"`     // face thumbnail sidecar file name in ThumbDir
+	ThumbSrc string      `json:"thumb_src,omitempty"` // enrolled photo the thumbnail was generated from
+	Meta     *PersonMeta `json:"meta,omitempty"`      // optional descriptive metadata (aliases, birthdate, URLs, description)
 }
 
 // DB is the on-disk face database plus its in-memory mirror. The zero value
@@ -239,7 +274,12 @@ func (d *DB) importJSONIfNeeded() error {
 			if id == "" {
 				id = newID(p.Name)
 			}
-			v, err := json.Marshal(Person{ID: id, Name: p.Name, Thumb: p.Thumb, ThumbSrc: p.ThumbSrc})
+			// Copy the parsed record (metadata included); photos go into
+			// their own bucket below, so the people record stays lean.
+			rec := *p
+			rec.ID = id
+			rec.Photos = nil
+			v, err := json.Marshal(rec)
 			if err != nil {
 				return err
 			}
@@ -343,13 +383,34 @@ func (d *DB) SetThreshold(t float64) error {
 // copyPersonLocked returns a deep copy of p for handing to callers: the
 // Photos slice gets its own backing array, so a reader iterating (or
 // mutating) the copy never races the in-place writes addPhoto/RemovePhoto
-// perform on the live mirror (SECURITY-REVIEW.md M6). The caller must hold
-// d.mu (at least RLock). Embedding backing arrays stay shared on purpose:
-// the store never mutates an embedding after the Photo is created.
+// perform on the live mirror (SECURITY-REVIEW.md M6), and the Meta struct is
+// duplicated with fresh Aliases/URLs backing arrays for the same reason. The
+// caller must hold d.mu (at least RLock). Embedding backing arrays stay
+// shared on purpose: the store never mutates an embedding after the Photo is
+// created.
 func copyPersonLocked(p *Person) *Person {
 	cp := *p
 	cp.Photos = append([]Photo(nil), p.Photos...)
+	cp.Meta = cloneMeta(p.Meta)
 	return &cp
+}
+
+// cloneMeta duplicates a PersonMeta value (struct + Aliases/URLs slices +
+// BirthDate struct), returning nil for nil/empty input. Used both for the
+// copies handed to callers and for storing caller-supplied values so the
+// mirror never aliases data the caller may still mutate.
+func cloneMeta(m *PersonMeta) *PersonMeta {
+	if m == nil {
+		return nil
+	}
+	c := *m
+	c.Aliases = append([]string(nil), m.Aliases...)
+	c.URLs = append([]string(nil), m.URLs...)
+	if m.Birth != nil {
+		b := *m.Birth
+		c.Birth = &b
+	}
+	return &c
 }
 
 // People returns a copy of all people, sorted by name.
@@ -442,7 +503,13 @@ func (d *DB) addPhoto(name, relPath, hash string, embedding []float32) error {
 			return fmt.Errorf("%w: %q (in use by %q)", ErrIDTaken, person.ID, other.Name)
 		}
 	} else {
-		person = Person{ID: p.ID, Name: p.Name, Thumb: p.Thumb, ThumbSrc: p.ThumbSrc}
+		// Copy the stored record (name, thumbnail fields, metadata) rather
+		// than rebuilding it field-by-field: a rebuild here would silently
+		// drop whatever the record gained since it was written (person
+		// metadata, e.g.). Photos live in their own bucket, never in the
+		// people record.
+		person = *p
+		person.Photos = nil
 	}
 	rec, err := json.Marshal(person)
 	if err != nil {
@@ -538,6 +605,36 @@ func (d *DB) RemovePerson(name string) (bool, error) {
 	return true, nil
 }
 
+// SetMeta replaces the optional metadata of the named person (matched
+// case-insensitively). A meta with no content at all is stored as nil so
+// records stay clean. The record copy pattern matters here: the persisted
+// record must carry everything the mirror entry has (thumbnails, metadata),
+// not just the fields this method touches. Returns the updated person
+// (deep copy). Errors: ErrPersonNotFound, or a wrapped persistence failure.
+//
+// Field validation (ranges, URL schemes, sizes) happens in the API layer;
+// the store is deliberately permissive.
+func (d *DB) SetMeta(name string, m *PersonMeta) (*Person, error) {
+	m = cloneMeta(m)
+	if m.IsEmpty() {
+		m = nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	p := d.findLocked(name)
+	if p == nil {
+		return nil, ErrPersonNotFound
+	}
+	rec := *p
+	rec.Meta, rec.Photos = m, nil
+	if err := d.putPersonLocked(rec); err != nil {
+		return nil, err
+	}
+	// Disk commit succeeded; update the in-memory mirror.
+	p.Meta = m
+	return copyPersonLocked(p), nil
+}
+
 // ThumbDir returns the sidecar directory holding face thumbnails, located
 // next to the database file (data/thumbs for a DB at data/faces.db).
 func (d *DB) ThumbDir() string {
@@ -594,7 +691,12 @@ func (d *DB) RenamePerson(oldName, newName string) (*Person, error) {
 			thumb, thumbSrc = "", ""
 		}
 	}
-	rec, err := json.Marshal(Person{ID: id, Name: newName, Thumb: thumb, ThumbSrc: thumbSrc})
+	// The new record copies the old one (keeping metadata) with the identity
+	// and thumbnail fields updated; photos stay in their own bucket.
+	record := *p
+	record.ID, record.Name, record.Thumb, record.ThumbSrc = id, newName, thumb, thumbSrc
+	record.Photos = nil
+	rec, err := json.Marshal(record)
 	if err != nil {
 		return nil, err
 	}
@@ -662,7 +764,10 @@ func (d *DB) SetThumbnail(personID string, jpg []byte, srcPhotoPath string) erro
 	if err := os.WriteFile(filepath.Join(dir, fileName), jpg, 0o644); err != nil {
 		return fmt.Errorf("write thumbnail: %w", err)
 	}
-	rec := Person{ID: p.ID, Name: p.Name, Thumb: fileName, ThumbSrc: srcPhotoPath}
+	// Copy the stored record (metadata included) and update the thumbnail
+	// fields; photos live in their own bucket.
+	rec := *p
+	rec.Thumb, rec.ThumbSrc, rec.Photos = fileName, srcPhotoPath, nil
 	if err := d.putPersonLocked(rec); err != nil {
 		return err
 	}
@@ -698,7 +803,11 @@ func (d *DB) ClearThumbnail(personID string) error {
 	if p.Thumb != "" {
 		_ = os.Remove(filepath.Join(d.ThumbDir(), p.Thumb)) // best-effort
 	}
-	if err := d.putPersonLocked(Person{ID: p.ID, Name: p.Name}); err != nil {
+	// Copy the stored record (metadata included) and clear the thumbnail
+	// fields.
+	rec := *p
+	rec.Thumb, rec.ThumbSrc, rec.Photos = "", "", nil
+	if err := d.putPersonLocked(rec); err != nil {
 		return err
 	}
 	p.Thumb, p.ThumbSrc = "", ""

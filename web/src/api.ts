@@ -15,10 +15,12 @@ import type {
 	EnrollFaceResponse,
 	EnrollResponse,
 	Health,
+	MetaUpdate,
 	OkResponse,
 	PasskeysResponse,
 	PeopleResponse,
 	PersonDetail,
+	PersonPhotosResponse,
 	PublicKeyCredentialJSON,
 	RenameResponse,
 	RecognizeResponse,
@@ -84,9 +86,30 @@ export async function setThreshold(value: number): Promise<Config> {
 	return expectJSON(r, "could not set the threshold");
 }
 
+// Public person details: name, optional metadata (aliases, partial
+// birthdate, URLs, markdown description) and the photo count. Enrolled photo
+// paths are not part of this document — the photos manager uses
+// getPersonPhotos (admin).
 export async function getPerson(name: string): Promise<PersonDetail> {
 	const r = await fetch(`/api/people/${encodeURIComponent(name)}`);
+	return expectJSON(r, "could not load person details");
+}
+
+// Admin photos-manager payload: enrolled photo paths + hashes + thumb_src.
+export async function getPersonPhotos(name: string): Promise<PersonPhotosResponse> {
+	const r = await fetch(`/api/people/${encodeURIComponent(name)}/photos`);
 	return expectJSON(r, "could not load photos");
+}
+
+// Replace a person's metadata (admin; full-replace: omitted/empty fields
+// clear the stored value). Returns the refreshed public details document.
+export async function setPersonMeta(name: string, meta: MetaUpdate): Promise<PersonDetail> {
+	const r = await fetch(`/api/people/${encodeURIComponent(name)}/meta`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify(meta),
+	});
+	return expectJSON(r, "could not save the details");
 }
 
 export async function recognize(file: File): Promise<RecognizeResponse> {

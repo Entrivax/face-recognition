@@ -78,6 +78,12 @@ web/                     the front-end: Preact + TypeScript, built by Vite
     api.ts               typed fetch wrappers for /api/* (422-on-enroll not
                          thrown); throws Error(j.error || fallback) otherwise
     overlay.ts           shared drawFaces canvas renderer (corner brackets)
+    markdown.ts          marked + DOMPurify sanitizer for the details modal's
+                         markdown description (links forced to noopener)
+    birthdate.ts         birthdate text template (YYYY-MM-DD / YYYY--DD /
+                         YYYY-MM / YYYY / -MM-DD / -MM-), parse/serialize and
+                         the age (≈ when partial) + days-to-birthday math
+                         (UTC, Feb 29 → Mar 1 on non-leap years)
     util.ts              fmtSize, initials, clipboard helpers
     modalStack.ts        Escape-stack registry (topmost modal closes first)
     toast.tsx            ToastProvider + useToast context
@@ -93,11 +99,16 @@ web/                     the front-end: Preact + TypeScript, built by Vite
                          multi-step undo–redo; always re-derives from the
                          stage's pristine original and restores the last
                          session per file (reset on any new upload)
-      PeoplePanel.tsx    enrolled-people list, search, threshold slider, rescan
+      PeoplePanel.tsx    enrolled-people list, search (names + aliases, with
+                         aka hints), threshold slider, rescan
       Modal.tsx          shared modal shell: backdrop, focus trap, focus
                          save/restore, Escape-stack membership, busy lock
       EnrollModal.tsx    enroll modal + pre-submit face-check chain
-      PhotosModal.tsx    photos manager (grid + detail, add/delete/avatar/rename)
+      PersonModal.tsx    person details modal (public): aliases, partial
+                         birthdate, URLs, markdown description; admins edit
+                         inline and reach the photos manager from here
+      PhotosModal.tsx    photos manager (grid + detail, add/delete/avatar/rename;
+                         opens from the person details modal)
       FaceCheckModal.tsx enlarged face-check viewer (read-only, stacked)
       CompareModal.tsx   admin compare tool: two photo slots → face-to-face
                          cosine similarity (no identity DB; POST /api/compare)
@@ -276,7 +287,9 @@ command hits a permission error.
 - **Front-end is Preact + TypeScript, built by Vite** — sources live under
   `web/`, the build lands in `internal/web/dist/` and is embedded by
   `go:embed all:dist` (`internal/web/web.go`). Build with `make ui`
-  (npm ci + `tsc --noEmit && vite build`; needs Node ≥ 20). During UI work run
+  (npm ci + `tsc --noEmit && vite build`; needs Node ≥ 20; frontend deps
+  beyond preact are deliberately tiny: `marked` + `dompurify` for the
+  details modal's markdown). During UI work run
   `npm --prefix web run dev` for the Vite dev server on :5173 — it proxies
   `/api` to the Go server on :8080, so no rebuild is needed for API-side
   checks. Architecture notes:
@@ -324,7 +337,13 @@ command hits a permission error.
   append-shift, pinned by `internal/db/alias_test.go`
   incl. a `-race` probe). `Photo.Embedding` backing arrays stay shared —
   the store never mutates an embedding after the Photo is created; keep it
-  that way or the copies stop being safe.
+  that way or the copies stop being safe. Optional person metadata
+  (`Person.Meta` — aliases/birthdate/URLs/markdown description) rides on the
+  person record: every site that rebuilds a record for persistence
+  (`addPhoto`'s existing branch, `RenamePerson`, `SetThumbnail`,
+  `ClearThumbnail`, the JSON import) must **copy the stored record** instead
+  of assembling a fresh struct literal, or the metadata is silently wiped —
+  pinned by `TestMetaSurvivesMutations`.
 - Embeddings are stripped from API/CLI JSON output (`Face.Embedding` is `json:"-"`
   or nil-ed) — don't leak 512-float arrays to clients.
 - **API request bodies are capped**: 32 MiB (`maxUpload`) on `/api/recognize`
@@ -359,7 +378,8 @@ command hits a permission error.
   builds the auth service; admin routes (enroll, people/photo mutations,
   `POST /api/config`, face comparison, full-res photo serving) sit behind an
   auth middleware.
-  Public: `/api/recognize`, `GET /api/people`, `/api/thumbs/{id}.jpg`,
+  Public: `/api/recognize`, `GET /api/people`, `GET /api/people/{name}`
+  (the public details document), `/api/thumbs/{id}.jpg`,
   `/api/health`, and the auth endpoints — but passkey **registration** is
   refused (403) while open mode lasts (see "Secure the admin surface" above).
   Passkey credentials persist in

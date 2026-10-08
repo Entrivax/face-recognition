@@ -13,6 +13,7 @@ import { Topbar } from "./Topbar";
 import { Stage } from "./Stage";
 import { PeoplePanel } from "./PeoplePanel";
 import { EnrollModal, type EnrollPasteTarget } from "./EnrollModal";
+import { PersonModal } from "./PersonModal";
 import { PhotosModal } from "./PhotosModal";
 import { FaceCheckModal } from "./FaceCheckModal";
 import { CompareModal, type ComparePasteTarget, type CompareSeed } from "./CompareModal";
@@ -39,6 +40,9 @@ export function App() {
 	// Both photos of a comparison launched from the enroll or photos modal
 	// (picked there); CompareModal consumes the seed when it opens.
 	const [compareSeed, setCompareSeed] = useState<CompareSeed | null>(null);
+	// Clicking a person opens the (public) details modal; the admin photos
+	// manager opens from there, stacked on top.
+	const [detailsName, setDetailsName] = useState<string | null>(null);
 	const [photosName, setPhotosName] = useState<string | null>(null);
 	const [checkView, setCheckView] = useState<CheckView | null>(null);
 	const [loginOpen, setLoginOpen] = useState(false);
@@ -211,9 +215,9 @@ export function App() {
 	useEffect(() => {
 		document.body.classList.toggle(
 			"modal-open",
-			enrollVisible || compareVisible || photosPerson !== null || checkView !== null || loginOpen || passkeysOpen || editOpen,
+			enrollVisible || compareVisible || detailsName !== null || photosPerson !== null || checkView !== null || loginOpen || passkeysOpen || editOpen,
 		);
-	}, [enrollVisible, compareVisible, photosPerson, checkView, loginOpen, passkeysOpen, editOpen]);
+	}, [enrollVisible, compareVisible, detailsName, photosPerson, checkView, loginOpen, passkeysOpen, editOpen]);
 
 	// ---- clipboard routing ----
 	// Ctrl+V / Cmd+V routes by context: with the compare modal open it sits
@@ -296,7 +300,7 @@ export function App() {
 					threshold={threshold}
 					onThresholdCommit={commitThreshold}
 					onRescan={doRescan}
-					onOpenPhotos={setPhotosName}
+					onOpenPerson={setDetailsName}
 					onRemove={removePerson}
 					onEnrollClick={() => setEnrollOpen(true)}
 					onCompareClick={() => setCompareOpen(true)}
@@ -314,10 +318,24 @@ export function App() {
 				registerPasteTarget={registerPasteTarget}
 			/>
 
+			<PersonModal
+				person={detailsName}
+				authed={authed}
+				thumb={detailsName ? people.find((p) => p.name === detailsName)?.thumb ?? null : null}
+				onCloseRequest={() => setDetailsName(null)}
+				onManagePhotos={setPhotosName}
+				onChange={refreshAll}
+			/>
+
 			<PhotosModal
 				person={photosPerson}
 				onCloseRequest={() => setPhotosName(null)}
-				onRenamed={setPhotosName}
+				onRenamed={(canonical) => {
+					// The rename happened in the photos manager; the details
+					// modal underneath follows the person too.
+					setPhotosName(canonical);
+					setDetailsName((d) => (d !== null ? canonical : d));
+				}}
 				onChange={refreshAll}
 				onComparePhotos={openCompareSeeded}
 				registerAddFiles={registerAddFiles}
