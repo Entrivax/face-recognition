@@ -113,14 +113,18 @@ export function PersonModal(props: PersonModalProps) {
 	// ---- view helpers ----
 	const meta = detail;
 	const birthText = formatBirthTextual(meta?.birthdate);
+	// The same date in dashed numeric form (YYYY-MM-DD when complete).
+	const birthIso = formatBirthText(meta?.birthdate);
 	const birthExtra = birthAgeLine(meta?.birthdate);
 	const hasMeta = !!(meta && ((meta.aliases?.length ?? 0) > 0 || birthText ||
 		(meta.urls?.length ?? 0) > 0 || (meta.description ?? "") !== ""));
 
 	function startEdit() {
 		if (busyRef.current || editing || !detail) return;
-		setAliases([...(detail.aliases ?? [])]);
-		setUrls([...(detail.urls ?? [])]);
+		// The lists keep one trailing empty row as the always-ready slot;
+		// blank rows (including that slot) are filtered out before saving.
+		setAliases([...(detail.aliases ?? []), ""]);
+		setUrls([...(detail.urls ?? []), ""]);
 		setBirthField(formatBirthText(detail.birthdate));
 		setDescription(detail.description ?? "");
 		setEditing(true);
@@ -131,14 +135,20 @@ export function PersonModal(props: PersonModalProps) {
 		setEditing(false);
 	}
 
-	// Row editors (aliases / URLs): one input per entry with a remove button.
-	function setRowAt(list: string[], set: (v: string[]) => void, i: number, v: string) {
+	// Row editors (aliases / URLs): one input per entry plus a permanent
+	// trailing empty row — no "add" button. Filling the ready row spawns the
+	// next empty one, and removing rows keeps the ready slot at the end.
+	// Blank rows (including the ready slot) are dropped before saving.
+	function rowInput(list: string[], set: (v: string[]) => void, i: number, v: string) {
 		const next = [...list];
 		next[i] = v;
+		if (i === list.length - 1 && v.trim() !== "") next.push("");
 		set(next);
 	}
-	function removeRowAt(list: string[], set: (v: string[]) => void, i: number) {
-		set(list.filter((_, j) => j !== i));
+	function rowRemove(list: string[], set: (v: string[]) => void, i: number) {
+		const next = list.filter((_, j) => j !== i);
+		if (next.length === 0 || next[next.length - 1].trim() !== "") next.push("");
+		set(next);
 	}
 
 	const saveEdit = async (e: Event) => {
@@ -183,6 +193,7 @@ export function PersonModal(props: PersonModalProps) {
 	const metaRows = (
 		list: string[],
 		set: (v: string[]) => void,
+		label: string,
 		placeholder: string,
 		maxLength: number,
 	) => (
@@ -194,25 +205,25 @@ export function PersonModal(props: PersonModalProps) {
 						value={val}
 						placeholder={placeholder}
 						maxLength={maxLength}
+						aria-label={label}
 						autocomplete="off"
 						spellcheck={false}
 						disabled={busyState}
-						onInput={(e) => setRowAt(list, set, i, e.currentTarget.value)}
+						onInput={(e) => rowInput(list, set, i, e.currentTarget.value)}
 					/>
-					<button
-						type="button"
-						class="meta-row-del"
-						aria-label="Remove entry"
-						disabled={busyState}
-						onClick={() => removeRowAt(list, set, i)}
-					>
-						×
-					</button>
+					{!(i === list.length - 1 && val.trim() === "") && (
+						<button
+							type="button"
+							class="meta-row-del"
+							aria-label="Remove entry"
+							disabled={busyState}
+							onClick={() => rowRemove(list, set, i)}
+						>
+							×
+						</button>
+					)}
 				</div>
 			))}
-			<button type="button" class="btn btn-ghost btn-sm" disabled={busyState} onClick={() => set([...list, ""])}>
-				+ Add {placeholder.startsWith("http") ? "URL" : "alias"}
-			</button>
 		</div>
 	);
 
@@ -272,7 +283,10 @@ export function PersonModal(props: PersonModalProps) {
 									{birthText && (
 										<section class="person-section">
 											<h3 class="person-section-label">Born</h3>
-											<p class="person-birth">{birthText}</p>
+											<p class="person-birth">
+												{birthText}
+												{birthIso && <span class="person-birth-iso"> ({birthIso})</span>}
+											</p>
 											{birthExtra && <p class="person-birth-extra">{birthExtra}</p>}
 										</section>
 									)}
@@ -309,7 +323,7 @@ export function PersonModal(props: PersonModalProps) {
 						<form id="personMetaForm" class="person-edit" ref={formRef} onSubmit={saveEdit}>
 							<label class="person-field">
 								<span class="person-field-label">Aliases</span>
-								{metaRows(aliases, setAliases, "Alias", 120)}
+								{metaRows(aliases, setAliases, "Alias", "Alias", 120)}
 							</label>
 
 							<label class="person-field">
@@ -329,7 +343,7 @@ export function PersonModal(props: PersonModalProps) {
 
 							<label class="person-field">
 								<span class="person-field-label">Links — http(s) URLs</span>
-								{metaRows(urls, setUrls, "https://…", 2048)}
+								{metaRows(urls, setUrls, "URL", "https://…", 2048)}
 							</label>
 
 							<label class="person-field">
