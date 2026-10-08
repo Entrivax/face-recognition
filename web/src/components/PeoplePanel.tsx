@@ -1,8 +1,10 @@
 // Right panel: the enrolled-people list (with search filter), the match
 // threshold slider, the enroll entry point, and the people-folder rescan.
-// The gallery itself is public (the list endpoint is); the threshold,
-// rescan, enroll, remove and open-photos controls are admin-only and only
-// render while logged in.
+// The gallery itself is public (the list endpoint is): clicking a person —
+// logged in or not — opens the person details modal. The threshold, rescan,
+// enroll, remove and open-photos controls are admin-only and only render
+// while logged in. The filter matches names and aliases; when only an alias
+// matched, the row shows that alias ("aka") so the hit explains itself.
 
 import { useEffect, useState } from "preact/hooks";
 import type { TargetedEvent } from "preact";
@@ -18,7 +20,7 @@ interface PeoplePanelProps {
 	threshold: number;
 	onThresholdCommit: (v: number) => void;
 	onRescan: () => Promise<void>;
-	onOpenPhotos: (name: string) => void;
+	onOpenPerson: (name: string) => void;
 	onRemove: (name: string) => void;
 	onEnrollClick: () => void;
 	onCompareClick: () => void;
@@ -28,7 +30,7 @@ export function PeoplePanel(props: PeoplePanelProps) {
 	const {
 		authed,
 		people, peopleErr, threshold, onRescan,
-		onOpenPhotos, onRemove,
+		onOpenPerson, onRemove,
 	} = props;
 
 	const [query, setQuery] = useState("");
@@ -45,9 +47,16 @@ export function PeoplePanel(props: PeoplePanelProps) {
 			? `${count} ${count === 1 ? "person" : "people"} in the database`
 			: "No one enrolled yet.";
 
-	// Case-insensitive substring filter; an all-filtered-out list shows a hint row.
+	// Case-insensitive substring filter across names and aliases; when only
+	// an alias matched, the row displays it (aka) so the hit is explainable.
+	// An all-filtered-out list shows a hint row.
 	const q = query.trim().toLowerCase();
-	const filtered = q ? people.filter((p) => p.name.toLowerCase().includes(q)) : people;
+	const filtered = q
+		? people.flatMap((p) => {
+				const m = rowMatch(p, q);
+				return m ? [{ p, aka: m.aka }] : [];
+			})
+		: people.map((p) => ({ p, aka: null as string | null }));
 	const noMatch = q !== "" && count > 0 && filtered.length === 0;
 
 	const doRescan = async () => {
@@ -118,8 +127,8 @@ export function PeoplePanel(props: PeoplePanelProps) {
 			</div>
 
 			<ul id="peopleList" class="people-list">
-				{filtered.map((p) => (
-					<PersonRow key={p.id} person={p} authed={authed} onOpen={onOpenPhotos} onRemove={onRemove} />
+				{filtered.map(({ p, aka }) => (
+					<PersonRow key={p.id} person={p} aka={aka} authed={authed} onOpen={onOpenPerson} onRemove={onRemove} />
 				))}
 				{noMatch && <li class="people-nomatch">No people match “{query.trim()}”.</li>}
 			</ul>
@@ -141,47 +150,53 @@ export function PeoplePanel(props: PeoplePanelProps) {
 	);
 }
 
+/**
+ * rowMatch reports how a row matches the (lowercased) query: null when it
+ * doesn't match at all, {aka: null} when the name matched (nothing extra to
+ * show), {aka: alias} when only an alias matched — the row then displays it.
+ * (The name-match and no-match cases must be distinguishable: collapsing
+ * them into one null filtered out every name-matched row.)
+ */
+function rowMatch(p: PersonSummary, q: string): { aka: string | null } | null {
+	if (p.name.toLowerCase().includes(q)) return { aka: null };
+	const a = (p.aliases ?? []).find((al) => al.toLowerCase().includes(q));
+	return a ? { aka: a } : null;
+}
+
 function PersonRow(props: {
 	person: PersonSummary;
+	/** matching alias, when the query hit an alias but not the name */
+	aka: string | null;
 	authed: boolean;
 	onOpen: (name: string) => void;
 	onRemove: (name: string) => void;
 }) {
 	const p = props.person;
-	const authed = props.authed;
+	// Every row opens the (public) person details modal; the remove button
+	// stays admin-only.
 	return (
 		<li class="person-row">
-			{authed ? (
-				<button
-					type="button"
-					class="person-avatar-btn"
-					title="Manage photos"
-					aria-label={`Manage photos for ${p.name}`}
-					onClick={() => props.onOpen(p.name)}
-				>
-					<Avatar src={p.thumb} name={p.name} />
-				</button>
-			) : (
-				<span class="person-avatar-holder"><Avatar src={p.thumb} name={p.name} /></span>
-			)}
-			{authed ? (
-				<button
-					type="button"
-					class="person-open"
-					title="Manage photos"
-					aria-label={`Manage photos for ${p.name}`}
-					onClick={() => props.onOpen(p.name)}
-				>
-					<span class="person-name">{p.name}</span>
-					<span class="person-count">{p.photos} photo(s)</span>
-				</button>
-			) : (
-				<span class="person-open static">
-					<span class="person-name">{p.name}</span>
-					<span class="person-count">{p.photos} photo(s)</span>
-				</span>
-			)}
-			{authed && (
+			<button
+				type="button"
+				class="person-avatar-btn"
+				title="View details"
+				aria-label={`View details for ${p.name}`}
+				onClick={() => props.onOpen(p.name)}
+			>
+				<Avatar src={p.thumb} name={p.name} />
+			</button>
+			<button
+				type="button"
+				class="person-open"
+				title="View details"
+				aria-label={`View details for ${p.name}`}
+				onClick={() => props.onOpen(p.name)}
+			>
+				<span class="person-name">{p.name}</span>
+				<span class="person-count">{p.photos} photo(s)</span>
+				{props.aka && <span class="person-aka">aka {props.aka}</span>}
+			</button>
+			{props.authed && (
 				<button
 					class="person-del"
 					title={`Remove ${p.name}`}

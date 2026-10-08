@@ -231,6 +231,185 @@ func TestExportRoundTrip(t *testing.T) {
 	}
 }
 
+// metaFixture is the metadata used across the meta tests.
+func metaFixture() *PersonMeta {
+	y, mo, d := 1965, 3, 2
+	return &PersonMeta{
+		Aliases:     []string{"A. Smith", "Smitty"},
+		Birth:       &BirthDate{Year: &y, Month: &mo, Day: &d},
+		URLs:        []string{"https://example.com/alice", "https://archive.org/interview"},
+		Description: "Birth name **Alicia**; see [notes](https://example.org).",
+	}
+}
+
+func TestSetMetaRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "faces.db")
+	d, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = d.AddPhoto("Alice", "a/1.jpg", []byte("x"), []float32{1})
+
+	if _, err := d.SetMeta("nobody", metaFixture()); !errors.Is(err, ErrPersonNotFound) {
+		t.Errorf("unknown person: expected ErrPersonNotFound, got %v", err)
+	}
+	if p := d.Get("Alice"); p.Meta != nil {
+		t.Fatalf("fresh person should have no metadata: %+v", p.Meta)
+	}
+
+	upd, err := d.SetMeta("alice", metaFixture())
+	if err != nil {
+		t.Fatalf("SetMeta: %v", err)
+	}
+	if upd.Meta == nil || len(upd.Meta.Aliases) != 2 {
+		t.Fatalf("updated person missing metadata: %+v", upd.Meta)
+	}
+	// Case-insensitive lookup; the returned copy must not alias the store.
+	if p := d.Get("ALICE"); p.Meta == nil || len(p.Meta.URLs) != 2 {
+		t.Fatalf("meta not readable: %+v", p.Meta)
+	}
+	// An all-empty meta normalizes to nil (no stub records).
+	empty := &PersonMeta{}
+	if _, err := d.SetMeta("Alice", empty); err != nil {
+		t.Fatal(err)
+	}
+	if p := d.Get("Alice"); p.Meta != nil {
+		t.Errorf("empty meta should be stored as nil, got %+v", p.Meta)
+	}
+
+	// Persistence: reopen and verify the meta survived.
+	_ = d.Close()
+	d2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d2.Close()
+	p := d2.Get("Alice")
+	if p.Meta != nil {
+		t.Errorf("empty meta should not persist as a record: %+v", p.Meta)
+	}
+	if _, err := d2.SetMeta("Alice", metaFixture()); err != nil {
+		t.Fatal(err)
+	}
+	_ = d2.Close()
+	d3, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d3.Close()
+	p = d3.Get("Alice")
+	if p.Meta == nil || len(p.Meta.Aliases) != 2 || p.Meta.Description == "" {
+		t.Fatalf("meta lost after reopen: %+v", p.Meta)
+	}
+	if p.Meta.Birth == nil || p.Meta.Birth.Year == nil || *p.Meta.Birth.Year != 1965 ||
+		p.Meta.Birth.Month == nil || *p.Meta.Birth.Month != 3 || p.Meta.Birth.Day == nil || *p.Meta.Birth.Day != 2 {
+		t.Errorf("birthdate not round-tripped: %+v", p.Meta.Birth)
+	}
+}
+
+// TestMetaSurvivesMutations pins the record-copy rule: every mutating method
+// must persist the whole stored record, not a struct literal rebuilt from the
+// fields it touches — otherwise a photo add, rename or thumbnail change would
+// silently wipe the metadata.
+func TestMetaSurvivesMutations(t *testing.T) {
+	d := openTemp(t)
+	_ = d.AddPhoto("Alice", "a/1.jpg", []byte("x"), []float32{1})
+	if _, err := d.SetMeta("Alice", metaFixture()); err != nil {
+		t.Fatal(err)
+	}
+	want := func() *PersonMeta { return d.Get("Alice").Meta }
+
+	// Adding / replacing / removing photos.
+	if err := d.AddPhoto("Alice", "a/2.jpg", []byte("y"), []float32{2}); err != nil {
+		t.Fatal(err)
+	}
+	_ = d.AddPhoto("Alice", "a/1.jpg", []byte("z"), []float32{3})
+	if ok, err := d.RemovePhoto("Alice", "a/2.jpg"); !ok || err != nil {
+		t.Fatalf("RemovePhoto: %v %v", ok, err)
+	}
+	if got := want(); got == nil || len(got.Aliases) != 2 {
+		t.Errorf("AddPhoto/RemovePhoto lost metadata: %+v", got)
+	}
+
+	// Thumbnail sidecar changes.
+	p := d.Get("Alice")
+	if err := d.SetThumbnail(p.ID, []byte("jpg"), "a/1.jpg"); err != nil {
+		t.Fatal(err)
+	}
+	if got := want(); got == nil || len(got.Aliases) != 2 {
+		t.Errorf("SetThumbnail lost metadata: %+v", got)
+	}
+	if err := d.ClearThumbnail(p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := want(); got == nil || len(got.Aliases) != 2 {
+		t.Errorf("ClearThumbnail lost metadata: %+v", got)
+	}
+
+	// A rename (ID change) keeps the metadata.
+	if _, err := d.RenamePerson("Alice", "Alicia"); err != nil {
+		t.Fatal(err)
+	}
+	if got := d.Get("Alicia").Meta; got == nil || len(got.Aliases) != 2 {
+		t.Errorf("RenamePerson lost metadata: %+v", got)
+	}
+}
+
+// TestMetaCopyIsolation extends TestGetReturnsCopy to the metadata slices:
+// mutating a handout must not touch the stored record (or other handouts).
+func TestMetaCopyIsolation(t *testing.T) {
+	d := openTemp(t)
+	_ = d.AddPhoto("Alice", "a/1.jpg", []byte("x"), []float32{1})
+	if _, err := d.SetMeta("Alice", metaFixture()); err != nil {
+		t.Fatal(err)
+	}
+	p := d.Get("Alice")
+	p.Meta.Aliases[0] = "MUTATED"
+	p.Meta.URLs = append(p.Meta.URLs, "https://mutated.example")
+	p.Meta.Birth.Year = nil
+	p2 := d.Get("Alice")
+	if p2.Meta.Aliases[0] != "A. Smith" || len(p2.Meta.URLs) != 2 || p2.Meta.Birth.Year == nil {
+		t.Errorf("stored meta was mutated through a handout: %+v", p2.Meta)
+	}
+	// And mutating one handout must not affect another.
+	if p.Meta.Aliases[0] != "MUTATED" || p.Meta.Birth.Year != nil {
+		t.Errorf("handout is not an independent copy: %+v", p.Meta)
+	}
+}
+
+// TestExportImportMeta checks the JSON interchange carries the metadata in
+// both directions: exports include it, and importing a file with metadata
+// restores it (the import must persist the whole record, not a field
+// subset).
+func TestExportImportMeta(t *testing.T) {
+	dir1, dir2 := t.TempDir(), t.TempDir()
+	d, err := Open(filepath.Join(dir1, "faces.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = d.AddPhoto("Alice", "a/1.jpg", []byte("x"), []float32{1})
+	if _, err := d.SetMeta("Alice", metaFixture()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.ExportTo(filepath.Join(dir2, "embeddings.json")); err != nil {
+		t.Fatal(err)
+	}
+	_ = d.Close()
+
+	d2, err := Open(filepath.Join(dir2, "faces.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d2.Close()
+	p := d2.Get("Alice")
+	if p.Meta == nil || len(p.Meta.Aliases) != 2 || len(p.Meta.URLs) != 2 || p.Meta.Description == "" {
+		t.Fatalf("metadata lost across export/import: %+v", p.Meta)
+	}
+	if p.Meta.Birth == nil || p.Meta.Birth.Month == nil || *p.Meta.Birth.Month != 3 {
+		t.Errorf("birthdate lost across export/import: %+v", p.Meta.Birth)
+	}
+}
+
 func TestExportDefaultPath(t *testing.T) {
 	d := openTemp(t)
 	if err := d.AddPhoto("Alice", "a/1.jpg", []byte("x"), []float32{1}); err != nil {

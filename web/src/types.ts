@@ -45,6 +45,8 @@ export interface PersonSummary {
 	photos: number;
 	embeddings: number;
 	thumb: string;
+	/** aliases (public metadata) — the list filter matches them and shows an aka hint */
+	aliases?: string[];
 }
 
 export interface PeopleResponse {
@@ -57,11 +59,46 @@ export interface PersonPhoto {
 	hash: string;
 }
 
+/** Partial birthdate: any component may be null when unknown. */
+export interface BirthDate {
+	year?: number | null;
+	month?: number | null;
+	day?: number | null;
+}
+
+/** Optional descriptive metadata about a person (all fields optional). */
+export interface PersonMeta {
+	aliases?: string[];
+	birthdate?: BirthDate;
+	urls?: string[];
+	description?: string;
+}
+
+/** GET /api/people/{name} — public details view (no enrolled photo paths). */
 export interface PersonDetail {
+	id: string;
+	name: string;
+	photos: number;
+	aliases?: string[];
+	birthdate?: BirthDate;
+	urls?: string[];
+	description?: string;
+}
+
+/** GET /api/people/{name}/photos — admin photos-manager payload. */
+export interface PersonPhotosResponse {
 	id: string;
 	name: string;
 	thumb_src: string;
 	photos: PersonPhoto[];
+}
+
+/** POST /api/people/{name}/meta body — full-replace semantics. */
+export interface MetaUpdate {
+	aliases?: string[];
+	birthdate?: BirthDate | null;
+	urls?: string[];
+	description?: string;
 }
 
 export interface Match {

@@ -189,7 +189,9 @@ func TestAuthAnonymousAdminRoutesReturn401(t *testing.T) {
 		body   io.Reader // io.Reader (not *bytes.Buffer) so nil stays a nil interface
 		ct     string
 	}{
-		{"person detail", http.MethodGet, "/api/people/Alice", nil, ""},
+		// GET /api/people/{name} is the public details view — not admin.
+		{"set meta", http.MethodPost, "/api/people/Alice/meta", bytes.NewBufferString(`{"aliases":["Bob"]}`), "application/json"},
+		{"person photos", http.MethodGet, "/api/people/Alice/photos", nil, ""},
 		{"photo file", http.MethodGet, "/api/people/Alice/photos/" + photo, nil, ""},
 		{"photo detect", http.MethodGet, "/api/people/Alice/photos/" + photo + "/detect", nil, ""},
 		{"enroll person", http.MethodPost, "/api/people/Alice/enroll", body, ct},

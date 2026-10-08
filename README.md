@@ -221,8 +221,10 @@ always come from the photos the modal currently shows.
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `POST` | `/api/recognize` | multipart `image` → `{count, faces:[{bbox,name,person_id,confidence,score,landmarks,matches}]}` — `matches` ranks every identity above the threshold (best per person); near-tied top scores hint at duplicate people. `?draw=1` responds with the annotated JPEG (numbered boxes + labels) instead of JSON |
-| `GET`  | `/api/people` | list enrolled people + photo counts (incl. `thumb` URL when a face thumbnail exists) |
-| `GET`  | `/api/people/{name}` | one person's enrolled photos (`thumb_src` = photo the avatar comes from) |
+| `GET`  | `/api/people` | list enrolled people + photo counts (incl. `thumb` URL when a face thumbnail exists, and `aliases` when the person has metadata) |
+| `GET`  | `/api/people/{name}` | one person's public **details document**: `{id, name, photos:<count>, aliases?, birthdate?, urls?, description?}` — optional metadata only, no enrolled photo paths; never-filled fields are omitted |
+| `GET`  | `/api/people/{name}/photos` | one person's enrolled photos (`thumb_src` = photo the avatar comes from) — the photos manager's payload |
+| `POST` | `/api/people/{name}/meta` | replace a person's metadata — JSON `{"aliases": [...], "birthdate": {"year","month","day"}, "urls": [...], "description": "<markdown>"}`; every field optional, omitted/empty fields clear the stored value (full-replace). Validation: aliases deduped (max 20 × 120 chars), URLs must be absolute `http(s)` (max 50 × 2048), birthdate parts are range-checked with a day requiring a month or year (max year 2100; a complete date must exist on the calendar), description max 20 000 chars |
 | `POST` | `/api/people/{name}/enroll` | add photo(s) (field `images`) for a new/existing person; each enrolled image is also saved into `people/<name>/` |
 | `POST` | `/api/people/{name}/enroll-face` | enroll one specific face of an uploaded photo: multipart `image` + `face_index` (1-based, in the detection order `/api/recognize` reports) — used by the UI's "name this face" action on unknown results |
 | `GET`  | `/api/people/{name}/photos/{path}` | one of the person's enrolled photo files (from the people folder) |
@@ -257,8 +259,8 @@ configured**. With no auth configured the server behaves exactly as before
 
 | Access | Routes |
 |--------|--------|
-| Public | UI recognize stage, `POST /api/recognize`, `GET /api/people` (read-only list incl. `thumb` URLs), `GET /api/thumbs/{id}.jpg`, `GET /api/health`, auth endpoints below |
-| Admin (login) | everything else: enroll/rescan, add/rename/delete people, photo add/delete/detect, thumbnail regen, face comparison (`POST /api/compare`), `GET`/`POST /api/config`, full-resolution enrolled photo files, passkey management |
+| Public | UI recognize stage, `POST /api/recognize`, `GET /api/people` (read-only list incl. `thumb` URLs), `GET /api/people/{name}` (public details document incl. metadata), `GET /api/thumbs/{id}.jpg`, `GET /api/health`, auth endpoints below |
+| Admin (login) | everything else: enroll/rescan, add/rename/delete people, metadata edits (`POST /api/people/{name}/meta`), photo add/delete/detect and the per-person photos list, thumbnail regen, face comparison (`POST /api/compare`), `GET`/`POST /api/config`, full-resolution enrolled photo files, passkey management |
 
 Auth endpoints: `POST /api/login`, `POST /api/logout`, `GET /api/auth/session`,
 `POST /api/auth/passkey/register/begin|finish` (admin),
@@ -351,10 +353,14 @@ JSON fails startup loudly rather than silently starting empty.
 **Face thumbnails**: the first enrolled photo that yields a face also produces
 a square face-crop thumbnail, stored as a sidecar next to the database file
 (`data/thumbs/<person-id>.jpg`) and served at `/api/thumbs/<id>.jpg` — the web
-UI's people list shows it as the person's avatar. Click a person's avatar (or
-row) to open the **photos manager**: a modal listing their enrolled photos
-where you can add more (upload happens immediately) or remove them; deleting
-the avatar's source photo regenerates it from another photo. Clicking a photo
+UI's people list shows it as the person's avatar. Clicking a person (their
+avatar or row) opens the **details modal**: a public view of who they are
+(see *Person metadata* below) plus, for logged-in admins, the entry points
+into managing them — **Edit details** (inline metadata form) and
+**Manage photos** (the photos-manager modal, stacked on top). In the photos
+manager you can add photos (upload happens immediately) or remove them;
+deleting the avatar's source photo regenerates it from another photo.
+Clicking a photo
 runs detection and draws the found face(s) over it, so you can judge whether
 it's a good enrollment shot, and re-select it as the avatar. The enroll modal
 runs the same face check on every photo *before* you confirm, so a photo with
@@ -368,6 +374,25 @@ without re-embedding.
 
 Photos with no detectable face are skipped with a warning, never silently
 poisoning the database.
+
+**Person metadata**: each person carries optional descriptive data — aliases,
+a partial birthdate, a list of reference URLs (SSN records, articles,
+interviews, …) and a free-text markdown description. The birthdate is edited
+in the UI as one text field using a dashed template with `-` for unknown
+slots — `YYYY-MM-DD`, `YYYY--DD` (year + day), `YYYY-MM`, `YYYY`, `-MM-DD`,
+`-MM-` — so any amount of partial info fits. The details modal shows the
+assembled date plus the age (exact for a full date, `≈` for partial ones,
+floored to the start of the month/year when the day/month is unknown) and
+the days until the next birthday when month and day are known. Metadata is
+consulted in the UI by clicking a person in the list (the details modal is
+public; only the
+fields that were actually filled are shown) and edited by admins through the
+modal's **Edit details** form. Under the hood it lives on the person's DB
+record: rescans and photo changes can't lose it, renames and exports carry it
+(`embeddings.json` round-trips it), and deleting the person deletes it with
+the record — re-enrolling their folder starts with empty metadata. The
+details document is served publicly at `GET /api/people/{name}` and written
+(admin-only) via `POST /api/people/{name}/meta`.
 
 ## Notes & tuning
 

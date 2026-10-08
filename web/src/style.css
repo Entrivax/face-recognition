@@ -491,6 +491,122 @@ body.modal-open { overflow: hidden; }
 .rename-row input:focus { outline: none; border-color: var(--accent); }
 .rename-row input:disabled { opacity: 0.6; }
 
+/* ---------- person details modal ---------- */
+.person-detail-head {
+	display: flex; align-items: center; gap: 12px; margin-top: 12px;
+}
+/* the details modal shows a bigger avatar than the list rows */
+.person-detail-head .person-avatar { width: 56px; height: 56px; font-size: 20px; }
+.person-detail-head .person-avatar-img { border-radius: 50%; }
+.person-empty { margin-top: 14px; }
+
+.person-meta-list { margin-top: 16px; display: grid; gap: 16px; }
+.person-section { margin: 0; }
+.person-section-label {
+	margin: 0 0 6px;
+	font-family: var(--mono); font-size: 10.5px; font-weight: 500;
+	text-transform: uppercase; letter-spacing: 1.4px;
+	color: var(--ink-faint);
+}
+.person-aliases { display: flex; flex-wrap: wrap; gap: 6px; }
+.person-alias {
+	font-family: var(--mono); font-size: 11px; color: var(--ink-dim);
+	padding: 3px 9px; border: 1px solid var(--line); border-radius: 999px;
+	background: var(--bg-raise);
+}
+.person-birth { margin: 0; font-size: 13.5px; color: var(--ink); }
+.person-birth-extra {
+	margin: 3px 0 0;
+	font-family: var(--mono); font-size: 11px; color: var(--ink-faint);
+}
+.person-links { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.person-links a {
+	font-family: var(--mono); font-size: 11.5px; color: var(--accent);
+	word-break: break-all; text-underline-offset: 3px;
+}
+.person-links a:hover { text-decoration: underline; }
+
+/* rendered markdown notes */
+.person-prose { font-size: 13.5px; line-height: 1.55; color: var(--ink-dim); }
+.person-prose > :first-child { margin-top: 0; }
+.person-prose > :last-child { margin-bottom: 0; }
+.person-prose h1, .person-prose h2, .person-prose h3, .person-prose h4 {
+	margin: 14px 0 6px; color: var(--ink); font-weight: 600;
+}
+.person-prose h1 { font-size: 16px; }
+.person-prose h2 { font-size: 14.5px; }
+.person-prose h3, .person-prose h4 { font-size: 13.5px; }
+.person-prose p { margin: 0 0 8px; }
+.person-prose ul, .person-prose ol { margin: 0 0 8px; padding-left: 20px; }
+.person-prose li { margin: 2px 0; }
+.person-prose a { color: var(--accent); text-underline-offset: 3px; }
+.person-prose a:hover { text-decoration: underline; }
+.person-prose code {
+	font-family: var(--mono); font-size: 12px;
+	background: var(--bg-raise); border: 1px solid var(--line-soft);
+	border-radius: 4px; padding: 1px 5px;
+}
+.person-prose pre {
+	margin: 0 0 8px; padding: 10px 12px; overflow-x: auto;
+	background: var(--bg-panel); border: 1px solid var(--line-soft); border-radius: 8px;
+}
+.person-prose pre code { background: none; border: none; padding: 0; }
+.person-prose blockquote {
+	margin: 0 0 8px; padding: 4px 12px;
+	border-left: 3px solid var(--line); color: var(--ink-faint);
+}
+.person-prose img { max-width: 100%; border-radius: 8px; }
+.person-prose table { border-collapse: collapse; }
+.person-prose th, .person-prose td { border: 1px solid var(--line-soft); padding: 4px 8px; }
+
+/* inline metadata edit form */
+.person-edit { display: grid; gap: 16px; margin-top: 12px; }
+.person-field { display: block; }
+.person-field-label {
+	display: block; margin: 0 0 6px;
+	font-family: var(--mono); font-size: 11px; font-weight: 500;
+	text-transform: uppercase; letter-spacing: 1.4px;
+	color: var(--ink-faint);
+}
+.meta-rows { display: grid; gap: 6px; }
+.meta-row { display: flex; align-items: center; gap: 6px; }
+.meta-row input {
+	flex: 1; min-width: 0;
+	background: var(--bg-raise); border: 1px solid var(--line);
+	border-radius: 8px; color: var(--ink);
+	padding: 8px 12px; font-family: var(--display); font-size: 13px;
+}
+.meta-row input:focus { outline: none; border-color: var(--accent); }
+.meta-row input:disabled { opacity: 0.6; }
+.meta-row-del {
+	width: 28px; height: 28px; flex-shrink: 0;
+	background: none; border: none; cursor: pointer;
+	color: var(--ink-faint); font-size: 15px; line-height: 1;
+	border-radius: 6px;
+}
+.meta-row-del:hover { color: var(--danger); background: var(--unknown-dim); }
+/* single dashed-template birthdate field on the edit form */
+#personBirthText {
+	width: 100%; box-sizing: border-box;
+	background: var(--bg-raise); border: 1px solid var(--line);
+	border-radius: 8px; color: var(--ink);
+	padding: 8px 12px; font-family: var(--mono); font-size: 12.5px;
+}
+#personBirthText:focus { outline: none; border-color: var(--accent); }
+#personBirthText:disabled { opacity: 0.6; }
+.person-birth-hint { margin-top: 5px; }
+#personDescription {
+	width: 100%; box-sizing: border-box; resize: vertical;
+	background: var(--bg-raise); border: 1px solid var(--line);
+	border-radius: 8px; color: var(--ink);
+	padding: 10px 12px; font-family: var(--mono); font-size: 12.5px; line-height: 1.5;
+}
+#personDescription:focus { outline: none; border-color: var(--accent); }
+#personDescription:disabled { opacity: 0.6; }
+
+/* aka hint on a people-list row that matched via an alias */
+.person-aka { font-family: var(--mono); font-size: 10px; color: var(--accent); }
+
 /* review dropzone — compact sibling of the main stage dropzone */
 .enroll-drop {
 	position: relative;
@@ -740,9 +856,9 @@ body.modal-open { overflow: hidden; }
 	font-family: var(--mono); font-size: 11px; color: var(--ink-faint);
 }
 
-/* logged-out people rows: the name/thumb block is static text, not a button */
-.person-open.static, .person-avatar-holder { cursor: default; }
-.person-avatar-holder { display: flex; flex-shrink: 0; }
+/* (the old logged-out .person-open.static / .person-avatar-holder rules went
+   away: every people row is now a clickable button that opens the public
+   person details modal) */
 
 /* ---------- stage photo editor (edit modal) ---------- */
 /* segmented tool tabs — mono uppercase, active state in the match cyan */

@@ -1,9 +1,10 @@
 // Photos manager modal.
-// Opens from a person's row or avatar. Grid view lists their enrolled photos
-// (remove per tile, add via drop/paste/browse); clicking a tile opens the
-// detail view, which runs detection on the stored photo and draws the faces
-// over it so the user can judge the photo's quality. The header carries an
-// inline rename editor; saving renames everything server-side.
+// Opens from the person details modal (admins only): the grid lists their
+// enrolled photos (remove per tile, add via drop/paste/browse); clicking a
+// tile opens the detail view, which runs detection on the stored photo and
+// draws the faces over it so the user can judge the photo's quality. The
+// header carries an inline rename editor; saving renames everything
+// server-side.
 //
 // Any two enrolled photos of this person can be compared face-to-face: each
 // grid tile has a compare button (the detail view has a "Compare faces…"
@@ -105,7 +106,7 @@ export function PhotosModal(props: PhotosModalProps) {
 	async function loadGrid(name: string) {
 		setHint("Loading photos…");
 		try {
-			const j = await api.getPerson(name);
+			const j = await api.getPersonPhotos(name);
 			const list = j.photos || [];
 			setPhotos(list);
 			setHint(list.length
