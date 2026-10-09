@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 )
@@ -470,6 +471,49 @@ func TestAddAndListPeople(t *testing.T) {
 	}
 	if len(people[0].Photos) != 1 || people[0].Photos[0].Embedding[0] != 0.1 {
 		t.Errorf("photo/embedding not stored: %+v", people[0].Photos)
+	}
+}
+
+// TestPeopleSortedCaseAndDiacriticsInsensitive pins the fold order of
+// db.People: names sort case- and accent-insensitively, not by bytes. The
+// names are inserted in byte-sorted order (Béla < Zack < arno < Åsa) while
+// the folded order is arno < Åsa < Béla < Zack (arno < asa < bela < zack), so
+// either a byte-order or an insertion-order accident fails the test.
+func TestPeopleSortedCaseAndDiacriticsInsensitive(t *testing.T) {
+	d := openTemp(t)
+	names := []string{"Béla", "Zack", "arno", "Åsa"}
+	for i, name := range names {
+		path := string(rune('a'+i)) + ".jpg"
+		if err := d.AddPhoto(name, path, []byte("img"), []float32{1}); err != nil {
+			t.Fatalf("AddPhoto(%q): %v", name, err)
+		}
+	}
+	got := make([]string, 0, len(names))
+	for _, p := range d.People() {
+		got = append(got, p.Name)
+	}
+	want := []string{"arno", "Åsa", "Béla", "Zack"}
+	if !slices.Equal(got, want) {
+		t.Errorf("People order = %q, want %q", got, want)
+	}
+}
+
+func TestFoldKey(t *testing.T) {
+	cases := map[string]string{
+		"Émile":   "emile",
+		"Åsa":     "asa",
+		"Béla":    "bela",
+		"Žaneta":  "zaneta",
+		"Jose":    "jose",
+		"JOSÉ":    "jose",
+		"e\u0301": "e", // already-decomposed input (API names may arrive so)
+		"ß":       "ß", // no decomposition: a distinct letter, not a diacritic
+		"":        "",
+	}
+	for in, want := range cases {
+		if got := foldKey(in); got != want {
+			t.Errorf("foldKey(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 

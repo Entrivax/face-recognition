@@ -10,6 +10,7 @@ import { useEffect, useState } from "preact/hooks";
 import type { TargetedEvent } from "preact";
 import type { PersonSummary } from "../types";
 import { Avatar } from "./Avatar";
+import { foldText } from "../util";
 
 interface PeoplePanelProps {
 	/** logged in? gates the admin-only controls (list itself is public) */
@@ -47,10 +48,11 @@ export function PeoplePanel(props: PeoplePanelProps) {
 			? `${count} ${count === 1 ? "person" : "people"} in the database`
 			: "No one enrolled yet.";
 
-	// Case-insensitive substring filter across names and aliases; when only
-	// an alias matched, the row displays it (aka) so the hit is explainable.
-	// An all-filtered-out list shows a hint row.
-	const q = query.trim().toLowerCase();
+	// Case- and diacritics-insensitive substring filter across names and
+	// aliases (foldText: "Émile" matches "emil"); when only an alias matched,
+	// the row displays it (aka) so the hit is explainable. An all-filtered-out
+	// list shows a hint row.
+	const q = foldText(query.trim());
 	const filtered = q
 		? people.flatMap((p) => {
 				const m = rowMatch(p, q);
@@ -151,15 +153,16 @@ export function PeoplePanel(props: PeoplePanelProps) {
 }
 
 /**
- * rowMatch reports how a row matches the (lowercased) query: null when it
+ * rowMatch reports how a row matches the (folded) query: null when it
  * doesn't match at all, {aka: null} when the name matched (nothing extra to
  * show), {aka: alias} when only an alias matched — the row then displays it.
  * (The name-match and no-match cases must be distinguishable: collapsing
- * them into one null filtered out every name-matched row.)
+ * them into one null filtered out every name-matched row.) Both sides are
+ * folded (foldText), so matching is case- and diacritics-insensitive.
  */
 function rowMatch(p: PersonSummary, q: string): { aka: string | null } | null {
-	if (p.name.toLowerCase().includes(q)) return { aka: null };
-	const a = (p.aliases ?? []).find((al) => al.toLowerCase().includes(q));
+	if (foldText(p.name).includes(q)) return { aka: null };
+	const a = (p.aliases ?? []).find((al) => foldText(al).includes(q));
 	return a ? { aka: a } : null;
 }
 

@@ -26,9 +26,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	bolt "go.etcd.io/bbolt"
 	boltErr "go.etcd.io/bbolt/errors"
+	"golang.org/x/text/unicode/norm"
 )
 
 // Photo records one enrolled image and the embedding derived from it. Hash is
@@ -413,16 +415,51 @@ func cloneMeta(m *PersonMeta) *PersonMeta {
 	return &c
 }
 
-// People returns a copy of all people, sorted by name.
+// People returns a copy of all people, sorted by name case- and
+// diacritics-insensitively ("Émile" orders as "emile"). Names whose fold keys
+// tie (possible: EqualFold lookups are diacritics-sensitive, so "Jose" and
+// "José" can coexist) fall back to raw byte order for determinism.
 func (d *DB) People() []Person {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	out := make([]Person, 0, len(d.data.People))
-	for _, p := range d.data.People {
-		out = append(out, *copyPersonLocked(p))
+	// Sort keyed rows (not the values and keys in parallel slices): sort.Slice
+	// permutes the element slice, so a side key array would desync mid-sort.
+	type keyed struct {
+		key    string
+		person Person
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	rows := make([]keyed, 0, len(d.data.People))
+	for _, p := range d.data.People {
+		rows = append(rows, keyed{key: foldKey(p.Name), person: *copyPersonLocked(p)})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].key != rows[j].key {
+			return rows[i].key < rows[j].key
+		}
+		return rows[i].person.Name < rows[j].person.Name
+	})
+	out := make([]Person, len(rows))
+	for i, r := range rows {
+		out[i] = r.person
+	}
 	return out
+}
+
+// foldKey returns a case- and diacritics-insensitive sort key: the string is
+// NFD-decomposed, combining marks dropped, then lowercased ("Émile" →
+// "emile"). Letters that are not accented forms of a base letter (Ø, Ł, Æ,
+// Đ, Þ, ß — they have no decomposition) keep their own place, matching the
+// linguistic notion of a "distinct letter". The web UI folds its search
+// filter the same way (web/src/util.ts foldText).
+func foldKey(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range norm.NFD.String(s) {
+		if !unicode.Is(unicode.Mn, r) {
+			b.WriteRune(r)
+		}
+	}
+	return strings.ToLower(b.String())
 }
 
 // Get returns a person by name (case-insensitive), or nil. The returned

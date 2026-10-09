@@ -27,3 +27,14 @@ export function imageFilesFromClipboard(dt: DataTransfer | null): File[] {
 export function plural(n: number, word = "photo"): string {
 	return `${n} ${word}${n === 1 ? "" : "s"}`;
 }
+
+/**
+ * Case- and diacritics-insensitive form of s for name comparisons: lowercase,
+ * NFD-decompose, drop combining marks ("Émile" → "emile"). Letters that are
+ * not accented forms of a base letter (Ø, Ł, Æ, ß — they have no
+ * decomposition) keep their own place. Mirrors foldKey in internal/db/db.go,
+ * which orders the server-side list the same way.
+ */
+export function foldText(s: string): string {
+	return s.toLowerCase().normalize("NFD").replace(/\p{M}/gu, "");
+}
