@@ -6,6 +6,13 @@
 // inference is a single serialized stream) so the user sees the detected
 // faces before committing to enrollment.
 //
+// An optional collapsed "Person details" section collects the person's
+// metadata (aliases, birthdate, links, notes) — the same fields and edit
+// model as the person-details modal's edit form. It saves right after the
+// photos enroll, through POST /api/people/{name}/meta; for an existing
+// person the stored details are pre-filled first, because that endpoint has
+// full-replace semantics.
+//
 // Any two pending photos can also be compared face-to-face: each thumb has
 // a compare button — the first click marks the photo (A), the second pick
 // launches the compare modal with both, auto-running the similarity check.
@@ -14,12 +21,19 @@ import { useEffect, useRef, useState } from "preact/hooks";
 import type { TargetedEvent } from "preact";
 import * as api from "../api";
 import type { CheckView, Face } from "../types";
+import { BIRTH_FORMATS_HINT, formatBirthText, parseBirthText } from "../birthdate";
 import { drawFaces } from "../overlay";
 import { fmtSize, plural } from "../util";
 import { useToast } from "../toast";
+import { MetaRows } from "./MetaRows";
 import { Modal } from "./Modal";
 
 const NAME_HINT = "Shown as the identity when their face is recognized.";
+
+// Metadata limits mirrored from the server (internal/api/meta.go) so the
+// combined form fails before any photo is sent.
+const MAX_ALIASES = 20;
+const MAX_URLS = 50;
 
 interface PendingPhoto {
 	key: string;
@@ -64,6 +78,19 @@ export function EnrollModal(props: EnrollModalProps) {
 	const [pulse, setPulse] = useState(false); // brief highlight on paste
 	const [submitMeta, setSubmitMeta] = useState<string | null>(null);
 
+	// Optional person details, saved right after the photos enroll (the meta
+	// endpoint needs the person to exist). Same edit model as the person
+	// details modal: row lists with a trailing empty slot, one dashed
+	// birthdate text field, markdown notes.
+	const [aliases, setAliases] = useState<string[]>([""]);
+	const [urls, setUrls] = useState<string[]>([""]);
+	const [birthField, setBirthField] = useState("");
+	const [description, setDescription] = useState("");
+	// Touched = the user edited the details section (vs. a programmatic
+	// pre-fill): the save then carries the fields even when everything is
+	// empty, so clearing a pre-filled value really clears it.
+	const [metaTouched, setMetaTouched] = useState(false);
+
 	const pendingRef = useRef<PendingPhoto[]>([]);
 	const enrollingRef = useRef(false);
 	// Pending photo currently marked as photo A of a comparison (ref mirrors
@@ -71,10 +98,18 @@ export function EnrollModal(props: EnrollModalProps) {
 	const cmpKeyRef = useRef<string | null>(null);
 	const [cmpKey, setCmpKey] = useState<string | null>(null);
 	const nameInputRef = useRef<HTMLInputElement | null>(null);
+	const birthInputRef = useRef<HTMLInputElement | null>(null);
 	const dropInputRef = useRef<HTMLInputElement | null>(null);
 	const thumbsRef = useRef<HTMLUListElement | null>(null);
+	const detailsRef = useRef<HTMLDetailsElement | null>(null);
 	const pulseTimer = useRef<number | undefined>(undefined);
 	const chainRef = useRef<Promise<void>>(Promise.resolve());
+	// Mirrors for the async details pre-fill: a fetched person's details may
+	// only land while the typed name still matches them and the user has not
+	// edited the fields meanwhile.
+	const nameRef = useRef("");
+	const metaTouchedRef = useRef(false);
+	const prefilledRef = useRef<string | null>(null);
 
 	// State + ref are updated together: async checks test membership via the
 	// ref (photos can be removed while their check is queued/in flight).
@@ -102,15 +137,75 @@ export function EnrollModal(props: EnrollModalProps) {
 		setEnrolling(b);
 	};
 
+	const setMetaTouchedBoth = (b: boolean) => {
+		metaTouchedRef.current = b;
+		setMetaTouched(b);
+	};
+
+	// Empty the details section back to a fresh state (one trailing empty
+	// row per list, closed disclosure).
+	const resetDetails = () => {
+		setAliases([""]);
+		setUrls([""]);
+		setBirthField("");
+		setDescription("");
+		setMetaTouchedBoth(false);
+		prefilledRef.current = null;
+		if (detailsRef.current) detailsRef.current.open = false;
+	};
+
+	// User edits mark the section touched; pre-fill never does.
+	const onAliasesChange = (v: string[]) => { setMetaTouchedBoth(true); setAliases(v); };
+	const onUrlsChange = (v: string[]) => { setMetaTouchedBoth(true); setUrls(v); };
+	const onBirthInput = (v: string) => { setMetaTouchedBoth(true); setBirthField(v); };
+	const onDescriptionInput = (v: string) => { setMetaTouchedBoth(true); setDescription(v); };
+
 	// Fresh session each time the modal opens; empty it when it closes.
 	useEffect(() => {
 		clearPending();
 		setSubmitMeta(null);
 		setCmpKeyBoth(null);
-		if (props.open) setName("");
+		if (props.open) {
+			setName("");
+			resetDetails();
+		}
 	}, [props.open]);
 
-	const dirty = props.open && (pending.length > 0 || name.trim() !== "");
+	// Pre-fill the details when the typed name matches an enrolled person:
+	// the meta save is a full-replace, so the form must show exactly what
+	// would be saved. Best-effort — a failed fetch leaves the fields as they
+	// are. When the name stops matching, drop a stale pre-fill unless the
+	// user has edited the fields since (their edits win).
+	useEffect(() => {
+		if (!props.open) return;
+		const trimmed = name.trim();
+		nameRef.current = trimmed;
+		const known = trimmed !== "" &&
+			props.peopleNames.some((x) => x.toLowerCase() === trimmed.toLowerCase());
+		if (!known) {
+			if (prefilledRef.current !== null && !metaTouchedRef.current) resetDetails();
+			return;
+		}
+		let stale = false;
+		api.getPerson(trimmed).then((j) => {
+			if (stale || nameRef.current !== trimmed || metaTouchedRef.current) return;
+			prefilledRef.current = trimmed;
+			setAliases([...(j.aliases ?? []), ""]);
+			setUrls([...(j.urls ?? []), ""]);
+			setBirthField(formatBirthText(j.birthdate));
+			setDescription(j.description ?? "");
+		}).catch(() => {
+			// The save is a full-replace: warn when the section may not show
+			// everything stored for this person, so nothing is wiped unseen.
+			if (stale || nameRef.current !== trimmed) return;
+			toast.show(`Could not load ${trimmed}'s current details — the section below may not show everything stored for them.`, "err");
+		});
+		return () => { stale = true; };
+	}, [name, props.open]);
+
+	const metaFilled = aliases.some((a) => a.trim() !== "") || urls.some((u) => u.trim() !== "") ||
+		birthField.trim() !== "" || description.trim() !== "";
+	const dirty = props.open && (pending.length > 0 || name.trim() !== "" || metaTouched || metaFilled);
 	useEffect(() => {
 		if (!dirty) return;
 		const onUnload = (e: BeforeUnloadEvent) => {
@@ -231,6 +326,33 @@ export function EnrollModal(props: EnrollModalProps) {
 			return;
 		}
 
+		// Validate the details fully client-side so a bad field never sends
+		// the photos; the server re-checks everything when the meta save runs.
+		const birth = parseBirthText(birthField);
+		if (!birth.ok) {
+			toast.show(birth.error, "err");
+			birthInputRef.current?.focus();
+			return;
+		}
+		const parts = birth.parts;
+		const birthdate = parts.year == null && parts.month == null && parts.day == null
+			? null
+			: { year: parts.year ?? null, month: parts.month ?? null, day: parts.day ?? null };
+		const aliasList = aliases.map((a) => a.trim()).filter(Boolean);
+		const urlList = urls.map((u) => u.trim()).filter(Boolean);
+		if (aliasList.length > MAX_ALIASES) {
+			toast.show(`Too many aliases (max ${MAX_ALIASES}).`, "err");
+			return;
+		}
+		if (urlList.length > MAX_URLS) {
+			toast.show(`Too many URLs (max ${MAX_URLS}).`, "err");
+			return;
+		}
+		// A touched section sends even when everything is now empty (a
+		// deliberate clear must clear); otherwise only non-empty fields do.
+		const hasMeta = metaTouched || aliasList.length > 0 || urlList.length > 0 ||
+			birthdate !== null || description.trim() !== "";
+
 		setBusy(true);
 		setSubmitMeta(`Enrolling ${pendingRef.current.length} photo${pendingRef.current.length === 1 ? "" : "s"} for ${person}…`);
 
@@ -239,6 +361,26 @@ export function EnrollModal(props: EnrollModalProps) {
 
 			if (j.added > 0) toast.show(`Enrolled ${j.added} photo${j.added === 1 ? "" : "s"} for ${person}.`, "ok");
 			props.onChange();
+
+			// The details save after the photos because the meta endpoint
+			// needs the person to exist; its failure must not lose the
+			// enrollment result.
+			if (hasMeta && j.added > 0) {
+				setSubmitMeta(`Saving details for ${person}…`);
+				try {
+					await api.setPersonMeta(person, {
+						aliases: aliasList,
+						birthdate,
+						urls: urlList,
+						description,
+					});
+					toast.show("Details saved.", "ok");
+					props.onChange(); // the people list summary carries aliases
+				} catch (err) {
+					const why = (err as Error).message || "could not save the details";
+					toast.show(`Photos enrolled, but the details could not be saved (${why}) — edit them later in the person's details.`, "err");
+				}
+			}
 
 			// Keep the modal open when some photos failed, so they can be swapped.
 			const failures = j.failures || [];
@@ -280,7 +422,7 @@ export function EnrollModal(props: EnrollModalProps) {
 
 	const known = Boolean(name.trim()) && props.peopleNames.some((x) => x.toLowerCase() === name.trim().toLowerCase());
 	const nameHint = known
-		? `${name.trim()} is already enrolled — photos will be added to their profile.`
+		? `${name.trim()} is already enrolled — photos will be added to their profile; their details are pre-filled in the section below.`
 		: NAME_HINT;
 
 	const canDrop = !enrolling;
@@ -324,6 +466,50 @@ export function EnrollModal(props: EnrollModalProps) {
 						onInput={(e) => setName(e.currentTarget.value)}
 					/>
 					<p class={"field-hint" + (known ? " warn" : "")} id="enrollNameHint">{nameHint}</p>
+
+					<details ref={detailsRef} id="enrollDetails" class="enroll-details">
+						<summary>Person details — aliases, birthdate, links, notes (optional)</summary>
+						<div class="enroll-details-body">
+							<div class="enroll-field">
+								<span class="field-label">Aliases</span>
+								<MetaRows entries={aliases} onChange={onAliasesChange} label="Alias" placeholder="Alias" maxLength={120} disabled={enrolling} />
+							</div>
+
+							<div class="enroll-field">
+								<label class="field-label" for="enrollBirth">Birthdate — leave empty if unknown</label>
+								<input
+									ref={birthInputRef}
+									id="enrollBirth"
+									type="text"
+									placeholder="1965-03-02"
+									autocomplete="off"
+									spellcheck={false}
+									disabled={enrolling}
+									value={birthField}
+									onInput={(e) => onBirthInput(e.currentTarget.value)}
+								/>
+								<p class="field-hint">{BIRTH_FORMATS_HINT}</p>
+							</div>
+
+							<div class="enroll-field">
+								<span class="field-label">Links</span>
+								<MetaRows entries={urls} onChange={onUrlsChange} label="URL" placeholder="https://…" maxLength={2048} disabled={enrolling} />
+							</div>
+
+							<div class="enroll-field">
+								<label class="field-label" for="enrollNotes">Notes — markdown supported</label>
+								<textarea
+									id="enrollNotes"
+									rows={4}
+									maxLength={20000}
+									placeholder="Free-form description…"
+									disabled={enrolling}
+									value={description}
+									onInput={(e) => onDescriptionInput(e.currentTarget.value)}
+								/>
+							</div>
+						</div>
+					</details>
 
 					<div
 						id="enrollDrop"

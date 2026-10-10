@@ -587,27 +587,49 @@ body.modal-open { overflow: hidden; }
 	border-radius: 6px;
 }
 .meta-row-del:hover { color: var(--danger); background: var(--unknown-dim); }
-/* single dashed-template birthdate field on the edit form */
-#personBirthText {
+/* dashed-template birthdate fields (person-details edit form + enroll modal) */
+#personBirthText, #enrollBirth {
 	width: 100%; box-sizing: border-box;
 	background: var(--bg-raise); border: 1px solid var(--line);
 	border-radius: 8px; color: var(--ink);
 	padding: 8px 12px; font-family: var(--mono); font-size: 12.5px;
 }
-#personBirthText:focus { outline: none; border-color: var(--accent); }
-#personBirthText:disabled { opacity: 0.6; }
+#personBirthText:focus, #enrollBirth:focus { outline: none; border-color: var(--accent); }
+#personBirthText:disabled, #enrollBirth:disabled { opacity: 0.6; }
 .person-birth-hint { margin-top: 5px; }
-#personDescription {
+#personDescription, #enrollNotes {
 	width: 100%; box-sizing: border-box; resize: vertical;
 	background: var(--bg-raise); border: 1px solid var(--line);
 	border-radius: 8px; color: var(--ink);
 	padding: 10px 12px; font-family: var(--mono); font-size: 12.5px; line-height: 1.5;
 }
-#personDescription:focus { outline: none; border-color: var(--accent); }
-#personDescription:disabled { opacity: 0.6; }
+#personDescription:focus, #enrollNotes:focus { outline: none; border-color: var(--accent); }
+#personDescription:disabled, #enrollNotes:disabled { opacity: 0.6; }
 
 /* aka hint on a people-list row that matched via an alias */
 .person-aka { font-family: var(--mono); font-size: 10px; color: var(--accent); }
+
+/* collapsed person-details section on the enroll form (aliases, birthdate,
+	 links, notes — the details modal's edit fields, one disclosure down) */
+.enroll-details { margin: 14px 0 0; }
+.enroll-details summary {
+	display: block; cursor: pointer; list-style: none;
+	padding: 9px 0 3px;
+	border-top: 1px solid var(--line-soft);
+	font-family: var(--mono); font-size: 11px; font-weight: 500;
+	text-transform: uppercase; letter-spacing: 1.4px;
+	color: var(--ink-faint);
+	user-select: none;
+}
+.enroll-details summary::-webkit-details-marker { display: none; }
+.enroll-details summary::before { content: "+ "; }
+.enroll-details[open] summary::before { content: "− "; }
+.enroll-details summary:hover { color: var(--ink-dim); }
+.enroll-details summary:focus-visible { outline: none; color: var(--accent); }
+.enroll-details-body { display: grid; gap: 14px; margin-top: 12px; }
+.enroll-field { display: grid; gap: 6px; align-content: start; }
+.enroll-field .field-label { margin: 0; }
+.enroll-field .field-hint { margin: 0; }
 
 /* review dropzone — compact sibling of the main stage dropzone */
 .enroll-drop {

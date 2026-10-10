@@ -397,7 +397,8 @@ the days until the next birthday when month and day are known. Metadata is
 consulted in the UI by clicking a person in the list (the details modal is
 public; only the
 fields that were actually filled are shown) and edited by admins through the
-modal's **Edit details** form. Under the hood it lives on the person's DB
+modal's **Edit details** form or the enroll modal's **Person details**
+section. Under the hood it lives on the person's DB
 record: rescans and photo changes can't lose it, renames and exports carry it
 (`embeddings.json` round-trips it), and deleting the person deletes it with
 the record — re-enrolling their folder starts with empty metadata. The

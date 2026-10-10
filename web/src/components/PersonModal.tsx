@@ -25,6 +25,7 @@ import {
 } from "../birthdate";
 import { useToast } from "../toast";
 import { Avatar } from "./Avatar";
+import { MetaRows } from "./MetaRows";
 import { Modal } from "./Modal";
 
 interface PersonModalProps {
@@ -135,22 +136,6 @@ export function PersonModal(props: PersonModalProps) {
 		setEditing(false);
 	}
 
-	// Row editors (aliases / URLs): one input per entry plus a permanent
-	// trailing empty row — no "add" button. Filling the ready row spawns the
-	// next empty one, and removing rows keeps the ready slot at the end.
-	// Blank rows (including the ready slot) are dropped before saving.
-	function rowInput(list: string[], set: (v: string[]) => void, i: number, v: string) {
-		const next = [...list];
-		next[i] = v;
-		if (i === list.length - 1 && v.trim() !== "") next.push("");
-		set(next);
-	}
-	function rowRemove(list: string[], set: (v: string[]) => void, i: number) {
-		const next = list.filter((_, j) => j !== i);
-		if (next.length === 0 || next[next.length - 1].trim() !== "") next.push("");
-		set(next);
-	}
-
 	const saveEdit = async (e: Event) => {
 		e.preventDefault();
 		const name = personRef.current;
@@ -190,42 +175,7 @@ export function PersonModal(props: PersonModalProps) {
 		props.onManagePhotos(personRef.current);
 	}
 
-	const metaRows = (
-		list: string[],
-		set: (v: string[]) => void,
-		label: string,
-		placeholder: string,
-		maxLength: number,
-	) => (
-		<div class="meta-rows">
-			{list.map((val, i) => (
-				<div class="meta-row" key={i}>
-					<input
-						type="text"
-						value={val}
-						placeholder={placeholder}
-						maxLength={maxLength}
-						aria-label={label}
-						autocomplete="off"
-						spellcheck={false}
-						disabled={busyState}
-						onInput={(e) => rowInput(list, set, i, e.currentTarget.value)}
-					/>
-					{!(i === list.length - 1 && val.trim() === "") && (
-						<button
-							type="button"
-							class="meta-row-del"
-							aria-label="Remove entry"
-							disabled={busyState}
-							onClick={() => rowRemove(list, set, i)}
-						>
-							×
-						</button>
-					)}
-				</div>
-			))}
-		</div>
-	);
+	// The list row editors themselves are the shared MetaRows component.
 
 	// ---- admin header actions ----
 	const adminActions = props.authed && (
@@ -323,7 +273,7 @@ export function PersonModal(props: PersonModalProps) {
 						<form id="personMetaForm" class="person-edit" ref={formRef} onSubmit={saveEdit}>
 							<label class="person-field">
 								<span class="person-field-label">Aliases</span>
-								{metaRows(aliases, setAliases, "Alias", "Alias", 120)}
+								<MetaRows entries={aliases} onChange={setAliases} label="Alias" placeholder="Alias" maxLength={120} disabled={busyState} />
 							</label>
 
 							<label class="person-field">
@@ -343,7 +293,7 @@ export function PersonModal(props: PersonModalProps) {
 
 							<label class="person-field">
 								<span class="person-field-label">Links — http(s) URLs</span>
-								{metaRows(urls, setUrls, "URL", "https://…", 2048)}
+								<MetaRows entries={urls} onChange={setUrls} label="URL" placeholder="https://…" maxLength={2048} disabled={busyState} />
 							</label>
 
 							<label class="person-field">

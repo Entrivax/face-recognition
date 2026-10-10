@@ -82,7 +82,7 @@ export function Modal(props: ModalProps) {
 		const card = cardRef.current;
 		if (!card) return;
 		const focusables = [...card.querySelectorAll<HTMLElement>(
-			"button, [href], input, select, textarea, [tabindex]:not([tabindex='-1'])"
+			"button, [href], input, select, textarea, summary, [tabindex]:not([tabindex='-1'])"
 		)].filter((el) => {
 			const btn = el as HTMLButtonElement | HTMLInputElement;
 			return !("disabled" in btn && btn.disabled) && el.offsetParent !== null;
