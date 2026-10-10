@@ -19,6 +19,11 @@
 # people folder" button. Photos enrolled through the API/UI are saved back
 # into ./people (as <Name>/<sha1>.<ext>), so the mount below must stay
 # writable.
+#
+# The ONNX models are not baked into the image: on first start the app
+# downloads the insightface buffalo_l pack (~289 MB) into ./models and keeps
+# only the two .onnx files it needs. If the folder already holds the models
+# (e.g. `make models`) nothing is downloaded.
 
 services:
   recogn:
@@ -48,7 +53,20 @@ services:
       # public URL:
       # RECOGN_WEBAUTHN_RPID: "recogn.example.com"
       # RECOGN_WEBAUTHN_ORIGIN: "https://recogn.example.com"
+      #
+      # Model source knobs (see the ./models mount below):
+      # RECOGN_MODELS_URL: "https://your-mirror/buffalo_l.zip"   # own pack mirror
+      # RECOGN_AUTO_DOWNLOAD: "0"   # only with the models already in ./models
     volumes:
+      # ONNX models (SCRFD + ArcFace). Mounted, not baked in, to keep the
+      # image ~190 MB smaller. On first start the app downloads the
+      # insightface buffalo_l pack (~289 MB) into ./models and extracts only
+      # det_10g.onnx + w600k_r50.onnx — so the folder must be writable by the
+      # container's uid 10001 on that first run (e.g. `sudo chown -R 10001
+      # ./models`). Once the models are there nothing is written, so a
+      # pre-populated ./models may even be mounted read-only. Point
+      # RECOGN_MODELS_URL at your own pack for mirrors / air-gapped hosts.
+      - ./models:/data/models
       # Your dataset: ./people/<Person Name>/*.jpg — mounted writable so
       # API/UI enrollments can save uploaded photos into it. The container
       # runs as uid 10001; make sure the host folder allows writes for that
@@ -63,4 +81,4 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s   # allow time for first-run enrollment + model warmup
+      start_period: 5m    # first start may download ~289 MB of models before serving

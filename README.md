@@ -54,8 +54,10 @@ data/embeddings.json   JSON interchange copy — auto-imported when the DB is
 
 ## Run with Docker (easiest)
 
-The image is all-in-one: the CGO-enabled Go binary, the ONNX Runtime library,
-and the models — no Python. You only need Docker.
+The image is all-in-one: the CGO-enabled Go binary and the embedded ONNX
+Runtime library — no Python. You only need Docker. The ONNX models are **not**
+baked into the image (they'd add ~191 MB): on first start they download into
+the mounted `./models` folder, or you can pre-populate it with `make models`.
 
 ```sh
 docker compose run --rm recogn hash-password   # 1. choose an admin password
@@ -72,9 +74,16 @@ To serve other machines, point a TLS reverse proxy at it (or switch the
 commented `8080:8080` binding) once the hash is set.
 
 On first start, if the face DB is empty, the container **auto-enrolls** from
-the mounted `./people` folder before serving. The generated database lives in a
-named volume (`recogn-db`) so it survives rebuilds and restarts.
+the mounted `./people` folder before serving. The generated database persists
+in `./data` (mounted at `/data/db`) so it survives rebuilds and restarts.
 
+- **Models**: `./models` is mounted at `/data/models`. On first start the app
+  downloads the insightface buffalo_l pack (~289 MB) into it and keeps only
+  the two `.onnx` files it needs — so the folder must be writable by the
+  container's uid 10001 once (`sudo chown -R 10001 ./models`). Pre-populate
+  it with `make models` and nothing is downloaded (a read-only mount then
+  works too). Point `RECOGN_MODELS_URL` at your own pack for mirrors /
+  air-gapped hosts; `RECOGN_AUTO_DOWNLOAD=0` disables the download entirely.
 - **Dataset**: `./people` is mounted writable at `/data/people` so photos
   enrolled through the API/UI are saved back into it (as `<Name>/<sha1>.<ext>`).
 - **Threshold**: set `RECOGN_THRESHOLD` in `docker-compose.yml`.
@@ -92,7 +101,8 @@ Without compose, plain Docker works too:
 
 ```sh
 docker build -t recogn .
-docker run -p 8080:8080 -v "$PWD/people:/data/people" -v recogn-db:/data/db recogn
+docker run -p 8080:8080 -v "$PWD/people:/data/people" \
+  -v "$PWD/models:/data/models" -v "$PWD/data:/data/db" recogn
 ```
 
 ## Run from source

@@ -12,7 +12,8 @@ identifies each one (name + confidence, or `unknown`). It runs on CPU.
 
 Current state: **complete and working.** Inference runs **in-process via CGO +
 the ONNX Runtime C API** (no Python, no subprocess). Enrolled 24 people / 66
-photos, all tests pass, Docker image builds and runs (~508 MB).
+photos, all tests pass, Docker image builds and runs (~157 MB; models are a
+mounted/downloaded volume, not baked in).
 
 ## Architecture (important — don't reinvent this)
 
@@ -197,23 +198,33 @@ export GOPATH=$PWD/.gopath GOMODCACHE=$PWD/.gomodcache GOCACHE=$PWD/.gocache \
 - Multi-face: a two-person composite returns both identities with separate boxes.
 - No-face photo → `{count:0, faces:[]}` (HTTP 200), not an error.
 - Docker: `docker compose up --build` serves UI+API, healthcheck `healthy`,
-  DB persists in the mounted `./data` → `/data/db`. Image ~508 MB.
+  DB persists in the mounted `./data` → `/data/db`, models in `./models` →
+  `/data/models` (first run downloads them into the mount). Image ~157 MB.
 
 ## Docker
 
 `Dockerfile` is multi-stage: (1) run `make ort` inside the image (reuses the
-Makefile recipe; ORT version pinned there), (2) fetch models, (3) build
+Makefile recipe; ORT version pinned there), (2) build
 the web UI with Vite (`node:22-bookworm-slim`, `npm ci && npm run build`),
-(4) build the CGO binary with `gcc`; the ORT tree is copied to
+(3) build the CGO binary with `gcc`; the ORT tree is copied to
 `/src/third_party/onnxruntime` so the `go:embed` pattern in
 `ort_embed_linux.go` matches (embed paths resolve relative to the module dir)
 and the binary dlopens the embedded library at runtime,
-(5) slim `debian:bookworm-slim` runtime with just the self-contained binary +
-models, `curl` for the healthcheck, non-root user,
-`EXPOSE 8080`, `VOLUME /data/db`. `docker-compose.yml` mounts `./people`
+(4) slim `debian:bookworm-slim` runtime with just the self-contained binary +
+`curl` for the healthcheck, non-root user,
+`EXPOSE 8080`, `VOLUME /data/db` + `/data/models`. The ONNX models are **not**
+baked into the image (they'd add ~191 MB): `RECOGN_MODELS_DIR=/data/models`
+in the image ENV and `docker-compose.yml` mounts `./models` there; on first
+start `models.Ensure` (internal/models, wired in `openEngine`) downloads the
+insightface buffalo_l pack into the mount (~289 MB) and extracts only the two
+`.onnx` files — the mount must be writable by uid 10001 for that first run;
+pre-populated folders need no download (read-only mounts then work), and
+`RECOGN_MODELS_URL` overrides the pack URL / `RECOGN_AUTO_DOWNLOAD=0`
+disables it. `docker-compose.yml` also mounts `./people`
 writable at `/data/people` (API enrollments save uploaded photos back into
 it), persists the DB via `./data` → `/data/db`, sets `RECOGN_THRESHOLD`,
-healthcheck via `curl /api/health`. The sample ships **secure by default**:
+healthcheck via `curl /api/health` (`start_period: 5m` to cover a first-run
+model download). The sample ships **secure by default**:
 `RECOGN_ADMIN_PASSWORD_HASH` must be replaced (the placeholder fails startup
 loudly — auth.New rejects non-PHC strings) and the port binds to `127.0.0.1`
 only (a commented `8080:8080` line documents the all-interfaces

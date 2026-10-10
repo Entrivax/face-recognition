@@ -15,7 +15,8 @@ recogn
 web/node_modules/
 internal/web/dist/
 
-# Downloaded models are fetched fresh inside the image build.
+# Downloaded models are runtime state, not build context: mounted at
+# /data/models (compose uses ./models) and fetched on first start.
 models/
 
 # The ONNX Runtime C library is fetched fresh inside the image build (stage 1).

@@ -4,15 +4,23 @@
 # recogn — all-in-one image: Go app (CLI + REST API + web UI) with in-process
 # ONNX inference via CGO + the ONNX Runtime C API. CPU-only. No Python.
 #
+# The ONNX models are NOT baked into the image (they'd add ~191 MB). Mount a
+# models directory at /data/models (docker-compose.yml uses ./models): on
+# first start the app downloads the insightface buffalo_l pack into it and
+# keeps only the two .onnx files it needs. Pre-populate the folder (e.g.
+# `make models`) and nothing is downloaded; override the pack URL with
+# RECOGN_MODELS_URL or disable the download with RECOGN_AUTO_DOWNLOAD=0.
+#
 # Stage 1 fetches the ONNX Runtime C library + headers (used at build time to
 # compile the CGO shim and embed the library).
-# Stage 2 downloads the ONNX models (SCRFD detector + ArcFace embedder).
-# Stage 3 builds the web UI (Preact + TypeScript) with Vite.
-# Stage 4 builds the CGO-enabled Go binary with the ORT library embedded.
-# Stage 5 is the slim runtime: debian-slim + self-contained binary + models.
+# Stage 2 builds the web UI (Preact + TypeScript) with Vite.
+# Stage 3 builds the CGO-enabled Go binary with the ORT library embedded.
+# Stage 4 is the slim runtime: debian-slim + self-contained binary. The models
+# are expected in a mounted /data/models volume.
 #
 # Build:  docker build -t recogn .
-# Run:    docker run -p 8080:8080 -v "$PWD/people:/data/people" recogn
+# Run:    docker run -p 8080:8080 -v "$PWD/people:/data/people" \
+#         -v "$PWD/models:/data/models" recogn
 # (see docker-compose.yml for the convenient form; the people mount must be
 # writable so photos enrolled through the API/UI are saved back into it)
 # ---------------------------------------------------------------------------
@@ -29,20 +37,7 @@ WORKDIR /ort
 COPY Makefile .
 RUN make ort
 
-# ---- Stage 2: ONNX models --------------------------------------------------
-# Baked into the image so the container is self-contained (no runtime
-# download). Override the pack URL via build arg if you mirror it yourself.
-FROM debian:bookworm-slim AS models
-ARG BUFFALO_URL=https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip
-RUN apt-get update \
- && apt-get install -y --no-install-recommends curl ca-certificates unzip \
- && rm -rf /var/lib/apt/lists/*
-WORKDIR /models
-RUN curl -fSL -o /tmp/buffalo_l.zip "$BUFFALO_URL" \
- && unzip -o /tmp/buffalo_l.zip det_10g.onnx w600k_r50.onnx -d /models \
- && rm /tmp/buffalo_l.zip
-
-# ---- Stage 3: build the web UI (Preact + TypeScript → Vite bundle) ---------
+# ---- Stage 2: build the web UI (Preact + TypeScript → Vite bundle) ---------
 FROM node:22-bookworm-slim AS ui
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
@@ -51,7 +46,7 @@ COPY web/ ./
 # Emits to /src/internal/web/dist (outDir ../internal/web/dist).
 RUN npm run build
 
-# ---- Stage 4: build the CGO-enabled Go binary ------------------------------
+# ---- Stage 3: build the CGO-enabled Go binary ------------------------------
 FROM golang:1.27.1-bookworm AS gobuild
 # CGO needs a C toolchain.
 RUN apt-get update \
@@ -78,7 +73,7 @@ ENV CGO_ENABLED=1 \
     CGO_LDFLAGS="-ldl"
 RUN go build -trimpath -ldflags="-s -w" -o /out/recogn .
 
-# ---- Stage 5: runtime -------------------------------------------------------
+# ---- Stage 4: runtime -------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 
 # curl is used by the docker-compose healthcheck; ca-certificates for any TLS.
@@ -91,13 +86,14 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY --from=gobuild /out/recogn /app/recogn
-COPY --from=models /models/ models/
 
 # Default layout inside the container. Everything is overridable via env.
-#   /app          app + models
+#   /app          the binary
+#   /data/models  the ONNX models (mount a host folder here; the app
+#                 downloads the buffalo_l pack into it on first start)
 #   /data/people  the dataset (mount your people/ folder here)
 #   /data/db      the generated face database (persisted via volume)
-ENV RECOGN_MODELS_DIR=/app/models \
+ENV RECOGN_MODELS_DIR=/data/models \
     RECOGN_PEOPLE_DIR=/data/people \
     RECOGN_DATA_DIR=/data/db \
     RECOGN_ADDR=:8080 \
@@ -105,7 +101,7 @@ ENV RECOGN_MODELS_DIR=/app/models \
     # Keep the ORT extraction cache out of the /data volume.
     XDG_CACHE_HOME=/tmp/.cache
 
-RUN mkdir -p /data/people /data/db
+RUN mkdir -p /data/models /data/people /data/db
 
 # Drop privileges.
 RUN useradd --system --uid 10001 --home /data recogn \
@@ -114,14 +110,20 @@ USER recogn
 
 EXPOSE 8080
 
-# Persist the generated face database across container restarts.
-VOLUME ["/data/db"]
+# Persist the generated face database across container restarts, and keep a
+# first-run model download out of the container's writable layer (compose
+# mounts ./models over /data/models; a plain `docker run` gets an anonymous
+# volume for it instead).
+VOLUME ["/data/db", "/data/models"]
 
 # Default command: start the API + web UI. On first run, if the DB is empty
-# and a people/ dataset is mounted, the server auto-enrolls before serving.
+# and a people/ dataset is mounted, the server auto-enrolls before serving;
+# missing models download into /data/models before anything starts.
 #
 # For one-off CLI commands, override the entrypoint args, e.g.:
-#   docker run --rm -v $PWD/people:/data/people recogn enroll
-#   docker run --rm -v $PWD/people:/data/people recogn recognize /data/people/Yana/img_0103.jpg
+#   docker run --rm -v "$PWD/models:/data/models" \
+#     -v "$PWD/people:/data/people" recogn enroll
+#   docker run --rm -v "$PWD/models:/data/models" \
+#     -v "$PWD/people:/data/people" recogn recognize /data/people/Yana/img_0103.jpg
 ENTRYPOINT ["/app/recogn"]
 CMD ["serve", "--addr", ":8080"]
