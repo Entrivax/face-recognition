@@ -4,7 +4,11 @@
 // stylesheet keys modal visibility off `.modal[hidden]`.
 //
 // Clicking the backdrop, the × button, or any [data-close] element inside
-// invokes onCloseRequest (callers decide to refuse while busy). Escape pops
+// invokes onCloseRequest (callers decide to refuse while busy). A mouse
+// click dismisses only when the press and the release land on the same
+// [data-close] element, so a drag from the card onto the backdrop can't
+// close it (the browser fires that click at their common ancestor).
+// Escape pops
 // this modal only when it is topmost (onEscape defaults to onCloseRequest).
 
 import { useEffect, useRef } from "preact/hooks";
@@ -59,22 +63,28 @@ export function Modal(props: ModalProps) {
 	// Escape-stack membership follows the open state.
 	useEffect(() => {
 		if (!open) return;
+		pressDismissRef.current = null; // drop a stale press from the last open
 		const esc = () => escRef.current();
 		pushEscape(esc);
 		return () => removeEscape(esc);
 	}, [open]);
 
 	// Focus management: focus the initial target on open, restore the
-	// trigger on close/unmount.
+	// trigger on close/unmount. The callback lives in a ref so inline
+	// closures (new identity every render) don't re-run this effect —
+	// re-running it would steal focus back to the initial target while the
+	// user types in any other field.
+	const initialFocusRef = useRef(initialFocus);
+	initialFocusRef.current = initialFocus;
 	useEffect(() => {
 		if (!open) return;
 		lastFocus.current = document.activeElement as HTMLElement | null;
-		const target = initialFocus?.() ?? cardRef.current?.querySelector<HTMLElement>(".modal-close");
+		const target = initialFocusRef.current?.() ?? cardRef.current?.querySelector<HTMLElement>(".modal-close");
 		target?.focus();
 		return () => {
 			lastFocus.current?.focus?.();
 		};
-	}, [open, initialFocus]);
+	}, [open]);
 
 	// Keep Tab focus inside the dialog while it is open.
 	const trapTab = (e: TargetedKeyboardEvent<HTMLDivElement>) => {
@@ -95,12 +105,27 @@ export function Modal(props: ModalProps) {
 	};
 
 	// Backdrop / × / [data-close] clicks close (callers may refuse).
+	// A mouse click only dismisses when the press AND the release land on
+	// the same [data-close] element (the backdrop or a button): when a drag
+	// starts inside the card and ends over the backdrop, the browser
+	// dispatches the click at their common ancestor — this root div — which
+	// must not count as a backdrop click, or backdropClickDisabled would be
+	// bypassed (and enabled backdrops would close on drags too). Keyboard-
+	// activated clicks fire without any mousedown and carry detail 0, so
+	// they keep the release-only check.
+	const pressDismissRef = useRef<Element | null>(null);
+	const onMouseDown = (e: TargetedMouseEvent<HTMLDivElement>) => {
+		pressDismissRef.current = (e.target as Element).closest?.("[data-close]") ?? null;
+	};
 	const onClick = (e: TargetedMouseEvent<HTMLDivElement>) => {
-		if (e.target === e.currentTarget || (e.target as Element).closest?.("[data-close]")) closeRef.current();
+		const release = (e.target as Element).closest?.("[data-close]") ?? null;
+		const press = pressDismissRef.current;
+		pressDismissRef.current = null;
+		if (press != null ? press === release : release != null && e.detail === 0) closeRef.current();
 	};
 
 	return (
-		<div id={id} class={"modal" + (locked ? " locked" : "")} hidden={!open} {...rootProps} onClick={onClick}>
+		<div id={id} class={"modal" + (locked ? " locked" : "")} hidden={!open} {...rootProps} onClick={onClick} onMouseDown={onMouseDown}>
 			<div class="modal-backdrop" data-close={backdropClickDisabled ? undefined : true} />
 			<div
 				class={"modal-card" + (cardClass ? ` ${cardClass}` : "")}

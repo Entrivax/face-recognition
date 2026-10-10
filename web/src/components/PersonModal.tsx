@@ -136,6 +136,16 @@ export function PersonModal(props: PersonModalProps) {
 		setEditing(false);
 	}
 
+	useEffect(() => {
+		if (!editing) return;
+		const onUnload = (e: BeforeUnloadEvent) => {
+			e.preventDefault();
+			e.returnValue = ""; // legacy Chrome/Safari; modern engines ignore custom text
+		};
+		window.addEventListener("beforeunload", onUnload);
+		return () => window.removeEventListener("beforeunload", onUnload);
+	}, [editing]);
+
 	const saveEdit = async (e: Event) => {
 		e.preventDefault();
 		const name = personRef.current;
@@ -195,6 +205,7 @@ export function PersonModal(props: PersonModalProps) {
 			id="personModal"
 			cardId="personCard"
 			locked={busyState}
+			backdropClickDisabled={editing}
 			eyebrow="person"
 			titleId="personTitle"
 			title={detail?.name ?? props.person ?? ""}
