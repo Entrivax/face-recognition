@@ -22,6 +22,8 @@ import { Modal } from "./Modal";
 interface PhotosModalProps {
 	/** name of the person being managed; null = closed */
 	person: string | null;
+	/** the repository the person lives in ("" while closed) */
+	repoId: string;
 	onCloseRequest: () => void;
 	/** the person was renamed server-side; App updates the open person */
 	onRenamed: (name: string) => void;
@@ -34,6 +36,9 @@ interface PhotosModalProps {
 
 export function PhotosModal(props: PhotosModalProps) {
 	const toast = useToast();
+	// The repo the open person belongs to, stable for imperative closures.
+	const repoRef = useRef(props.repoId);
+	repoRef.current = props.repoId;
 
 	const [photos, setPhotos] = useState<PersonPhoto[] | null>(null);
 	const [hint, setHint] = useState("Loading photos…");
@@ -106,7 +111,7 @@ export function PhotosModal(props: PhotosModalProps) {
 	async function loadGrid(name: string) {
 		setHint("Loading photos…");
 		try {
-			const j = await api.getPersonPhotos(name);
+			const j = await api.getPersonPhotos(name, repoRef.current);
 			const list = j.photos || [];
 			setPhotos(list);
 			setHint(list.length
@@ -152,7 +157,7 @@ export function PhotosModal(props: PhotosModalProps) {
 
 		setBusy(true);
 		try {
-			const j = await api.renamePerson(oldName, newName);
+			const j = await api.renamePerson(oldName, repoRef.current, newName);
 			const canonical = j.name || newName; // DB-canonical name
 			// Photo URLs embed the person's name: drop any open detail view and
 			// reload the grid under the new name (the person-prop effect does it).
@@ -183,7 +188,7 @@ export function PhotosModal(props: PhotosModalProps) {
 		const c = detailCanvasRef.current;
 		c?.getContext("2d")?.clearRect(0, 0, c.width, c.height);
 		try {
-			const j = await api.detectPhoto(person, photoPath);
+			const j = await api.detectPhoto(person, repoRef.current, photoPath);
 			if (detailRef.current !== photoPath) return; // view moved on
 			renderVerdict(j.faces || [], photoPath);
 		} catch (e) {
@@ -255,8 +260,8 @@ export function PhotosModal(props: PhotosModalProps) {
 		setBusy(true);
 		try {
 			const [a, b] = await Promise.all([
-				api.fetchPhotoFile(person, aPath),
-				api.fetchPhotoFile(person, bPath),
+				api.fetchPhotoFile(person, repoRef.current, aPath),
+				api.fetchPhotoFile(person, repoRef.current, bPath),
 			]);
 			setCmpPath(null);
 			props.onComparePhotos(a, b);
@@ -292,7 +297,7 @@ export function PhotosModal(props: PhotosModalProps) {
 		if (!confirm(`Remove ${photoPath} from ${person}? The file is deleted from the people folder too.`)) return;
 		setBusy(true);
 		try {
-			await api.deletePhoto(person, photoPath);
+			await api.deletePhoto(person, repoRef.current, photoPath);
 			toast.show(`Removed ${photoPath}.`, "ok");
 			if (detailRef.current === photoPath) {
 				detailRef.current = null;
@@ -313,7 +318,7 @@ export function PhotosModal(props: PhotosModalProps) {
 		if (busyRef.current || !person || !detailRef.current) return;
 		setBusy(true);
 		try {
-			await api.setThumbnail(person, detailRef.current);
+			await api.setThumbnail(person, repoRef.current, detailRef.current);
 			toast.show("Avatar updated.", "ok");
 			props.onChange();
 		} catch (e) {
@@ -334,7 +339,7 @@ export function PhotosModal(props: PhotosModalProps) {
 		setBusy(true);
 		setHint(`Uploading ${files.length} photo${files.length === 1 ? "" : "s"}…`);
 		try {
-			const j = await api.enrollPhotos(person, files);
+			const j = await api.enrollPhotos(person, repoRef.current, files);
 			if (j.added > 0) toast.show(`Added ${j.added} photo${j.added === 1 ? "" : "s"}.`, "ok");
 			if (j.failures && j.failures.length) {
 				toast.show(`${j.failures.length} photo(s) rejected: ${j.failures[0]}`, "err");
@@ -424,6 +429,7 @@ export function PhotosModal(props: PhotosModalProps) {
 									<PhotoTile
 										key={ph.path}
 										person={props.person ?? ""}
+										repoId={props.repoId}
 										ph={ph}
 										cmpMark={cmpPath === ph.path}
 										onOpen={() => openDetail(ph.path)}
@@ -469,7 +475,12 @@ export function PhotosModal(props: PhotosModalProps) {
 						<div id="photoDetailView">
 							<button type="button" class="photo-back" id="photoBackBtn" onClick={backToGrid}>← All photos</button>
 							<div class="canvas-wrap photo-canvas">
-								<img ref={detailImgRef} id="photoDetailImg" alt="Enrolled photo" src={api.photoURL(props.person ?? "", detailPath)} />
+								<img
+									ref={detailImgRef}
+									id="photoDetailImg"
+									alt="Enrolled photo"
+									src={api.withRepoQuery(api.photoURL(props.person ?? "", detailPath), props.repoId)}
+								/>
 								<canvas ref={detailCanvasRef} id="photoOverlay" />
 							</div>
 							<p class={"photo-verdict" + (verdictWarn ? " warn" : "")} id="photoVerdict" aria-live="polite">{verdict}</p>
@@ -505,6 +516,7 @@ export function PhotosModal(props: PhotosModalProps) {
 // photo as photo A of a face-to-face comparison (second pick launches).
 function PhotoTile(props: {
 	person: string;
+	repoId: string;
 	ph: PersonPhoto;
 	cmpMark: boolean;
 	onOpen: () => void;
@@ -524,7 +536,9 @@ function PhotoTile(props: {
 			>
 				{broken
 					? "unavailable"
-					: <img alt={ph.path} src={api.photoURL(props.person, ph.path)} onError={() => setBroken(true)} />}
+					// The photo route is repo-scoped (?repo= is required), so the
+					// URL must carry the repository the person lives in.
+					: <img alt={ph.path} src={api.withRepoQuery(api.photoURL(props.person, ph.path), props.repoId)} onError={() => setBroken(true)} />}
 			</button>
 			<button
 				type="button"

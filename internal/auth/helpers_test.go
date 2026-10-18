@@ -19,8 +19,9 @@ func newTestRequest(method, target string) *http.Request {
 	return httptest.NewRequest(method, target, nil)
 }
 
-// newTestConfig returns a Config pointed at temp directories. Callers set
-// cfg.AdminPasswordHash etc. themselves.
+// newTestConfig returns a Config pointed at temp directories (zero users:
+// services built from it start in setup mode; tests create accounts via
+// Service.CreateUser themselves).
 func newTestConfig(t *testing.T) config.Config {
 	t.Helper()
 	cfg := config.Default()

@@ -1,320 +1,139 @@
 package api
 
+// Tests for the session/account surface: the session probe, the first-run
+// setup flow, login/logout, the personal API keys endpoints, the self-
+// service password change, the admin users endpoints and the config
+// endpoint's role split. Everything runs through the real routes; the auth
+// service's internals are covered by internal/auth's own tests.
+
 import (
 	"bytes"
-	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
-	"recogn/internal/auth"
-	"recogn/internal/config"
-	"recogn/internal/db"
-	"recogn/internal/engine"
+	"recogn/internal/users"
 )
 
-// testAdminPassword is the password every auth test configures; tests use
-// its precomputed argon2id hash (testAdminPasswordHash).
-const testAdminPassword = "test-password-123"
+// TestSessionProbe pins GET /api/auth/session for both postures: anonymous
+// ({"authenticated":false,"user":null,...}) and logged-in (the user block).
+func TestSessionProbe(t *testing.T) {
+	s, _ := newTestServer(t, &stubEngine{}) // zero users: setup mode
 
-var testAdminPasswordHash = func() string {
-	h, err := auth.HashPassword([]byte(testAdminPassword))
-	if err != nil {
-		panic(err)
-	}
-	return h
-}()
-
-// newAuthTestServer builds a Server with admin password auth enabled and a
-// hermetic DataDir (passkey store). Open-mode tests reuse newTestServer.
-func newAuthTestServer(t *testing.T, eng Engine) (*Server, *db.DB) {
-	t.Helper()
-	t.Setenv("RECOGN_ADMIN_PASSWORD_HASH", "")
-	t.Setenv("RECOGN_WEBAUTHN_RPID", "")
-	t.Setenv("RECOGN_WEBAUTHN_ORIGIN", "")
-	t.Setenv("RECOGN_WEBAUTHN_RP_NAME", "")
-	database, err := db.Open(filepath.Join(t.TempDir(), "emb.json"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	cfg := config.Default()
-	cfg.Addr = ":0"
-	cfg.PeopleDir = filepath.Join(t.TempDir(), "people")
-	cfg.DataDir = filepath.Join(t.TempDir(), "data")
-	cfg.AdminPasswordHash = testAdminPasswordHash
-	s, err := New(cfg, eng, database, nil)
-	if err != nil {
-		t.Fatalf("new server: %v", err)
-	}
-	return s, database
-}
-
-// authReq builds a request from a given RemoteAddr so rate-limit buckets can
-// be isolated per test (the s parameter keeps call sites reading like the
-// rest of the file).
-func authReq(t *testing.T, _ *Server, method, target, remoteIP string, body io.Reader, header map[string]string) *http.Request {
-	t.Helper()
-	r := httptest.NewRequest(method, target, body)
-	r.RemoteAddr = remoteIP + ":1234"
-	for k, v := range header {
-		r.Header.Set(k, v)
-	}
-	return r
-}
-
-// login POSTs a password to /api/login and returns the recorder.
-func login(t *testing.T, s *Server, remoteIP, password string) *httptest.ResponseRecorder {
-	t.Helper()
-	b, _ := json.Marshal(map[string]string{"password": password})
-	req := authReq(t, s, http.MethodPost, "/api/login", remoteIP, bytes.NewReader(b), map[string]string{"Content-Type": "application/json"})
-	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
-	return rec
-}
-
-// sessionCookie extracts the recogn_session cookie from a login response.
-func sessionCookie(t *testing.T, rec *httptest.ResponseRecorder) *http.Cookie {
-	t.Helper()
-	for _, c := range rec.Result().Cookies() {
-		if c.Name == "recogn_session" {
-			return c
-		}
-	}
-	t.Fatalf("no recogn_session cookie in response: %v", rec.Result().Cookies())
-	return nil
-}
-
-// loginAdmin logs in via POST /api/login and returns the admin's session
-// cookie. It replaces the old bearer-password helper: the password itself is
-// never accepted as a Bearer credential anymore.
-func loginAdmin(t *testing.T, s *Server) *http.Cookie {
-	t.Helper()
-	rec := login(t, s, "1.2.3.4", testAdminPassword)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("admin login: got %d (%s)", rec.Code, rec.Body.String())
-	}
-	return sessionCookie(t, rec)
-}
-
-// bearerSession sets a Bearer header carrying a session token on a request.
-func bearerSession(r *http.Request, token string) *http.Request {
-	r.Header.Set("Authorization", "Bearer "+token)
-	return r
-}
-
-func TestAuthOpenModeStaysPublic(t *testing.T) {
-	// newTestServer has no password and no passkeys: open mode. Everything
-	// keeps working exactly as before, including the admin routes.
-	eng := &stubEngine{faces: []engine.Face{{BBox: [4]float64{10, 10, 40, 40}}}}
-	s, database := newTestServer(t, eng)
-	img := pngBytes(t, 120, 120, 3)
-	if rec := enrollPerson(t, s, "Alice", map[string][]byte{"a.png": img}); rec.Code != http.StatusOK {
-		t.Fatalf("open-mode enroll: got %d (%s)", rec.Code, rec.Body.String())
-	}
-
-	// Admin POST /api/enroll succeeds unauthenticated.
-	req := httptest.NewRequest(http.MethodPost, "/api/enroll", nil)
-	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("open-mode rescan: got %d (%s)", rec.Code, rec.Body.String())
-	}
-
-	// Login reports "not configured".
-	rec = postJSON(t, s, "/api/login", map[string]string{"password": "whatever"})
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("open-mode login: got %d, want 401", rec.Code)
-	}
-	var body map[string]string
-	json.NewDecoder(rec.Body).Decode(&body)
-	if body["error"] != "admin authentication is not configured" {
-		t.Fatalf("error body = %q", body["error"])
-	}
-
-	// Health reports both methods off.
-	var health struct {
-		Auth map[string]bool `json:"auth"`
-	}
-	if r := getJSON(t, s, "/api/health", &health); r.Code != http.StatusOK {
-		t.Fatalf("health: got %d", r.Code)
-	}
-	if health.Auth["password"] || health.Auth["passkey"] {
-		t.Fatalf("open-mode auth flags: %v", health.Auth)
-	}
-
-	// Session endpoint: open mode is always authenticated, no methods.
+	// Anonymous: not authenticated; a fresh server with no users still
+	// requires the setup.
 	var session struct {
-		Authenticated bool            `json:"authenticated"`
-		Methods       map[string]bool `json:"methods"`
+		Authenticated bool           `json:"authenticated"`
+		User          map[string]any `json:"user"`
+		SetupRequired bool           `json:"setup_required"`
 	}
-	if r := getJSON(t, s, "/api/auth/session", &session); r.Code != http.StatusOK {
-		t.Fatalf("session: got %d", r.Code)
-	}
-	if !session.Authenticated || session.Methods["password"] || session.Methods["passkey"] {
-		t.Fatalf("open-mode session shape: %+v", session)
-	}
-
-	// Public reads stay 200.
-	if code := getJSON(t, s, "/api/people", nil).Code; code != http.StatusOK {
-		t.Errorf("people list: got %d", code)
-	}
-	if code := getJSON(t, s, "/api/people/Alice", nil).Code; code != http.StatusOK {
-		t.Errorf("person detail: got %d", code)
-	}
-	_ = database
-	_ = img
-}
-
-func TestAuthAnonymousAdminRoutesReturn401(t *testing.T) {
-	eng := &stubEngine{faces: []engine.Face{{BBox: [4]float64{10, 10, 40, 40}}}}
-	s, database := newAuthTestServer(t, eng)
-	img := pngBytes(t, 120, 120, 5)
-	photo := db.HashBytes(img)[:12] + ".png"
-	if err := database.AddPhoto("Alice", photo, img, []float32{1}); err != nil {
-		t.Fatal(err)
-	}
-	os.MkdirAll(filepath.Join(s.cfg.PeopleDir, "Alice"), 0o755)
-	os.WriteFile(filepath.Join(s.cfg.PeopleDir, "Alice", photo), img, 0o644)
-
-	body, ct := multipartBody(t, "images", "x.jpg", []byte("img"))
-	cmpBody, cmpCT := compareBody(t, []byte("a"), []byte("b"))
-	cases := []struct {
-		name   string
-		method string
-		path   string
-		body   io.Reader // io.Reader (not *bytes.Buffer) so nil stays a nil interface
-		ct     string
-	}{
-		// GET /api/people/{name} is the public details view — not admin.
-		{"set meta", http.MethodPost, "/api/people/Alice/meta", bytes.NewBufferString(`{"aliases":["Bob"]}`), "application/json"},
-		{"person photos", http.MethodGet, "/api/people/Alice/photos", nil, ""},
-		{"photo file", http.MethodGet, "/api/people/Alice/photos/" + photo, nil, ""},
-		{"photo detect", http.MethodGet, "/api/people/Alice/photos/" + photo + "/detect", nil, ""},
-		{"enroll person", http.MethodPost, "/api/people/Alice/enroll", body, ct},
-		{"enroll-face", http.MethodPost, "/api/people/Alice/enroll-face", body, ct},
-		{"rename", http.MethodPost, "/api/people/Alice/rename", bytes.NewBufferString(`{"name":"Bob"}`), "application/json"},
-		{"thumbnail", http.MethodPost, "/api/people/Alice/thumbnail", bytes.NewBufferString(`{"photo":"` + photo + `"}`), "application/json"},
-		{"delete photo", http.MethodDelete, "/api/people/Alice/photos/" + photo, nil, ""},
-		{"delete person", http.MethodDelete, "/api/people/Alice", nil, ""},
-		{"enroll folder", http.MethodPost, "/api/enroll", nil, ""},
-		{"compare", http.MethodPost, "/api/compare", cmpBody, cmpCT},
-		{"config GET", http.MethodGet, "/api/config", nil, ""},
-		{"config POST", http.MethodPost, "/api/config", bytes.NewBufferString(`{"threshold":0.5}`), "application/json"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			req := authReq(t, s, tc.method, tc.path, "9.9.9.9", tc.body, map[string]string{"Content-Type": tc.ct})
-			rec := httptest.NewRecorder()
-			s.Handler().ServeHTTP(rec, req)
-			if rec.Code != http.StatusUnauthorized {
-				t.Fatalf("%s: got %d, want 401", tc.name, rec.Code)
-			}
-			var errBody map[string]string
-			json.NewDecoder(rec.Body).Decode(&errBody)
-			if errBody["error"] != "authentication required" {
-				t.Fatalf("%s: error body = %q", tc.name, errBody["error"])
-			}
-		})
-	}
-}
-
-func TestAuthSessionBearerGrantsAccess(t *testing.T) {
-	eng := &stubEngine{faces: []engine.Face{{BBox: [4]float64{10, 10, 40, 40}}}}
-	s, _ := newAuthTestServer(t, eng)
-
-	// Log in once; the cookie value is the session token.
-	c := loginAdmin(t, s)
-
-	// The session token as a Bearer credential authorizes admin routes.
-	req := authReq(t, s, http.MethodGet, "/api/config", "1.1.1.1", nil, nil)
-	bearerSession(req, c.Value)
-	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
+	rec := get(t, s, nil, "/api/auth/session")
 	if rec.Code != http.StatusOK {
-		t.Fatalf("bearer session on /api/config: got %d (%s)", rec.Code, rec.Body.String())
+		t.Fatalf("session probe: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	decodeBody(t, rec, &session)
+	if session.Authenticated || session.User != nil || !session.SetupRequired {
+		t.Fatalf("anonymous session shape: %+v", session)
 	}
 
-	// ...also for a mutating admin route.
-	req = authReq(t, s, http.MethodPost, "/api/config", "1.1.1.1", bytes.NewBufferString(`{"threshold":0.5}`), map[string]string{"Content-Type": "application/json"})
-	bearerSession(req, c.Value)
-	rec = httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("bearer session on POST /api/config: got %d (%s)", rec.Code, rec.Body.String())
+	// After the admin exists: authenticated with the user block.
+	cookie := createAdmin(t, s)
+	rec = get(t, s, cookie, "/api/auth/session")
+	decodeBody(t, rec, &session)
+	if !session.Authenticated || session.SetupRequired {
+		t.Fatalf("authed session shape: %+v", session)
 	}
-
-	// The password itself must NEVER authenticate as a Bearer token — this
-	// is the fix: Bearer accepts sessions only.
-	req = authReq(t, s, http.MethodGet, "/api/config", "1.1.1.1", nil, nil)
-	bearerSession(req, testAdminPassword)
-	rec = httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("bearer password must not authenticate: got %d, want 401", rec.Code)
-	}
-
-	// Unknown Bearer tokens are rejected too.
-	req = authReq(t, s, http.MethodGet, "/api/config", "1.1.1.1", nil, nil)
-	bearerSession(req, "not-a-live-session-token")
-	rec = httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("bearer garbage: got %d, want 401", rec.Code)
+	if session.User["name"] != adminName || session.User["admin"] != true {
+		t.Errorf("user block: %v", session.User)
 	}
 }
 
-func TestAuthPublicRoutesStayAnonymous(t *testing.T) {
-	eng := &stubEngine{faces: []engine.Face{{BBox: [4]float64{10, 10, 40, 40}}}}
-	s, database := newAuthTestServer(t, eng)
-	img := pngBytes(t, 120, 120, 5)
-	// Enroll via the DB directly (people list + thumbnails only read).
-	if err := database.AddPhoto("Alice", "a.png", img, []float32{1}); err != nil {
-		t.Fatal(err)
-	}
-	database.SetThumbnail("alice", pngBytes(t, 32, 32, 9), "a.png")
+// TestSetupFlow covers the first-run bootstrap: the in-memory setup key,
+// POST /api/setup creating the admin, and the endpoint refusing once an
+// admin exists (or on a wrong key).
+func TestSetupFlow(t *testing.T) {
+	s, _ := newTestServer(t, &stubEngine{}) // zero users: setup mode
 
-	// recognize (multipart) is public.
-	body, ct := multipartBody(t, "image", "photo.jpg", img)
-	req := authReq(t, s, http.MethodPost, "/api/recognize", "2.2.2.2", body, map[string]string{"Content-Type": ct})
-	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
+	key, ok := s.auth.SetupKey()
+	if !ok || key == "" {
+		t.Fatal("a fresh server must hold an in-memory setup key")
+	}
+	if s.auth.Mode() != "setup" {
+		t.Fatalf("mode = %q, want setup", s.auth.Mode())
+	}
+
+	// Wrong key → 403, no user created.
+	rec := sendJSON(t, s, nil, "/api/setup", map[string]string{"key": "AAAA-BBBB-CCCC-DDDD", "username": "admin", "password": adminPass})
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("wrong key: got %d (%s), want 403", rec.Code, rec.Body.String())
+	}
+	if s.auth.SetupRequired() != true {
+		t.Fatalf("failed setup must not create an account")
+	}
+
+	// The right key → 200 {"ok":true}; the account can log in immediately.
+	rec = sendJSON(t, s, nil, "/api/setup", map[string]string{"key": key, "username": "admin", "password": adminPass})
 	if rec.Code != http.StatusOK {
-		t.Fatalf("anon recognize: got %d (%s)", rec.Code, rec.Body.String())
+		t.Fatalf("setup: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	decodeBody(t, rec, &body)
+	if body["ok"] != true {
+		t.Errorf("setup body = %v", body)
+	}
+	if s.auth.SetupRequired() {
+		t.Fatalf("setup should be complete")
 	}
 
-	for _, path := range []string{"/", "/api/health", "/api/people", "/api/thumbs/alice.jpg"} {
-		req := authReq(t, s, http.MethodGet, path, "2.2.2.2", nil, nil)
-		rec := httptest.NewRecorder()
-		s.Handler().ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("anon GET %s: got %d (%s)", path, rec.Code, rec.Body.String())
-		}
+	// Once completed the endpoint refuses — even with the right key.
+	rec = sendJSON(t, s, nil, "/api/setup", map[string]string{"key": key, "username": "second", "password": adminPass})
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("setup after completion: got %d (%s), want 403", rec.Code, rec.Body.String())
+	}
+	decodeBody(t, rec, &body)
+	if !strings.Contains(body["error"].(string), "already completed") {
+		t.Errorf("error body = %q", body["error"])
+	}
+
+	// GET /api/setup is not a route (the handler requires POST).
+	if rec := get(t, s, nil, "/api/setup"); rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET setup: got %d, want 405", rec.Code)
 	}
 }
 
-func TestAuthLoginLogoutFlow(t *testing.T) {
-	eng := &stubEngine{faces: []engine.Face{{BBox: [4]float64{10, 10, 40, 40}}}}
-	s, _ := newAuthTestServer(t, eng)
+// TestLoginLogoutFlow covers the session lifecycle through the real routes.
+func TestLoginLogoutFlow(t *testing.T) {
+	e := newEnv(t, &stubEngine{}, "", false, false)
+	_ = createAdmin(t, e.s)
 
-	// Wrong password → 401 with the specific error.
-	rec := login(t, s, "3.3.3.3", "not-the-password")
+	// Wrong password → 401 with the uniform message (never "which field").
+	rec := sendJSON(t, e.s, nil, "/api/login", map[string]string{"username": adminName, "password": "wrong-password"})
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("wrong password: got %d, want 401", rec.Code)
 	}
 	var body map[string]string
-	json.NewDecoder(rec.Body).Decode(&body)
-	if body["error"] != "invalid password" {
+	decodeBody(t, rec, &body)
+	if body["error"] != "invalid username or password" {
 		t.Fatalf("error body = %q", body["error"])
 	}
 
 	// Right password → 200, cookie with sane attributes.
-	rec = login(t, s, "3.3.3.3", testAdminPassword)
+	rec = sendJSON(t, e.s, nil, "/api/login", map[string]string{"username": adminName, "password": adminPass})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("login: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	var login struct {
+		OK   bool `json:"ok"`
+		User struct {
+			Name  string `json:"name"`
+			Admin bool   `json:"admin"`
+		} `json:"user"`
+	}
+	decodeBody(t, rec, &login)
+	if !login.OK || login.User.Name != adminName || !login.User.Admin {
+		t.Errorf("login body: %+v", login)
 	}
 	c := sessionCookie(t, rec)
 	if !c.HttpOnly || c.Path != "/" || c.MaxAge <= 0 {
@@ -323,41 +142,14 @@ func TestAuthLoginLogoutFlow(t *testing.T) {
 	if c.SameSite != http.SameSiteLaxMode {
 		t.Fatalf("SameSite = %v, want Lax", c.SameSite)
 	}
-	if rec.Header().Get("X-Forwarded-Proto") != "" && c.Secure {
-		t.Fatal("plain-http login must not set Secure")
-	}
 
-	// The cookie authorizes admin routes.
-	req := authReq(t, s, http.MethodGet, "/api/config", "3.3.3.3", nil, nil)
-	req.AddCookie(c)
-	rec = httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("admin with cookie: got %d", rec.Code)
-	}
-
-	// Session endpoint shows authenticated + methods.
-	var session struct {
-		Authenticated bool `json:"authenticated"`
-		Methods       struct {
-			Password bool `json:"password"`
-			Passkey  bool `json:"passkey"`
-		} `json:"methods"`
-	}
-	req = authReq(t, s, http.MethodGet, "/api/auth/session", "3.3.3.3", nil, nil)
-	req.AddCookie(c)
-	rec = httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
-	json.NewDecoder(rec.Body).Decode(&session)
-	if !session.Authenticated || !session.Methods.Password || session.Methods.Passkey {
-		t.Fatalf("session shape: %+v", session)
+	// The cookie authorizes an any-auth route.
+	if rec := get(t, e.s, c, "/api/config"); rec.Code != http.StatusOK {
+		t.Fatalf("cookie on /api/config: got %d (%s)", rec.Code, rec.Body.String())
 	}
 
 	// Logout clears the session server-side.
-	req = authReq(t, s, http.MethodPost, "/api/logout", "3.3.3.3", nil, nil)
-	req.AddCookie(c)
-	rec = httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
+	rec = sendJSON(t, e.s, c, "/api/logout", map[string]any{})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("logout: got %d", rec.Code)
 	}
@@ -370,258 +162,395 @@ func TestAuthLoginLogoutFlow(t *testing.T) {
 	if !cleared {
 		t.Fatal("logout must clear the cookie (Max-Age=0)")
 	}
-	// The old cookie no longer authorizes anything.
-	req = authReq(t, s, http.MethodGet, "/api/config", "3.3.3.3", nil, nil)
-	req.AddCookie(c)
-	rec = httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
+	if rec := get(t, e.s, c, "/api/config"); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("stale session after logout: got %d, want 401", rec.Code)
 	}
 }
 
-func TestAuthLoginSecureCookieBehindProxy(t *testing.T) {
-	eng := &stubEngine{}
-	s, _ := newAuthTestServer(t, eng)
-	rec := httptest.NewRecorder()
-	req := authReq(t, s, http.MethodPost, "/api/login", "4.4.4.4",
-		bytes.NewReader([]byte(`{"password":"`+testAdminPassword+`"}`)),
-		map[string]string{"Content-Type": "application/json", "X-Forwarded-Proto": "https"})
-	s.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("login: got %d", rec.Code)
+// TestAPIKeysEndpoints covers the owner's API keys: create (token shown
+// exactly once), list, use (a rk_ Bearer acts as the user), delete, and the
+// refusals.
+func TestAPIKeysEndpoints(t *testing.T) {
+	e := newEnv(t, &stubEngine{}, "Team", true, false)
+
+	// Anonymous → 401.
+	if rec := get(t, e.s, nil, "/api/auth/keys"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("anon keys list: got %d, want 401", rec.Code)
 	}
-	if c := sessionCookie(t, rec); !c.Secure {
-		t.Fatal("X-Forwarded-Proto: https must set the Secure flag")
+
+	// Create: the plaintext token appears exactly once.
+	rec := sendJSON(t, e.s, e.writer, "/api/auth/keys", map[string]string{"name": "ci script"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create key: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ID      string `json:"id"`
+		Token   string `json:"token"`
+		Prefix  string `json:"prefix"`
+		Name    string `json:"name"`
+		Created string `json:"created_at"`
+	}
+	decodeBody(t, rec, &created)
+	if created.Token == "" || !strings.HasPrefix(created.Token, "rk_") || created.ID == "" {
+		t.Fatalf("unexpected key response: %+v", created)
+	}
+	if created.Name != "ci script" || !strings.Contains(created.Prefix, "rk_") {
+		t.Errorf("key metadata: %+v", created)
+	}
+	if _, err := time.Parse(time.RFC3339, created.Created); err != nil {
+		t.Errorf("created_at %q is not RFC3339", created.Created)
+	}
+
+	// List: the key is there, the token is not.
+	var list struct {
+		Keys []struct {
+			ID     string `json:"id"`
+			Name   string `json:"name"`
+			Prefix string `json:"prefix"`
+			Token  string `json:"token"`
+		} `json:"keys"`
+	}
+	decodeBody(t, get(t, e.s, e.writer, "/api/auth/keys"), &list)
+	if len(list.Keys) != 1 || list.Keys[0].ID != created.ID {
+		t.Fatalf("keys list: %+v", list)
+	}
+	if list.Keys[0].Token != "" {
+		t.Errorf("the list must never carry the token")
+	}
+
+	// The key acts as its user: authorized for the user's repos, not admin.
+	req := httptest.NewRequest(http.MethodGet, "/api/repos", nil)
+	req.Header.Set("Authorization", "Bearer "+created.Token)
+	rec2 := httptest.NewRecorder()
+	e.s.Handler().ServeHTTP(rec2, req)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("rk_ bearer on /api/repos: got %d (%s)", rec2.Code, rec2.Body.String())
+	}
+	var repos struct {
+		Repos []struct {
+			Role string `json:"role"`
+		} `json:"repos"`
+	}
+	decodeBody(t, rec2, &repos)
+	if len(repos.Repos) != 1 || repos.Repos[0].Role != "writer" {
+		t.Errorf("key acts as its user: %+v", repos.Repos)
+	}
+	// ...but not an admin: /api/users → 403.
+	req = httptest.NewRequest(http.MethodGet, "/api/users", nil)
+	req.Header.Set("Authorization", "Bearer "+created.Token)
+	rec2 = httptest.NewRecorder()
+	e.s.Handler().ServeHTTP(rec2, req)
+	if rec2.Code != http.StatusForbidden {
+		t.Errorf("rk_ bearer on /api/users: got %d, want 403", rec2.Code)
+	}
+
+	// Delete: own key works, unknown id → 404.
+	if rec := del(t, e.s, e.writer, "/api/auth/keys/"+created.ID); rec.Code != http.StatusOK {
+		t.Fatalf("delete key: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if rec := del(t, e.s, e.writer, "/api/auth/keys/"+created.ID); rec.Code != http.StatusNotFound {
+		t.Errorf("re-delete: got %d, want 404", rec.Code)
+	}
+	// The dead key stops authenticating.
+	req = httptest.NewRequest(http.MethodGet, "/api/repos", nil)
+	req.Header.Set("Authorization", "Bearer "+created.Token)
+	rec2 = httptest.NewRecorder()
+	e.s.Handler().ServeHTTP(rec2, req)
+	if rec2.Code != http.StatusUnauthorized {
+		t.Errorf("deleted key must stop authenticating: got %d, want 401", rec2.Code)
 	}
 }
 
-func TestAuthLoginRateLimit(t *testing.T) {
-	eng := &stubEngine{}
-	s, _ := newAuthTestServer(t, eng)
+// TestChangePasswordFlow covers POST /api/auth/password: wrong current
+// password → 403, success → 200, the new password logs in, the old one
+// does not.
+func TestChangePasswordFlow(t *testing.T) {
+	e := newEnv(t, &stubEngine{}, "", false, false)
+	_ = createAdmin(t, e.s)
 
-	// 11 wrong passwords from one IP are each answered 401...
-	for i := 0; i < 11; i++ {
-		rec := login(t, s, "5.5.5.5", "wrong")
-		if rec.Code != http.StatusUnauthorized {
-			t.Fatalf("failure %d: got %d, want 401", i+1, rec.Code)
-		}
+	// Wrong current password → 403.
+	rec := sendJSON(t, e.s, e.admin, "/api/auth/password", map[string]string{"current": "not-it", "new": "new-password-9"})
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("wrong current: got %d (%s), want 403", rec.Code, rec.Body.String())
 	}
-	// ...and then the limiter denies with 429 + Retry-After.
-	rec := login(t, s, "5.5.5.5", testAdminPassword)
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("after 11 failures: got %d (%s), want 429", rec.Code, rec.Body.String())
+
+	// Anonymous → 401.
+	if rec := sendJSON(t, e.s, nil, "/api/auth/password", map[string]string{"current": "x", "new": "y"}); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("anon change: got %d, want 401", rec.Code)
+	}
+
+	// Success: 200.
+	if rec := sendJSON(t, e.s, e.admin, "/api/auth/password", map[string]string{"current": adminPass, "new": "new-password-9"}); rec.Code != http.StatusOK {
+		t.Fatalf("change: got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	// The old password stops working; the new one logs in.
+	if rec := sendJSON(t, e.s, nil, "/api/login", map[string]string{"username": adminName, "password": adminPass}); rec.Code != http.StatusUnauthorized {
+		t.Errorf("old password still works: got %d, want 401", rec.Code)
+	}
+	if rec := sendJSON(t, e.s, nil, "/api/login", map[string]string{"username": adminName, "password": "new-password-9"}); rec.Code != http.StatusOK {
+		t.Errorf("new password rejected: got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	// Too-short new password → 400 with the users-store text.
+	rec = sendJSON(t, e.s, e.admin, "/api/auth/password", map[string]string{"current": "new-password-9", "new": "short"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("short password: got %d (%s), want 400", rec.Code, rec.Body.String())
 	}
 	var body map[string]string
-	json.NewDecoder(rec.Body).Decode(&body)
-	if body["error"] != "too many attempts" {
-		t.Fatalf("error body = %q", body["error"])
-	}
-	if ra := rec.Header().Get("Retry-After"); ra == "" {
-		t.Fatal("429 must carry a Retry-After header")
-	}
-
-	// A fresh server (or a different IP) is not affected.
-	rec = login(t, s, "6.6.6.6", testAdminPassword)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("other IP: got %d, want 200", rec.Code)
-	}
-	s2, _ := newAuthTestServer(t, &stubEngine{})
-	if rec := login(t, s2, "5.5.5.5", testAdminPassword); rec.Code != http.StatusOK {
-		t.Fatalf("fresh server: got %d, want 200", rec.Code)
+	decodeBody(t, rec, &body)
+	if !strings.Contains(body["error"], "password must be at least") {
+		t.Errorf("error body = %q", body["error"])
 	}
 }
 
-func TestAuthHealthFlags(t *testing.T) {
-	eng := &stubEngine{}
-	s, _ := newAuthTestServer(t, eng)
-	var health struct {
-		Auth map[string]bool `json:"auth"`
-	}
-	if r := getJSON(t, s, "/api/health", &health); r.Code != http.StatusOK {
-		t.Fatalf("health: got %d", r.Code)
-	}
-	if !health.Auth["password"] || health.Auth["passkey"] {
-		t.Fatalf("password-mode health auth flags: %v", health.Auth)
-	}
+// TestUsersEndpointsAdminOnly pins the admin gating of the users endpoints.
+func TestUsersEndpointsAdminOnly(t *testing.T) {
+	e := newEnv(t, &stubEngine{}, "Team", true, false)
 
-	// Mode() passthrough.
-	if s.Mode() != "password" {
-		t.Fatalf("mode = %q, want password", s.Mode())
-	}
-}
-
-func TestAuthPasskeyRoutes(t *testing.T) {
-	eng := &stubEngine{}
-	s, _ := newAuthTestServer(t, eng)
-	c := loginAdmin(t, s) // admin session cookie replaces the old bearer-password helper
-
-	// Register begin requires admin: anonymous → 401.
-	req := authReq(t, s, http.MethodPost, "/api/auth/passkey/register/begin", "7.7.7.7", nil, nil)
-	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("anon register begin: got %d, want 401", rec.Code)
-	}
-
-	// As admin: returns the CredentialCreation options JSON.
-	req = authReq(t, s, http.MethodPost, "/api/auth/passkey/register/begin", "7.7.7.7", nil, nil)
-	req.AddCookie(c)
-	rec = httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("admin register begin: got %d (%s)", rec.Code, rec.Body.String())
-	}
-	var creation struct {
-		PublicKey struct {
-			Challenge string `json:"challenge"`
-			RP        struct {
-				ID   string `json:"id"`
-				Name string `json:"name"`
-			} `json:"rp"`
-			User struct {
-				Name string `json:"name"`
-			} `json:"user"`
-		} `json:"publicKey"`
-	}
-	if err := json.NewDecoder(rec.Body).Decode(&creation); err != nil {
-		t.Fatalf("register begin body is not JSON options: %v", err)
-	}
-	if creation.PublicKey.Challenge == "" || creation.PublicKey.User.Name != "admin" {
-		t.Fatalf("unexpected creation options: %+v", creation)
-	}
-
-	// Register finish with a garbage body → 400 (never 500).
-	req = authReq(t, s, http.MethodPost, "/api/auth/passkey/register/finish", "7.7.7.7", bytes.NewBufferString("not-json"), nil)
-	req.AddCookie(c)
-	rec = httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("register finish garbage: got %d, want 400", rec.Code)
-	}
-
-	// Login begin with no registered passkeys → 401 "not configured".
-	req = authReq(t, s, http.MethodPost, "/api/auth/passkey/login/begin", "7.7.7.7", nil, nil)
-	rec = httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("login begin without passkeys: got %d, want 401", rec.Code)
-	}
-	json.NewDecoder(rec.Body).Decode(&creation)
-	_ = creation
-
-	// Public routes: unknown suffix → 404; wrong method → 405.
-	req = authReq(t, s, http.MethodGet, "/api/auth/passkey/login/begin", "7.7.7.7", nil, nil)
-	rec = httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("GET login begin: got %d, want 405", rec.Code)
-	}
-
-	// Passkey list (admin): empty shape.
-	req = authReq(t, s, http.MethodGet, "/api/auth/passkeys", "7.7.7.7", nil, nil)
-	req.AddCookie(c)
-	rec = httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("passkeys list: got %d (%s)", rec.Code, rec.Body.String())
-	}
-	var list struct {
-		Passkeys []map[string]string `json:"passkeys"`
-	}
-	json.NewDecoder(rec.Body).Decode(&list)
-	if list.Passkeys == nil || len(list.Passkeys) != 0 {
-		t.Fatalf("expected empty passkeys array, got %+v", list)
-	}
-
-	// DELETE an unknown passkey id → 404.
-	req = authReq(t, s, http.MethodDelete, "/api/auth/passkeys/"+strings.Repeat("A", 22), "7.7.7.7", nil, nil)
-	req.AddCookie(c)
-	rec = httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("delete unknown passkey: got %d, want 404", rec.Code)
-	}
-
-	// Session endpoint reflects the passkey method state.
-	var session struct {
-		Methods struct {
-			Passkey bool `json:"passkey"`
-		} `json:"methods"`
-	}
-	req = authReq(t, s, http.MethodGet, "/api/auth/session", "7.7.7.7", nil, nil)
-	req.AddCookie(c)
-	rec = httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
-	json.NewDecoder(rec.Body).Decode(&session)
-	if session.Methods.Passkey {
-		t.Fatal("no passkey registered yet, methods.passkey must be false")
-	}
-}
-
-// TestAuthCorruptPasskeyStoreFailsStartup mirrors the DB's behaviour for a
-// corrupt interchange file: a corrupt data/passkeys.json must fail server
-// startup loudly, not silently drop the registered credentials.
-func TestAuthCorruptPasskeyStoreFailsStartup(t *testing.T) {
-	t.Setenv("RECOGN_ADMIN_PASSWORD_HASH", "")
-	t.Setenv("RECOGN_WEBAUTHN_RPID", "")
-	t.Setenv("RECOGN_WEBAUTHN_ORIGIN", "")
-	t.Setenv("RECOGN_WEBAUTHN_RP_NAME", "")
-	database, err := db.Open(filepath.Join(t.TempDir(), "emb.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg := config.Default()
-	cfg.Addr = ":0"
-	cfg.PeopleDir = filepath.Join(t.TempDir(), "people")
-	cfg.DataDir = t.TempDir()
-	if err := os.WriteFile(filepath.Join(cfg.DataDir, "passkeys.json"), []byte("{corrupt"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := New(cfg, &stubEngine{}, database, nil); err == nil {
-		t.Fatal("a corrupt passkeys.json must fail startup")
-	}
-}
-
-// TestAuthOpenModePasskeyRegisterRefused pins the route-level behaviour of the
-// H2 fix (SECURITY-REVIEW.md): in open mode the admin middleware passes
-// through, so the refusal must come from the auth handler itself — passkey
-// registration used to be first-come-first-served admin takeover. Everything
-// else about open mode stays exactly as before.
-func TestAuthOpenModePasskeyRegisterRefused(t *testing.T) {
-	eng := &stubEngine{}
-	s, _ := newTestServer(t, eng)
-
-	// Register begin/finish: refused with guidance (was 200 before the fix).
-	for _, path := range []string{"/api/auth/passkey/register/begin", "/api/auth/passkey/register/finish"} {
-		req := authReq(t, s, http.MethodPost, path, "8.8.8.8", nil, nil)
-		rec := httptest.NewRecorder()
-		s.Handler().ServeHTTP(rec, req)
+	for _, c := range []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{"list", http.MethodGet, "/api/users"},
+		{"create", http.MethodPost, "/api/users"},
+		{"delete", http.MethodDelete, "/api/users/rita"},
+		{"password", http.MethodPost, "/api/users/rita/password"},
+		{"grants", http.MethodPost, "/api/users/rita/repos"},
+	} {
+		// Anonymous → 401.
+		rec := do(t, e.s, c.method, c.path, nil, "", nil, nil)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("anon %s: got %d, want 401", c.name, rec.Code)
+		}
+		// Authenticated non-admin → 403.
+		rec = do(t, e.s, c.method, c.path, nil, "", e.writer, nil)
 		if rec.Code != http.StatusForbidden {
-			t.Fatalf("open-mode %s: got %d (%s), want 403", path, rec.Code, rec.Body.String())
+			t.Errorf("writer %s: got %d, want 403", c.name, rec.Code)
 		}
-		var body map[string]string
-		json.NewDecoder(rec.Body).Decode(&body)
-		if !strings.Contains(body["error"], "RECOGN_ADMIN_PASSWORD_HASH") {
-			t.Fatalf("%s: error body must name the env var, got %q", path, body["error"])
-		}
+	}
+}
+
+// TestUsersCRUD covers account creation, listing, validation and deletion
+// (self-deletion and the last remaining admin are refused; a non-last admin
+// is deletable by another admin).
+func TestUsersCRUD(t *testing.T) {
+	e := newEnv(t, &stubEngine{}, "Team", false, false)
+
+	// Create a plain user.
+	rec := sendJSON(t, e.s, e.admin, "/api/users", map[string]any{"username": "Bob", "password": "bob-password-1"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create user: got %d (%s)", rec.Code, rec.Body.String())
 	}
 
-	// Open-mode semantics are otherwise unchanged.
-	var session struct {
-		Authenticated bool            `json:"authenticated"`
-		Methods       map[string]bool `json:"methods"`
+	// List: the admin + bob, with grants and RFC3339 timestamps.
+	var list struct {
+		Users []struct {
+			Username  string        `json:"username"`
+			Admin     bool          `json:"admin"`
+			Grants    []users.Grant `json:"grants"`
+			CreatedAt string        `json:"created_at"`
+		} `json:"users"`
+		Count int `json:"count"`
 	}
-	if r := getJSON(t, s, "/api/auth/session", &session); r.Code != http.StatusOK {
-		t.Fatalf("session: got %d", r.Code)
+	decodeBody(t, get(t, e.s, e.admin, "/api/users"), &list)
+	if list.Count != 2 || len(list.Users) != 2 {
+		t.Fatalf("users list: %+v", list)
 	}
-	if !session.Authenticated || session.Methods["password"] || session.Methods["passkey"] {
-		t.Fatalf("open-mode session shape: %+v", session)
+	if list.Users[0].Username != "admin" || !list.Users[0].Admin {
+		t.Errorf("admin entry: %+v", list.Users[0])
 	}
-	if code := getJSON(t, s, "/api/health", nil).Code; code != http.StatusOK {
-		t.Errorf("health: got %d", code)
+	if list.Users[1].Username != "bob" || list.Users[1].Admin {
+		t.Errorf("bob entry: %+v", list.Users[1]) // stored lowercase
 	}
-	if code := getJSON(t, s, "/api/people", nil).Code; code != http.StatusOK {
-		t.Errorf("people: got %d", code)
+	if _, err := time.Parse(time.RFC3339, list.Users[1].CreatedAt); err != nil {
+		t.Errorf("created_at %q is not RFC3339", list.Users[1].CreatedAt)
+	}
+
+	// Validation errors carry the users store's text.
+	if rec := sendJSON(t, e.s, e.admin, "/api/users", map[string]any{"username": "Bob", "password": "bob-password-1"}); rec.Code != http.StatusConflict {
+		t.Errorf("taken username: got %d (%s), want 409", rec.Code, rec.Body.String())
+	}
+	if rec := sendJSON(t, e.s, e.admin, "/api/users", map[string]any{"username": "x", "password": "long-enough-pass"}); rec.Code != http.StatusBadRequest {
+		t.Errorf("short username: got %d, want 400", rec.Code)
+	}
+	if rec := sendJSON(t, e.s, e.admin, "/api/users", map[string]any{"username": "bob 2", "password": "long-enough-pass"}); rec.Code != http.StatusBadRequest {
+		t.Errorf("invalid username: got %d, want 400", rec.Code)
+	}
+	if rec := sendJSON(t, e.s, e.admin, "/api/users", map[string]any{"username": "carol", "password": "short"}); rec.Code != http.StatusBadRequest {
+		t.Errorf("short password: got %d, want 400", rec.Code)
+	}
+	var errBody map[string]string
+	decodeBody(t, sendJSON(t, e.s, e.admin, "/api/users", map[string]any{"username": "carol", "password": "short"}), &errBody)
+	if !strings.Contains(errBody["error"], "password must be at least") {
+		t.Errorf("error body = %q", errBody["error"])
+	}
+
+	// Delete: the caller's own account is refused.
+	rec = del(t, e.s, e.admin, "/api/users/admin")
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("delete self: got %d (%s), want 403", rec.Code, rec.Body.String())
+	}
+	var body map[string]string
+	decodeBody(t, rec, &body)
+	if body["error"] != "you cannot delete your own account" {
+		t.Errorf("self-delete error = %q", body["error"])
+	}
+
+	// A second admin is deletable by the first (the last remaining admin is
+	// the only protected admin).
+	if rec = sendJSON(t, e.s, e.admin, "/api/users", map[string]any{"username": "Root", "password": "root-password-1", "admin": true}); rec.Code != http.StatusOK {
+		t.Fatalf("create second admin: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if rec = del(t, e.s, e.admin, "/api/users/Root"); rec.Code != http.StatusOK {
+		t.Errorf("delete non-last admin: got %d (%s), want 200", rec.Code, rec.Body.String())
+	}
+	if rec = del(t, e.s, e.admin, "/api/users/Root"); rec.Code != http.StatusNotFound {
+		t.Errorf("delete deleted admin: got %d, want 404", rec.Code)
+	}
+
+	// Unknown user → 404; the deleted user's login stops working.
+	if rec := del(t, e.s, e.admin, "/api/users/nobody"); rec.Code != http.StatusNotFound {
+		t.Errorf("delete unknown: got %d, want 404", rec.Code)
+	}
+	if rec := del(t, e.s, e.admin, "/api/users/bob"); rec.Code != http.StatusOK {
+		t.Fatalf("delete bob: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if rec := sendJSON(t, e.s, nil, "/api/login", map[string]string{"username": "bob", "password": "bob-password-1"}); rec.Code != http.StatusUnauthorized {
+		t.Errorf("deleted user still logs in: got %d", rec.Code)
+	}
+	// Wrong method → 405.
+	if rec := do(t, e.s, http.MethodPost, "/api/users/bob", bytes.NewReader([]byte(`{}`)), "application/json", e.admin, nil); rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST /api/users/{u}: got %d, want 405", rec.Code)
+	}
+}
+
+// TestUserGrants covers POST /api/users/{u}/repos: full replacement,
+// repository validation (ID or name) and role validation.
+func TestUserGrants(t *testing.T) {
+	e := newEnv(t, &stubEngine{}, "Team", true, false)
+	other := seedRepo(t, e.s, e.admin, "Other")
+
+	// Full replace: replace the writer's grants with reader-on-Other.
+	rec := sendJSON(t, e.s, e.admin, "/api/users/walter/repos", map[string]any{
+		"grants": []map[string]string{{"repo": other, "role": "reader"}},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set grants: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	// The old grant is gone: walter no longer sees Team.
+	var list struct {
+		Users []struct {
+			Username string        `json:"username"`
+			Grants   []users.Grant `json:"grants"`
+		} `json:"users"`
+	}
+	decodeBody(t, get(t, e.s, e.admin, "/api/users"), &list)
+	for _, u := range list.Users {
+		if u.Username != "walter" {
+			continue
+		}
+		if len(u.Grants) != 1 || u.Grants[0].RepoID != other || u.Grants[0].Role != "reader" {
+			t.Fatalf("walter grants after replace: %+v", u.Grants)
+		}
+	}
+	if rec := do(t, e.s, http.MethodGet, "/api/people?repo="+e.repoID, nil, "", e.writer, nil); rec.Code != http.StatusForbidden {
+		t.Errorf("old grant should be gone: got %d, want 403", rec.Code)
+	}
+	// ...and the new one applies.
+	if rec := do(t, e.s, http.MethodGet, "/api/people?repo="+other, nil, "", e.writer, nil); rec.Code != http.StatusOK {
+		t.Errorf("new grant should apply: got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	// Grants by repo NAME work too (canonicalized to the ID).
+	if rec := sendJSON(t, e.s, e.admin, "/api/users/walter/repos", map[string]any{
+		"grants": []map[string]string{{"repo": "Team", "role": "writer"}},
+	}); rec.Code != http.StatusOK {
+		t.Fatalf("grants by name: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, e.s, http.MethodGet, "/api/people?repo="+e.repoID, nil, "", e.writer, nil); rec.Code != http.StatusOK {
+		t.Errorf("grant by name should apply: got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	// Validation: unknown repo → 400, bad role → 400, unknown user → 404.
+	if rec := sendJSON(t, e.s, e.admin, "/api/users/walter/repos", map[string]any{
+		"grants": []map[string]string{{"repo": "nosuchrepo", "role": "reader"}},
+	}); rec.Code != http.StatusBadRequest {
+		t.Errorf("unknown repo: got %d, want 400", rec.Code)
+	}
+	if rec := sendJSON(t, e.s, e.admin, "/api/users/walter/repos", map[string]any{
+		"grants": []map[string]string{{"repo": e.repoID, "role": "owner"}},
+	}); rec.Code != http.StatusBadRequest {
+		t.Errorf("bad role: got %d, want 400", rec.Code)
+	}
+	if rec := sendJSON(t, e.s, e.admin, "/api/users/nobody/repos", map[string]any{
+		"grants": []map[string]string{{"repo": e.repoID, "role": "reader"}},
+	}); rec.Code != http.StatusNotFound {
+		t.Errorf("unknown user: got %d, want 404", rec.Code)
+	}
+}
+
+// TestUserPasswordReset covers POST /api/users/{u}/password: the admin
+// resets another user's password; validation errors carry the store text.
+func TestUserPasswordReset(t *testing.T) {
+	e := newEnv(t, &stubEngine{}, "Team", true, false)
+
+	rec := sendJSON(t, e.s, e.admin, "/api/users/rita/password", map[string]string{"password": "rita-password-9"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reset: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	// The new password works, the old one doesn't.
+	if rec := sendJSON(t, e.s, nil, "/api/login", map[string]string{"username": "rita", "password": "rita-password-1"}); rec.Code != http.StatusUnauthorized {
+		t.Errorf("old password still works: got %d", rec.Code)
+	}
+	if rec := sendJSON(t, e.s, nil, "/api/login", map[string]string{"username": "rita", "password": "rita-password-9"}); rec.Code != http.StatusOK {
+		t.Errorf("new password rejected: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	// Too short → 400 with the store text.
+	rec = sendJSON(t, e.s, e.admin, "/api/users/rita/password", map[string]string{"password": "short"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("short: got %d (%s), want 400", rec.Code, rec.Body.String())
+	}
+	// Unknown user → 404.
+	if rec := sendJSON(t, e.s, e.admin, "/api/users/nobody/password", map[string]string{"password": "whatever-long"}); rec.Code != http.StatusNotFound {
+		t.Errorf("unknown user: got %d, want 404", rec.Code)
+	}
+}
+
+// TestConfigRoles pins the config endpoint's split: GET for any
+// authenticated principal, POST admin-only.
+func TestConfigRoles(t *testing.T) {
+	eng := &stubEngine{threshold: 0.45}
+	e := newEnv(t, eng, "Team", true, false)
+
+	// Anonymous GET → 401.
+	if rec := get(t, e.s, nil, "/api/config"); rec.Code != http.StatusUnauthorized {
+		t.Errorf("anon GET config: got %d, want 401", rec.Code)
+	}
+	// Reader GET → 200.
+	var cfg struct {
+		Threshold float64 `json:"threshold"`
+	}
+	if rec := get(t, e.s, e.reader, "/api/config"); rec.Code != http.StatusOK {
+		t.Fatalf("reader GET config: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	decodeBody(t, get(t, e.s, e.reader, "/api/config"), &cfg)
+	if cfg.Threshold != 0.45 {
+		t.Errorf("threshold = %v", cfg.Threshold)
+	}
+	// Reader POST → 403.
+	if rec := sendJSON(t, e.s, e.reader, "/api/config", map[string]float64{"threshold": 0.6}); rec.Code != http.StatusForbidden {
+		t.Errorf("reader POST config: got %d, want 403", rec.Code)
+	}
+	// Admin POST → 200, engine + store updated.
+	if rec := sendJSON(t, e.s, e.admin, "/api/config", map[string]float64{"threshold": 0.6}); rec.Code != http.StatusOK {
+		t.Fatalf("admin POST config: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if eng.threshold != 0.6 {
+		t.Errorf("threshold not applied to the engine: %v", eng.threshold)
+	}
+	if e.db.Threshold() == nil || *e.db.Threshold() != 0.6 {
+		t.Errorf("threshold not persisted")
 	}
 }

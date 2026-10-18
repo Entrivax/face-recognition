@@ -38,3 +38,38 @@ export function plural(n: number, word = "photo"): string {
 export function foldText(s: string): string {
 	return s.toLowerCase().normalize("NFD").replace(/\p{M}/gu, "");
 }
+
+/**
+ * Username rules for account-creation forms (setup + the admin users
+ * manager), mirroring the server's validation: starts with a letter or
+ * digit, then letters, digits, dots, underscores or hyphens, 2–32 chars.
+ */
+export const USERNAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{1,31}$/;
+
+/**
+ * Copy text to the clipboard: the async Clipboard API when available, with
+ * a hidden-textarea execCommand fallback for non-secure contexts. Returns
+ * whether the copy (probably) succeeded so the caller can react.
+ */
+export async function copyText(text: string): Promise<boolean> {
+	if (navigator.clipboard && window.isSecureContext) {
+		try {
+			await navigator.clipboard.writeText(text);
+			return true;
+		} catch { /* fall through to the legacy path */ }
+	}
+	try {
+		const ta = document.createElement("textarea");
+		ta.value = text;
+		ta.style.position = "fixed";
+		ta.style.opacity = "0";
+		document.body.appendChild(ta);
+		ta.focus();
+		ta.select();
+		const ok = document.execCommand("copy");
+		ta.remove();
+		return ok;
+	} catch {
+		return false;
+	}
+}

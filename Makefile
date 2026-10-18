@@ -102,9 +102,18 @@ ort:
 dataset-test: ort
 	./scripts/dataset-test.sh
 
-# Build, then enroll the people/ dataset into data/faces.db.
+# Build, then enroll a dataset repository into data/faces.db. Datasets are
+# per-repository now, so REPO (a repo name or id) is required:
+#   make enroll REPO="My people"
+# Create repositories from the admin UI, or wrap the legacy flat people/
+# layout into one first: ./$(BINARY) repo import --name "My people".
 enroll: build
-	./$(BINARY) enroll
+	@if [ -z "$(REPO)" ]; then \
+	  echo "make enroll: REPO is required (name or id of the repository to enroll)"; \
+	  echo "  usage: make enroll REPO=\"My people\""; \
+	  exit 2; \
+	fi
+	./$(BINARY) enroll --repo "$(REPO)"
 
 # Build, then start the API + web UI on :8080.
 serve: build

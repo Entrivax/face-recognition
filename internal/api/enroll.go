@@ -14,11 +14,11 @@ import (
 )
 
 // handleEnrollPerson adds one or more uploaded photos to a (new or existing)
-// person. Accepts multipart files under "images" (or "image"). On success each
-// photo's embedding goes into the DB and the image file itself is written into
-// the person's folder under the people directory, so runtime uploads become
-// part of the dataset.
-func (s *Server) handleEnrollPerson(w http.ResponseWriter, r *http.Request, name string) {
+// person of the repository. Accepts multipart files under "images" (or
+// "image"). On success each photo's embedding goes into the DB (repo-scoped
+// mutator) and the image file itself is written into the person's folder
+// under people/<repoID>/, so runtime uploads become part of the dataset.
+func (s *Server) handleEnrollPerson(w http.ResponseWriter, r *http.Request, name, repoID string) {
 	if r.Method != http.MethodPost {
 		writeErr(w, http.StatusMethodNotAllowed, "POST required")
 		return
@@ -80,7 +80,7 @@ func (s *Server) handleEnrollPerson(w http.ResponseWriter, r *http.Request, name
 	}
 	if workers <= 1 {
 		for i, f := range files {
-			rel, err := enroll.EnrollBytes(s.eng, s.db, s.cfg.PeopleDir, name, f.name, f.data)
+			rel, err := enroll.EnrollBytes(s.eng, s.db, s.cfg.PeopleDir, repoID, name, f.name, f.data)
 			results[i] = enrollResult{rel: rel, err: err}
 		}
 	} else {
@@ -91,7 +91,7 @@ func (s *Server) handleEnrollPerson(w http.ResponseWriter, r *http.Request, name
 			go func() {
 				defer wg.Done()
 				for i := range next {
-					rel, err := enroll.EnrollBytes(s.eng, s.db, s.cfg.PeopleDir, name, files[i].name, files[i].data)
+					rel, err := enroll.EnrollBytes(s.eng, s.db, s.cfg.PeopleDir, repoID, name, files[i].name, files[i].data)
 					results[i] = enrollResult{rel: rel, err: err}
 				}
 			}()
@@ -123,11 +123,11 @@ func (s *Server) handleEnrollPerson(w http.ResponseWriter, r *http.Request, name
 }
 
 // handleEnrollFace enrolls one specific face of an uploaded photo as (or
-// into) the named person. Body: multipart "image" plus "face_index" — a
-// 1-based index into the detection order /api/recognize reported for the same
-// bytes (detection is deterministic). The UI's "name this face" action on
-// unknown recognition results uses it.
-func (s *Server) handleEnrollFace(w http.ResponseWriter, r *http.Request, name string) {
+// into) the named person of the repository. Body: multipart "image" plus
+// "face_index" — a 1-based index into the detection order /api/recognize
+// reported for the same bytes (detection is deterministic). The UI's "name
+// this face" action on unknown recognition results uses it.
+func (s *Server) handleEnrollFace(w http.ResponseWriter, r *http.Request, name, repoID string) {
 	if r.Method != http.MethodPost {
 		writeErr(w, http.StatusMethodNotAllowed, "POST required")
 		return
@@ -151,7 +151,7 @@ func (s *Server) handleEnrollFace(w http.ResponseWriter, r *http.Request, name s
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	saved, err := enroll.EnrollFace(s.eng, s.db, s.cfg.PeopleDir, name, "upload", img, idx)
+	saved, err := enroll.EnrollFace(s.eng, s.db, s.cfg.PeopleDir, repoID, name, "upload", img, idx)
 	if err != nil {
 		switch {
 		case errors.Is(err, enroll.ErrFaceIndex):
@@ -170,16 +170,32 @@ func (s *Server) handleEnrollFace(w http.ResponseWriter, r *http.Request, name s
 	writeJSON(w, http.StatusOK, map[string]any{"person": name, "saved": saved})
 }
 
-// handleEnrollFolder rescans the people/ directory (incremental).
+// handleEnrollFolder rescans one repository's dataset folder
+// (people/<repoID>, incremental; ?repo= required) as a writer of that
+// repository. The scan only ever touches the repository's own persons.
 func (s *Server) handleEnrollFolder(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeErr(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	repoID, ok := s.requireRepo(w, r)
+	if !ok {
+		return
+	}
+	if !s.requireRepoRole(w, r, repoID, roleWriter) {
+		return
+	}
+	// Enrollment (and the rescan) turns repoID into a filesystem path:
+	// refuse values that resolve to no stored repository (the writer role
+	// check alone passes admins on any id).
+	if !s.requireExistingRepo(w, repoID) {
 		return
 	}
 	force := r.URL.Query().Get("force") == "true"
 	prune := r.URL.Query().Get("prune") == "true"
 	res, err := enroll.Scan(s.eng, s.db, enroll.Options{
 		PeopleDir: s.cfg.PeopleDir,
+		RepoID:    repoID,
 		Force:     force,
 		Prune:     prune,
 		Workers:   s.workers,

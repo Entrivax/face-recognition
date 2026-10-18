@@ -1,4 +1,4 @@
-package auth
+package users
 
 import (
 	"crypto/rand"
@@ -11,6 +11,10 @@ import (
 
 	"golang.org/x/crypto/argon2"
 )
+
+// passwordMinLen is the minimum accepted password length (also enforced by
+// HashPassword itself, so every hashing path validates it).
+const passwordMinLen = 8
 
 // Argon2id parameters used by HashPassword when creating NEW hashes. The
 // full parameter set travels inside the PHC string, so hashes created with
@@ -27,17 +31,20 @@ const (
 
 // HashPassword derives an argon2id PHC-encoded hash of the password using a
 // fresh random salt. The returned string contains no secret, only the
-// parameters, salt and digest — it is what RECOGN_ADMIN_PASSWORD_HASH stores,
-// so a leaked environment variable does not leak the password itself.
-func HashPassword(password []byte) (string, error) {
-	if len(password) == 0 {
-		return "", errors.New("password is empty")
+// parameters, salt and digest — it is what the users store persists, so a
+// leaked database file does not leak the password itself.
+//
+// Passwords shorter than passwordMinLen (including the empty password) are
+// rejected with an error before any hashing happens.
+func HashPassword(password string) (string, error) {
+	if len(password) < passwordMinLen {
+		return "", fmt.Errorf("password must be at least %d characters", passwordMinLen)
 	}
 	salt := make([]byte, argon2SaltLen)
 	if _, err := rand.Read(salt); err != nil {
 		return "", fmt.Errorf("generate salt: %w", err)
 	}
-	key := argon2.IDKey(password, salt, argon2Time, argon2Memory, argon2Threads, argon2KeyLen)
+	key := argon2.IDKey([]byte(password), salt, argon2Time, argon2Memory, argon2Threads, argon2KeyLen)
 	return fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
 		argon2.Version, argon2Memory, argon2Time, argon2Threads,
 		base64.RawStdEncoding.EncodeToString(salt),
@@ -45,18 +52,17 @@ func HashPassword(password []byte) (string, error) {
 	), nil
 }
 
-// verifyPassword checks a provided password against the configured argon2id
-// PHC hash. The candidate is re-derived with the hash's own parameters and
-// compared in constant time. An empty or malformed configured hash never
-// matches: only Enabled/PasswordEnabled may decide that password auth is off,
-// and auth.New validates the configured hash at startup so a typo cannot
-// silently disable logins.
-func verifyPassword(provided, configured string) bool {
-	params, salt, want, err := parsePasswordHash(configured)
+// VerifyPassword checks a provided password against a stored argon2id PHC
+// hash. The candidate is re-derived with the hash's own parameters and
+// compared in constant time. An empty or malformed stored hash never
+// matches: an unknown or corrupted record can never accidentally
+// authenticate (a deleted user must always re-verify through GetUser).
+func VerifyPassword(hash, password string) bool {
+	params, salt, want, err := parsePasswordHash(hash)
 	if err != nil {
 		return false
 	}
-	got := argon2.IDKey([]byte(provided), salt, params.time, params.memory, params.threads, uint32(len(want)))
+	got := argon2.IDKey([]byte(password), salt, params.time, params.memory, params.threads, uint32(len(want)))
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
 
@@ -113,7 +119,7 @@ func parsePasswordHash(encoded string) (argon2Params, []byte, []byte, error) {
 // parseCosts parses the "m=65536,t=2,p=1" PHC cost segment (already split on
 // commas), rejecting wrong field counts and zero or unparsable values. The
 // guards mirror argon2.IDKey's panic conditions (time/threads ≥ 1), so
-// verifyPassword can never trip a library panic on a crafted hash. m and t
+// VerifyPassword can never trip a library panic on a crafted hash. m and t
 // are 32-bit, p (the lane count argon2 takes as uint8) is 8-bit.
 func parseCosts(segments []string) (argon2Params, error) {
 	if len(segments) != 3 {

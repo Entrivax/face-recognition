@@ -2,12 +2,14 @@ package enroll
 
 import (
 	"bytes"
+	"errors"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"image/png"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -109,7 +111,7 @@ func TestEnrollBytesWritesImage(t *testing.T) {
 	eng := &stubEngine{faces: testFace()}
 	img := []byte("uploaded-image-bytes")
 
-	rel, err := EnrollBytes(eng, database, peopleDir, "Bob", "photo.PNG", img)
+	rel, err := EnrollBytes(eng, database, peopleDir, "", "Bob", "photo.PNG", img)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +138,7 @@ func TestEnrollBytesWritesImage(t *testing.T) {
 	}
 
 	// Re-uploading the same bytes must stay idempotent.
-	if _, err := EnrollBytes(eng, database, peopleDir, "Bob", "other.jpg", img); err != nil {
+	if _, err := EnrollBytes(eng, database, peopleDir, "", "Bob", "other.jpg", img); err != nil {
 		t.Fatal(err)
 	}
 	p := database.Get("Bob")
@@ -153,16 +155,16 @@ func TestEnrollBytesRejections(t *testing.T) {
 	}
 	eng := &stubEngine{faces: testFace()}
 
-	if _, err := EnrollBytes(eng, database, "", "Bob", "x.jpg", []byte("img")); err == nil {
+	if _, err := EnrollBytes(eng, database, "", "", "Bob", "x.jpg", []byte("img")); err == nil {
 		t.Error("expected error when people dir is not configured")
 	}
 	for _, name := range []string{"", "..", ".", "a/b", `a\b`, ".hidden", "a\nb"} {
-		if _, err := EnrollBytes(eng, database, peopleDir, name, "x.jpg", []byte("img")); err == nil {
+		if _, err := EnrollBytes(eng, database, peopleDir, "", name, "x.jpg", []byte("img")); err == nil {
 			t.Errorf("expected rejection for name %q", name)
 		}
 	}
 	// A no-face upload must not write anything.
-	if _, err := EnrollBytes(&stubEngine{}, database, peopleDir, "Bob", "x.jpg", []byte("img")); err == nil {
+	if _, err := EnrollBytes(&stubEngine{}, database, peopleDir, "", "Bob", "x.jpg", []byte("img")); err == nil {
 		t.Error("expected error when no face is detected")
 	}
 	if _, err := os.Stat(filepath.Join(peopleDir, "Bob")); !os.IsNotExist(err) {
@@ -196,7 +198,7 @@ func TestEnrollBytesGeneratesThumbnail(t *testing.T) {
 	eng := &stubEngine{faces: []engine.Face{{BBox: [4]float64{30, 20, 40, 50}}}}
 	img := pngBytes(t, 120, 120)
 
-	if _, err := EnrollBytes(eng, database, peopleDir, "Bob", "photo.png", img); err != nil {
+	if _, err := EnrollBytes(eng, database, peopleDir, "", "Bob", "photo.png", img); err != nil {
 		t.Fatal(err)
 	}
 	p := database.Get("Bob")
@@ -222,7 +224,7 @@ func TestEnrollBytesGeneratesThumbnail(t *testing.T) {
 
 	// A second upload must not overwrite the existing thumbnail.
 	before := append([]byte(nil), raw...)
-	if _, err := EnrollBytes(eng, database, peopleDir, "Bob", "photo.png", img); err != nil {
+	if _, err := EnrollBytes(eng, database, peopleDir, "", "Bob", "photo.png", img); err != nil {
 		t.Fatal(err)
 	}
 	after, _ := os.ReadFile(thumbPath)
@@ -286,10 +288,10 @@ func TestScanPrunesMissingPhotos(t *testing.T) {
 	b2 := pngBytes(t, 41, 41)
 	name1 := db.HashBytes(b1)[:12] + ".png"
 	name2 := db.HashBytes(b2)[:12] + ".png"
-	if _, err := EnrollBytes(eng, database, peopleDir, "Bob", "a.png", b1); err != nil {
+	if _, err := EnrollBytes(eng, database, peopleDir, "", "Bob", "a.png", b1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := EnrollBytes(eng, database, peopleDir, "Bob", "b.png", b2); err != nil {
+	if _, err := EnrollBytes(eng, database, peopleDir, "", "Bob", "b.png", b2); err != nil {
 		t.Fatal(err)
 	}
 
@@ -501,7 +503,11 @@ func TestScanParallelProgressIndexes(t *testing.T) {
 	res, err := Scan(eng, database, Options{
 		PeopleDir: dir,
 		Workers:   4,
-		Progress:  func(person, file string, idx, total int) { mu.Lock(); calls = append(calls, call{person, file, idx, total}); mu.Unlock() },
+		Progress: func(person, file string, idx, total int) {
+			mu.Lock()
+			calls = append(calls, call{person, file, idx, total})
+			mu.Unlock()
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -531,5 +537,427 @@ func TestScanParallelProgressIndexes(t *testing.T) {
 		if idxReached[person] != 5 {
 			t.Errorf("person %s: last progress idx = %d, want 5", person, idxReached[person])
 		}
+	}
+}
+
+// ---- repository-scoped enrollment ----
+
+// TestScanRepoScoped checks that a repo-scoped scan walks only the
+// repository's dataset folder (PeopleDir/<RepoID>) and writes through the
+// repo-scoped mutators: the repo's persons get NewPersonID-prefixed IDs,
+// while legacy flat folders and other repositories stay untouched.
+func TestScanRepoScoped(t *testing.T) {
+	peopleDir := t.TempDir()
+	database, err := db.Open(filepath.Join(t.TempDir(), "emb.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := &stubEngine{faces: testFace()}
+
+	repo, err := database.CreateRepo("Team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := database.CreateRepo("Other")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	write := func(dir, person, name, content string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Join(dir, person), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, person, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(peopleDir, repo.ID), "Alice", "a.jpg", "alice-a")
+	write(filepath.Join(peopleDir, repo.ID), "Bob", "b.jpg", "bob-b")
+	write(filepath.Join(peopleDir, other.ID), "Carol", "c.jpg", "carol-c")
+	write(peopleDir, "Flat", "f.jpg", "flat-f") // legacy folder next to the repos
+
+	res, err := Scan(eng, database, Options{PeopleDir: peopleDir, RepoID: repo.ID})
+	if err != nil {
+		t.Fatalf("repo scan: %v", err)
+	}
+	if res.PeopleSeen != 2 || res.PhotosAdded != 2 {
+		t.Fatalf("repo scan saw %+v, want PeopleSeen=2 Added=2", res)
+	}
+
+	// The repo's persons are repo-scoped with NewPersonID-derived IDs.
+	team := database.PeopleByRepo(repo.ID)
+	if len(team) != 2 || findPerson(team, "Alice") == nil || findPerson(team, "Bob") == nil {
+		t.Fatalf("repo persons: %+v", team)
+	}
+	for _, p := range team {
+		if p.RepoID != repo.ID {
+			t.Errorf("person %q RepoID = %q, want %q", p.Name, p.RepoID, repo.ID)
+		}
+		if want := database.NewPersonID(repo.ID, p.Name); p.ID != want {
+			t.Errorf("person %q ID = %q, want %q", p.Name, p.ID, want)
+		}
+	}
+	// Other repositories and the legacy set were not touched.
+	if ps := database.PeopleByRepo(other.ID); len(ps) != 0 {
+		t.Errorf("other repo got persons from the scan: %+v", ps)
+	}
+	if database.PeopleCount(other.ID) != 0 {
+		t.Errorf("other repo should have no persons after the repo scan")
+	}
+	if p := database.Get("Flat"); p != nil {
+		t.Errorf("legacy folder must not be enrolled by a repo scan, got %+v", p)
+	}
+	if database.PhotoHash("Alice", "a.jpg") != "" {
+		t.Errorf("legacy PhotoHash must not see a repo person")
+	}
+	if got := database.PhotoHashInRepo(repo.ID, "Alice", "a.jpg"); got != db.HashBytes([]byte("alice-a")) {
+		t.Errorf("repo PhotoHash mismatch: %q", got)
+	}
+
+	// A legacy scan of the same root enrols only the flat folder (and
+	// leaves the repo persons alone). The repo folders themselves are
+	// walked too — they are directories — but hold no image files at their
+	// root, so they contribute nothing.
+	res, err = Scan(eng, database, Options{PeopleDir: peopleDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.PhotosAdded != 1 || findPerson(database.PeopleByRepo(repo.ID), "Bob") == nil {
+		t.Fatalf("legacy scan results: %+v", res)
+	}
+	if p := database.Get("Flat"); p == nil || p.RepoID != "" {
+		t.Errorf("legacy scan should enrol the flat folder as a legacy person, got %+v", p)
+	}
+	if len(database.PeopleByRepo(repo.ID)) != 2 {
+		t.Errorf("legacy scan must not add to or remove from the repo")
+	}
+}
+
+// TestLegacyScanIgnoresRepoPersons checks the read side of the legacy
+// scoping rule: a legacy scan resolving a name that also exists as a repo
+// person must resolve the LEGACY record — a thumbnail generated for the
+// flat folder's photo goes to the legacy person, never to the repo person.
+func TestLegacyScanIgnoresRepoPersons(t *testing.T) {
+	peopleDir := t.TempDir()
+	database, err := db.Open(filepath.Join(t.TempDir(), "emb.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := &stubEngine{faces: testFace()}
+	repo, err := database.CreateRepo("Team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A repo-scoped DB record for "Alice" with no thumbnail yet (the way a
+	// first enrollment whose thumbnail failed looks) — and no files on
+	// disk for the repo.
+	img := pngBytes(t, 40, 40)
+	if err := database.AddPhotoHashedForRepo(repo.ID, "Alice", "a.png", db.HashBytes(img), []float32{0.5}); err != nil {
+		t.Fatal(err)
+	}
+	// A legacy flat folder with the SAME name next to the repo folder.
+	if err := os.MkdirAll(filepath.Join(peopleDir, "Alice"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(peopleDir, "Alice", "flat.png"), img, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := Scan(eng, database, Options{PeopleDir: peopleDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.PhotosAdded != 1 {
+		t.Fatalf("legacy scan: %+v, want 1 added", res)
+	}
+
+	// The flat photo belongs to a NEW legacy person, with its thumbnail.
+	legacy := database.GetLegacy("Alice")
+	if legacy == nil || legacy.RepoID != "" || len(legacy.Photos) != 1 {
+		t.Fatalf("legacy Alice: %+v, want one legacy person with 1 photo", legacy)
+	}
+	if legacy.Thumb == "" || legacy.ThumbSrc != "flat.png" {
+		t.Fatalf("legacy Alice thumb = %q src %q, want a generated sidecar from flat.png", legacy.Thumb, legacy.ThumbSrc)
+	}
+	// The repo person was not touched — old global-lookup behavior would
+	// have attributed the legacy photo's thumbnail to them.
+	repoAlice := database.GetInRepo(repo.ID, "Alice")
+	if repoAlice == nil || len(repoAlice.Photos) != 1 || repoAlice.Photos[0].Path != "a.png" {
+		t.Fatalf("repo Alice photos: %+v, want unchanged (1 photo, a.png)", repoAlice)
+	}
+	if repoAlice.Thumb != "" || repoAlice.ThumbSrc != "" {
+		t.Errorf("repo Alice must not gain a thumbnail from the legacy scan: %+v", repoAlice)
+	}
+}
+
+// TestScanRepoScopedIncrementalByHash checks the incremental contract inside
+// a repository: unchanged files keep, a changed file re-enrols.
+func TestScanRepoScopedIncrementalByHash(t *testing.T) {
+	peopleDir := t.TempDir()
+	database, err := db.Open(filepath.Join(t.TempDir(), "emb.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := database.CreateRepo("Team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(peopleDir, repo.ID, "Alice")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("a.jpg", "image-a")
+	write("b.jpg", "image-b")
+	eng := &stubEngine{faces: testFace()}
+
+	if res, err := Scan(eng, database, Options{PeopleDir: peopleDir, RepoID: repo.ID}); err != nil {
+		t.Fatal(err)
+	} else if res.PhotosAdded != 2 {
+		t.Fatalf("first scan: expected added=2, got %+v", res)
+	}
+	if res, err := Scan(eng, database, Options{PeopleDir: peopleDir, RepoID: repo.ID}); err != nil {
+		t.Fatal(err)
+	} else if res.PhotosAdded != 0 || res.PhotosKept != 2 {
+		t.Fatalf("second scan: expected added=0 kept=2, got %+v", res)
+	}
+	write("a.jpg", "image-a-v2")
+	if res, err := Scan(eng, database, Options{PeopleDir: peopleDir, RepoID: repo.ID}); err != nil {
+		t.Fatal(err)
+	} else if res.PhotosAdded != 1 || res.PhotosKept != 1 {
+		t.Fatalf("changed-file scan: expected added=1 kept=1, got %+v", res)
+	}
+}
+
+// TestScanRepoScopedMissingDir checks that a repo-scoped scan on a missing
+// dataset folder fails with the ReadDir error (wrapped, so callers can test
+// with errors.Is(err, os.ErrNotExist)) instead of silently doing nothing.
+func TestScanRepoScopedMissingDir(t *testing.T) {
+	peopleDir := t.TempDir()
+	database, err := db.Open(filepath.Join(t.TempDir(), "emb.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := database.CreateRepo("Team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = Scan(&stubEngine{faces: testFace()}, database, Options{PeopleDir: peopleDir, RepoID: repo.ID})
+	if err == nil {
+		t.Fatal("expected an error for a missing repo folder")
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("error should wrap the ReadDir failure, got %v", err)
+	}
+	if !strings.Contains(err.Error(), repo.ID) {
+		t.Fatalf("error should name the dataset folder, got %v", err)
+	}
+}
+
+// TestScanRepoScopedPrune checks that prune inside a repository drops only
+// that repo's stale entries: a vanished person folder of the repo loses its
+// photos, other repositories and legacy persons are untouched.
+func TestScanRepoScopedPrune(t *testing.T) {
+	peopleDir := t.TempDir()
+	database, err := db.Open(filepath.Join(t.TempDir(), "emb.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := &stubEngine{faces: testFace()}
+	repoA, err := database.CreateRepo("A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoB, err := database.CreateRepo("B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b1, b2 := pngBytes(t, 40, 40), pngBytes(t, 41, 41)
+	name1, name2 := db.HashBytes(b1)[:12]+".png", db.HashBytes(b2)[:12]+".png"
+	if _, err := EnrollBytes(eng, database, peopleDir, repoA.ID, "Bob", "a.png", b1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EnrollBytes(eng, database, peopleDir, repoA.ID, "Bob", "b.png", b2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EnrollBytes(eng, database, peopleDir, repoB.ID, "Bob", "x.png", b1); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AddPhoto("LegacyBob", "l.png", b1, []float32{1}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Without Prune the vanished file stays in the DB.
+	if err := os.Remove(filepath.Join(peopleDir, repoA.ID, "Bob", name2)); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Scan(eng, database, Options{PeopleDir: peopleDir, RepoID: repoA.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.PhotosPruned != 0 {
+		t.Fatalf("prune without opt-in: pruned %d", res.PhotosPruned)
+	}
+
+	// With Prune the stale entry of repo A's Bob is dropped.
+	res, err = Scan(eng, database, Options{PeopleDir: peopleDir, RepoID: repoA.ID, Prune: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.PhotosPruned != 1 {
+		t.Fatalf("expected 1 pruned, got %+v", res)
+	}
+	if p := database.GetInRepo(repoA.ID, "Bob"); p == nil || len(p.Photos) != 1 || p.Photos[0].Path != name1 {
+		t.Fatalf("expected only %q to remain in repo A's Bob, got %+v", name1, p)
+	}
+	// The other repo's Bob and the legacy Bob are untouched.
+	if p := database.GetInRepo(repoB.ID, "Bob"); p == nil || len(p.Photos) != 1 {
+		t.Errorf("repo B's Bob was touched by repo A's prune: %+v", p)
+	}
+	if p := database.Get("LegacyBob"); p == nil || len(p.Photos) != 1 {
+		t.Errorf("legacy Bob was touched by a repo prune: %+v", p)
+	}
+
+	// The whole person folder vanishes: repo A's Bob loses all entries but
+	// stays enrolled; repo B's Bob survives untouched.
+	if err := os.RemoveAll(filepath.Join(peopleDir, repoA.ID, "Bob")); err != nil {
+		t.Fatal(err)
+	}
+	res, err = Scan(eng, database, Options{PeopleDir: peopleDir, RepoID: repoA.ID, Prune: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.PhotosPruned != 1 {
+		t.Fatalf("expected 1 pruned for the missing folder, got %+v", res)
+	}
+	if p := database.GetInRepo(repoA.ID, "Bob"); p == nil || len(p.Photos) != 0 {
+		t.Fatalf("repo A's Bob should remain enrolled with 0 photos, got %+v", p)
+	}
+	if p := database.GetInRepo(repoB.ID, "Bob"); p == nil || len(p.Photos) != 1 {
+		t.Errorf("repo B's Bob was touched by the missing-folder prune: %+v", p)
+	}
+}
+
+// TestEnrollBytesRepoScoped checks a repo-scoped upload: the file lands in
+// the repository's dataset folder, the DB write goes through the repo
+// mutator, the thumbnail is scoped by person ID, and the same person name
+// in two repositories stays two independent people.
+func TestEnrollBytesRepoScoped(t *testing.T) {
+	peopleDir := t.TempDir()
+	database, err := db.Open(filepath.Join(t.TempDir(), "emb.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoA, err := database.CreateRepo("A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoB, err := database.CreateRepo("B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := &stubEngine{faces: []engine.Face{{BBox: [4]float64{0, 0, 10, 10}}}}
+	img := pngBytes(t, 80, 80) // real image bytes: the thumbnail crop needs one
+
+	rel, err := EnrollBytes(eng, database, peopleDir, repoA.ID, "Bob", "photo.PNG", img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(repoA.ID, "Bob", db.HashBytes(img)[:12]+".png") // real PNG bytes → sniffed extension
+	if rel != want {
+		t.Fatalf("rel = %q, want %q", rel, want)
+	}
+	if _, err := os.Stat(filepath.Join(peopleDir, rel)); err != nil {
+		t.Fatalf("image not written: %v", err)
+	}
+	p := database.GetInRepo(repoA.ID, "Bob")
+	if p == nil || len(p.Photos) != 1 {
+		t.Fatalf("repo person not enrolled: %+v", p)
+	}
+	if p.RepoID != repoA.ID {
+		t.Errorf("RepoID = %q, want %q", p.RepoID, repoA.ID)
+	}
+	if got := database.PhotoHashInRepo(repoA.ID, "Bob", db.HashBytes(img)[:12]+".png"); got != db.HashBytes(img) {
+		t.Fatalf("DB hash mismatch for the repo-enrolled photo")
+	}
+	if database.PhotoHash("Bob", db.HashBytes(img)[:12]+".png") != "" {
+		t.Fatalf("legacy PhotoHash must not see a repo person")
+	}
+	if p.Thumb == "" {
+		t.Fatalf("expected a thumbnail sidecar for the repo person")
+	}
+	if _, err := os.Stat(filepath.Join(database.ThumbDir(), p.Thumb)); err != nil {
+		t.Fatalf("sidecar missing: %v", err)
+	}
+
+	// The same name in another repo is an independent person with its own
+	// photo and thumbnail.
+	relB, err := EnrollBytes(eng, database, peopleDir, repoB.ID, "Bob", "photo.PNG", img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if relB == rel {
+		t.Fatalf("the two repos must save to different folders, both %q", relB)
+	}
+	pB := database.GetInRepo(repoB.ID, "Bob")
+	if pB == nil || pB.ID == p.ID || len(pB.Photos) != 1 {
+		t.Fatalf("repo B's Bob: %+v", pB)
+	}
+	if pB.Thumb == "" || pB.Thumb == p.Thumb {
+		t.Errorf("thumbnails must be keyed per person: %q vs %q", pB.Thumb, p.Thumb)
+	}
+
+	// A rescan of repo A keeps the uploaded file (already enrolled).
+	res, err := Scan(eng, database, Options{PeopleDir: peopleDir, RepoID: repoA.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.PhotosAdded != 0 || res.PhotosKept != 1 {
+		t.Fatalf("rescan after repo upload: expected added=0 kept=1, got %+v", res)
+	}
+
+	// Re-uploading the same bytes into repo B stays idempotent.
+	if _, err := EnrollBytes(eng, database, peopleDir, repoB.ID, "Bob", "other.jpg", img); err != nil {
+		t.Fatal(err)
+	}
+	if pB = database.GetInRepo(repoB.ID, "Bob"); pB == nil || len(pB.Photos) != 1 {
+		t.Fatalf("expected exactly 1 photo after duplicate repo upload, got %+v", pB)
+	}
+}
+
+// TestEnrollBytesRepoScopedCanonicalFolder checks that a repo-scoped
+// enrollment of "alice" when "Alice" already exists in the repo lands in the
+// existing canonical folder instead of creating a case-duplicate one.
+func TestEnrollBytesRepoScopedCanonicalFolder(t *testing.T) {
+	peopleDir := t.TempDir()
+	database, err := db.Open(filepath.Join(t.TempDir(), "emb.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := database.CreateRepo("Team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := &stubEngine{faces: []engine.Face{{BBox: [4]float64{0, 0, 10, 10}}}}
+
+	if _, err := EnrollBytes(eng, database, peopleDir, repo.ID, "Alice", "a.png", []byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	rel, err := EnrollBytes(eng, database, peopleDir, repo.ID, "alice", "b.png", []byte("second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(filepath.ToSlash(rel), "/Alice/") {
+		t.Fatalf("rel = %q, want it under the canonical folder", rel)
+	}
+	p := database.GetInRepo(repo.ID, "ALICE")
+	if p == nil || p.Name != "Alice" || len(p.Photos) != 2 {
+		t.Fatalf("unexpected person after case-variant enrollment: %+v", p)
 	}
 }

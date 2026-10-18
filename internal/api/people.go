@@ -8,12 +8,23 @@ import (
 	"recogn/internal/enroll"
 )
 
+// handlePeople answers GET /api/people?repo=<id|name>: the person list of
+// one repository, for callers holding at least the reader role on it
+// (share tokens included). The summary shape is unchanged; the repo ID
+// echoes back so clients can pin which dataset the rows belong to.
 func (s *Server) handlePeople(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeErr(w, http.StatusMethodNotAllowed, "GET required")
 		return
 	}
-	people := s.db.People()
+	repoID, ok := s.requireRepo(w, r)
+	if !ok {
+		return
+	}
+	if !s.requireRepoRole(w, r, repoID, roleReader) {
+		return
+	}
+	people := s.db.PeopleByRepo(repoID)
 	type summary struct {
 		ID      string   `json:"id"`
 		Name    string   `json:"name"`
@@ -38,13 +49,14 @@ func (s *Server) handlePeople(w http.ResponseWriter, r *http.Request) {
 			Thumb: thumb, Aliases: aliases,
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"people": out, "count": len(out)})
+	writeJSON(w, http.StatusOK, map[string]any{"people": out, "count": len(out), "repo": repoID})
 }
 
-// handlePersonSubroutes dispatches /api/people/{name}/… admin subroutes:
-// enroll, enroll-face, thumbnail, rename, meta, photos and their subpaths.
-// The public details GET (exactly one path segment) never reaches here —
-// routes() answers it before the admin middleware.
+// handlePersonSubroutes dispatches /api/people/{name}/… — the reader-visible
+// details view, the writer-gated mutations (enroll, enroll-face, thumbnail,
+// rename, meta, photo management) and person deletion. Every route needs
+// ?repo= and resolves the person through that repository (db.GetInRepo), so
+// the same person name in two repositories stays two people.
 func (s *Server) handlePersonSubroutes(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/api/people/")
 	parts := strings.SplitN(rest, "/", 2)
@@ -53,77 +65,119 @@ func (s *Server) handlePersonSubroutes(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "person name required")
 		return
 	}
-	if len(parts) == 2 && parts[1] == "enroll" {
-		s.handleEnrollPerson(w, r, name)
+	repoID, ok := s.requireRepo(w, r)
+	if !ok {
 		return
 	}
-	if len(parts) == 2 && parts[1] == "enroll-face" {
-		s.handleEnrollFace(w, r, name)
-		return
-	}
-	if len(parts) == 2 && parts[1] == "thumbnail" {
-		s.handleSelectThumb(w, r, name)
-		return
-	}
-	if len(parts) == 2 && parts[1] == "rename" {
-		s.handleRenamePerson(w, r, name)
-		return
-	}
-	if len(parts) == 2 && parts[1] == "photos" {
-		s.handlePersonPhotos(w, r, name)
-		return
-	}
-	if len(parts) == 2 && parts[1] == "meta" {
-		s.handleSetMeta(w, r, name)
-		return
-	}
-	if len(parts) == 2 && strings.HasPrefix(parts[1], "photos/") {
+	switch {
+	case len(parts) == 1 && r.Method == http.MethodGet:
+		// The details document (name, optional metadata, photo count).
+		s.handleGetPerson(w, r, name, repoID)
+	case len(parts) == 1:
+		// DELETE /api/people/{name} and everything else.
+		if r.Method != http.MethodDelete {
+			writeErr(w, http.StatusMethodNotAllowed, "unsupported method")
+			return
+		}
+		if !s.requireRepoRole(w, r, repoID, roleWriter) {
+			return
+		}
+		s.handleDeletePerson(w, r, name, repoID)
+	case parts[1] == "enroll":
+		if !s.requireRepoRole(w, r, repoID, roleWriter) {
+			return
+		}
+		if !s.requireExistingRepo(w, repoID) {
+			return
+		}
+		s.handleEnrollPerson(w, r, name, repoID)
+	case parts[1] == "enroll-face":
+		if !s.requireRepoRole(w, r, repoID, roleWriter) {
+			return
+		}
+		if !s.requireExistingRepo(w, repoID) {
+			return
+		}
+		s.handleEnrollFace(w, r, name, repoID)
+	case parts[1] == "thumbnail":
+		if !s.requireRepoRole(w, r, repoID, roleWriter) {
+			return
+		}
+		s.handleSelectThumb(w, r, name, repoID)
+	case parts[1] == "rename":
+		if !s.requireRepoRole(w, r, repoID, roleWriter) {
+			return
+		}
+		s.handleRenamePerson(w, r, name, repoID)
+	case parts[1] == "photos":
+		// The photos-manager list (writer tooling); the handler answers
+		// 405 for methods other than GET.
+		if !s.requireRepoRole(w, r, repoID, roleWriter) {
+			return
+		}
+		s.handlePersonPhotos(w, r, name, repoID)
+	case parts[1] == "meta":
+		if !s.requireRepoRole(w, r, repoID, roleWriter) {
+			return
+		}
+		s.handleSetMeta(w, r, name, repoID)
+	case strings.HasPrefix(parts[1], "photos/"):
 		photoPath := strings.TrimPrefix(parts[1], "photos/")
 		// /photos/{path}/detect inspects the stored photo's faces; basenames
 		// cannot contain "/", so the suffix is unambiguous.
 		if strings.HasSuffix(photoPath, "/detect") {
-			s.handlePersonPhotoDetect(w, r, name, strings.TrimSuffix(photoPath, "/detect"))
+			if !s.requireRepoRole(w, r, repoID, roleReader) {
+				return
+			}
+			s.handlePersonPhotoDetect(w, r, name, repoID, strings.TrimSuffix(photoPath, "/detect"))
+			return
+		}
+		// The full-resolution file is writer-only (a reader gets the
+		// thumbnail and the detect view).
+		if !s.requireRepoRole(w, r, repoID, roleWriter) {
 			return
 		}
 		if r.Method == http.MethodDelete {
-			s.handleDeletePhoto(w, r, name, photoPath)
+			s.handleDeletePhoto(w, r, name, repoID, photoPath)
 			return
 		}
-		s.handlePersonPhoto(w, r, name, photoPath)
-		return
-	}
-	switch r.Method {
-	case http.MethodDelete:
-		s.handleDeletePerson(w, r, name)
-	case http.MethodGet:
-		s.handleGetPerson(w, r, name)
+		s.handlePersonPhoto(w, r, name, repoID, photoPath)
 	default:
-		writeErr(w, http.StatusMethodNotAllowed, "unsupported method")
+		writeErr(w, http.StatusNotFound, "unknown endpoint")
 	}
 }
 
-// handleGetPerson serves the public person-details document: identity, the
-// photo count (already public via the list endpoint) and the optional
-// metadata — aliases, partial birthdate, URLs, markdown description. Fields
-// that were never filled are omitted so the UI can hide empty sections.
+// handleGetPerson serves the reader-visible details document for one person
+// of the repository: identity, the photo count (already public via the list
+// endpoint) and the optional metadata — aliases, partial birthdate, URLs,
+// markdown description — plus the repo context (id and display name).
 // Enrolled photo paths and hashes are not listed here: the full-res photo
-// files stay admin-only, and the photos manager reads GET …/photos instead.
-func (s *Server) handleGetPerson(w http.ResponseWriter, r *http.Request, name string) {
+// files stay writer-only, and the photos manager reads GET …/photos instead.
+func (s *Server) handleGetPerson(w http.ResponseWriter, r *http.Request, name, repoID string) {
+	if !s.requireRepoRole(w, r, repoID, roleReader) {
+		return
+	}
 	if err := enroll.CheckName(name); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	p := s.db.Get(name)
+	p := s.db.GetInRepo(repoID, name)
 	if p == nil {
 		writeErr(w, http.StatusNotFound, "person not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, personDetailDoc(p))
+	resp := personDetailDoc(p)
+	resp["repo"] = repoID
+	if repo, ok := s.db.GetRepo(repoID); ok {
+		resp["repo_name"] = repo.Name
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
-// personDetailDoc renders the public details document for a person. Meta
-// values must already be validated (the API layer validates writes; stored
-// values are trusted — the store is only written through validated paths).
+// personDetailDoc renders the reader-visible details document for a person.
+// Meta values must already be validated (the API layer validates writes;
+// stored values are trusted — the store is only written through validated
+// paths).
 func personDetailDoc(p *db.Person) map[string]any {
 	resp := map[string]any{
 		"id":     p.ID,
@@ -147,15 +201,16 @@ func personDetailDoc(p *db.Person) map[string]any {
 	return resp
 }
 
-// handlePersonPhotos serves a person's enrolled photo list for the admin
-// photos manager (paths + content hashes, no embeddings; thumb_src names the
-// photo the avatar comes from).
-func (s *Server) handlePersonPhotos(w http.ResponseWriter, r *http.Request, name string) {
+// handlePersonPhotos serves a person's enrolled photo list for the
+// photos-manager modal (writer-only: it exposes the enrolled photo paths
+// and content hashes; no embeddings). thumb_src names the photo the avatar
+// comes from.
+func (s *Server) handlePersonPhotos(w http.ResponseWriter, r *http.Request, name, repoID string) {
 	if r.Method != http.MethodGet {
 		writeErr(w, http.StatusMethodNotAllowed, "GET required")
 		return
 	}
-	p := s.db.Get(name)
+	p := s.db.GetInRepo(repoID, name)
 	if p == nil {
 		writeErr(w, http.StatusNotFound, "person not found")
 		return

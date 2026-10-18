@@ -5,11 +5,17 @@ import (
 	"net/http"
 )
 
+// handleConfig is mounted under RequireAuth (share tokens do not apply):
+// GET reports the current threshold to any authenticated principal; POST
+// stays admin-only.
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, map[string]any{"threshold": s.eng.Threshold()})
 	case http.MethodPost:
+		if !s.requireAdminRole(w, r) {
+			return
+		}
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		var body struct {
 			Threshold float64 `json:"threshold"`

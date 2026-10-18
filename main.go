@@ -1,39 +1,37 @@
 // Command recogn is a face-recognition application with a CLI, a REST API and
-// a minimal web UI. It enrolls known people from a people/ folder and then
-// detects and identifies every face in new photos.
+// a minimal web UI. It organises known people into repositories — each a
+// people/<repo-uuid>/<Person>/ photo folder — enrolls them from those folders
+// and then detects and identifies every face in new photos.
 //
 // Usage:
 //
-//	recogn enroll [--force]            build/rebuild the face DB from people/
-//	recogn recognize <image...>        identify faces in photos
-//	recogn people                      list enrolled identities
-//	recogn export [--out path]         write the face database as JSON
-//	recogn serve [--addr :8080]        start the REST API + web UI
-//	recogn hash-password               generate an argon2id admin password hash
+//	recogn repo import --name "Name"      wrap the legacy flat people/ folders into a new repository
+//	recogn enroll --repo NAME|ID          build/rebuild a repository's face DB
+//	recogn recognize --repo NAME|ID img   identify faces in photos, scoped to the repository
+//	recogn people --repo NAME|ID          list a repository's enrolled identities
+//	recogn export [--out path]            write the face database as JSON
+//	recogn serve [--addr :8080]           start the REST API + web UI
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"recogn/internal/api"
-	"recogn/internal/auth"
 	"recogn/internal/config"
 	"recogn/internal/db"
 	"recogn/internal/engine"
@@ -54,11 +52,13 @@ func main() {
 	case "enroll":
 		fs := newFlagSet("enroll")
 		force := fs.Bool("force", false, "re-embed all photos, ignoring cached hashes")
-		prune := fs.Bool("prune", false, "drop DB photo entries whose files are missing from the people folder")
+		prune := fs.Bool("prune", false, "drop DB photo entries whose files are missing from the person folder")
+		repoSpec := fs.String("repo", "", "repository to enroll (NAME or ID); required")
 		cfg, set := parseFlags(fs, rest)
-		must(runEnroll(cfg, *force, *prune, set["threshold"]))
+		must(runEnroll(cfg, *repoSpec, *force, *prune, set["threshold"]))
 	case "recognize":
 		fs := newFlagSet("recognize")
+		repoSpec := fs.String("repo", "", "repository whose identities may match (NAME or ID); required")
 		jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 		drawOut := fs.String("draw", "", "also write an annotated copy (boxes + labels): a .jpg/.jpeg path for a single image, or a directory for one copy per image")
 		cfg, set := parseFlags(fs, rest)
@@ -66,12 +66,15 @@ func main() {
 			fmt.Fprintln(os.Stderr, "recognize: provide at least one image path")
 			os.Exit(2)
 		}
-		must(runRecognize(cfg, fs.Args(), *jsonOut, *drawOut, set["threshold"]))
+		must(runRecognize(cfg, *repoSpec, fs.Args(), *jsonOut, *drawOut, set["threshold"]))
 	case "people":
 		fs := newFlagSet("people")
+		repoSpec := fs.String("repo", "", "repository whose people to list (NAME or ID); required")
 		jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 		cfg, _ := parseFlags(fs, rest)
-		must(runPeople(cfg, *jsonOut))
+		must(runPeople(cfg, *repoSpec, *jsonOut))
+	case "repo":
+		repoCommand(rest)
 	case "export":
 		fs := newFlagSet("export")
 		out := fs.String("out", "", "output path for the JSON export (default: embeddings.json next to the database)")
@@ -81,11 +84,6 @@ func main() {
 		fs := newFlagSet("serve")
 		cfg, set := parseFlags(fs, rest)
 		must(runServe(cfg, set["threshold"]))
-	case "hash-password":
-		fs := newFlagSet("hash-password")
-		pw := fs.String("password", "", "hash this password non-interactively instead of prompting (exposed in shell history and process lists — prefer the prompt or a stdin pipe)")
-		_ = fs.Parse(rest)
-		must(runHashPassword(*pw))
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -93,6 +91,37 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+}
+
+// repoCommand dispatches the `recogn repo` subcommands. Only `import` exists
+// so far: it wraps the legacy flat people/<Person>/ folders into one new
+// repository.
+func repoCommand(args []string) {
+	if len(args) == 0 || args[0] != "import" {
+		if len(args) > 0 {
+			fmt.Fprintf(os.Stderr, "unknown repo command %q\n\n", args[0])
+		} else {
+			fmt.Fprintln(os.Stderr, "repo: a subcommand is required (recogn repo import)")
+		}
+		usage()
+		os.Exit(2)
+	}
+	fs := newFlagSet("repo import")
+	name := fs.String("name", "", `display name of the repository to create (required, e.g. --name "My people")`)
+	// parseFlags binds the shared flags (-addr/-threshold/-people/-db);
+	// -people here selects the legacy people root to import from (default
+	// cfg.PeopleDir).
+	cfg, _ := parseFlags(fs, args[1:])
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "repo import: unexpected argument(s): %s\n", strings.Join(fs.Args(), " "))
+		os.Exit(2)
+	}
+	if strings.TrimSpace(*name) == "" {
+		fmt.Fprintln(os.Stderr, `repo import: a repository name is required (use --name "Name")`)
+		usage()
+		os.Exit(2)
+	}
+	must(runRepoImport(cfg, strings.TrimSpace(*name)))
 }
 
 // newFlagSet creates a FlagSet for one subcommand.
@@ -109,7 +138,7 @@ func parseFlags(fs *flag.FlagSet, args []string) (config.Config, map[string]bool
 	fs.StringVar(&cfg.Addr, "addr", cfg.Addr, "listen address (serve)")
 	fs.Float64Var(&cfg.Threshold, "threshold", cfg.Threshold,
 		"cosine-similarity threshold (0..1) for a positive identity match")
-	fs.StringVar(&cfg.PeopleDir, "people", cfg.PeopleDir, "people dataset directory")
+	fs.StringVar(&cfg.PeopleDir, "people", cfg.PeopleDir, "people root (people/<repo-uuid>/<Person>/)")
 	fs.StringVar(&cfg.DBPath, "db", cfg.DBPath, "face database path")
 	_ = fs.Parse(args)
 	set := make(map[string]bool)
@@ -121,29 +150,34 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `recogn — face recognition (CLI + API + web UI)
 
 Usage:
-  recogn enroll [--force] [--prune]      build or update the face DB from the people folder
-  recogn recognize [--json] [--draw out] <image...>
-                                       detect & identify every face in the given photos
-                                       (--draw: write annotated copies — a .jpg path for a
-                                       single image, or a directory for one copy per image)
-  recogn people [--json]               list enrolled identities
-  recogn export [--out path]           write the face database as JSON (embeddings.json)
+  recogn repo import --name "Name" [--people DIR]
+                                       wrap the legacy flat people/ folders into one new repository
+  recogn enroll --repo NAME|ID [--force] [--prune]
+                                       build or update a repository's face DB from its person folders
+  recogn recognize --repo NAME|ID [--json] [--draw OUT] <image...>
+                                       detect & identify every face in the given photos, matching
+                                       only identities of that repository (--draw: write annotated
+                                       copies — a .jpg path for a single image, or a directory for
+                                       one copy per image)
+  recogn people --repo NAME|ID [--json]
+                                       list the identities enrolled in that repository
+  recogn export [--out path]           write the face database as JSON (embeddings.json, all repos)
   recogn serve [--addr :8080]          start the REST API and web UI
-  recogn hash-password [--password X]  print an argon2id hash for the admin password
-                                       (set RECOGN_ADMIN_PASSWORD_HASH to it; the plaintext
-                                       password itself is never stored)
 
 Shared flags (per subcommand):
+  -repo NAME|ID       repository to act on (enroll, recognize, people); required
   -addr string        listen address for serve (default ":8080")
   -threshold float    cosine-similarity threshold 0..1 (default 0.45)
-  -people string      people dataset directory (default ./people)
+  -people string      people root: people/<repo-uuid>/<Person>/ (default ./people)
   -db string          face database path (default ./data/faces.db)
 
 Dataset layout:
-  people/<Person Name>/*.{jpg,jpeg,png,webp,bmp}
+  people/<repo-uuid>/<Person Name>/*.{jpg,jpeg,png,webp,bmp,gif}
 
-To add someone new, drop a folder with their photos into people/ and run
-'recogn enroll' again (incremental), or use POST /api/people/{name}/enroll.
+Legacy flat folders people/<Person>/ are wrapped into one repository with
+'recogn repo import'. To add someone new afterwards, drop a folder under
+people/<repo-uuid>/ and run 'recogn enroll --repo X' (incremental), or use
+POST /api/people/{name}/enroll.
 `)
 }
 
@@ -157,13 +191,6 @@ func resolveWorkers(cfg config.Config) int {
 	return engine.DefaultConcurrency()
 }
 
-// openEngine builds the engine + DB and loads identities into the engine.
-// Inference runs in-process via CGO + the ONNX Runtime C API, with at most
-// cfg.Concurrency (default engine.DefaultConcurrency) model Runs in parallel.
-//
-// Threshold precedence: an explicit --threshold flag wins; otherwise the value
-// persisted in the DB (set via POST /api/config or the UI slider); otherwise
-// the env/default in cfg.
 // autoDownloadEnabled reports whether the model auto-download is active.
 // Enabled by default; disable with RECOGN_AUTO_DOWNLOAD=0/false/off/no.
 func autoDownloadEnabled() bool {
@@ -175,6 +202,12 @@ func autoDownloadEnabled() bool {
 }
 
 // openEngine builds the engine + DB and loads identities into the engine.
+// Inference runs in-process via CGO + the ONNX Runtime C API, with at most
+// cfg.Concurrency (default engine.DefaultConcurrency) model Runs in parallel.
+//
+// Threshold precedence: an explicit --threshold flag wins; otherwise the value
+// persisted in the DB (set via POST /api/config or the UI slider); otherwise
+// the env/default in cfg.
 func openEngine(cfg config.Config, thresholdSet bool) (*engine.Engine, *db.DB, error) {
 	// Register the embedded ONNX Runtime library so the first session can
 	// extract and dlopen it (single-file deployment). No-op when nothing is
@@ -235,7 +268,108 @@ func refreshEngine(eng *engine.Engine, database *db.DB) {
 	eng.SetKnown(known)
 }
 
-func runEnroll(cfg config.Config, force, prune, thresholdSet bool) error {
+// repositories
+
+// resolveRepo resolves a --repo spec to a repository: the display name first
+// (unique, case-insensitive), then the exact repository ID (also matched
+// case-insensitively). A spec that is neither returns an error.
+func resolveRepo(database *db.DB, spec string) (db.Repo, error) {
+	spec = strings.TrimSpace(spec)
+	if repo, ok := database.GetRepoByName(spec); ok {
+		return repo, nil
+	}
+	if repo, ok := database.GetRepo(spec); ok {
+		return repo, nil
+	}
+	return db.Repo{}, fmt.Errorf("repository %q not found", spec)
+}
+
+// requireRepoSpec handles a missing --repo flag: it lists the available
+// repositories on stderr with a usage hint and exits 2.
+func requireRepoSpec(cfg config.Config, hint string) {
+	if database, err := db.Open(cfg.DBPath); err == nil {
+		printRepoList(database)
+		database.Close()
+	} else {
+		fmt.Fprintln(os.Stderr, "error opening the face database:", err)
+	}
+	fmt.Fprintf(os.Stderr, "specify a repository with --repo NAME|ID (%s)\n", hint)
+	os.Exit(2)
+}
+
+// printRepoList writes the available repositories ("<id>  <name>" per line)
+// to stderr so the operator can pick a --repo value.
+func printRepoList(database *db.DB) {
+	repos := database.Repos()
+	if len(repos) == 0 {
+		fmt.Fprintln(os.Stderr, "available repositories: none — create one with 'recogn repo import --name \"Name\"' or the admin UI")
+		return
+	}
+	fmt.Fprintf(os.Stderr, "available repositories:\n")
+	for _, r := range repos {
+		fmt.Fprintf(os.Stderr, "  %s  %s\n", r.ID, r.Name)
+	}
+}
+
+// isRepoUUID reports whether name looks like a repository dataset directory:
+// a 36-character lowercase UUID (8-4-4-4-12 hex groups), the shape every
+// repo folder is created with. Legacy person folder names never match it, so
+// it is what separates repositories from persons under the people root.
+func isRepoUUID(name string) bool {
+	if len(name) != 36 || name[8] != '-' || name[13] != '-' || name[18] != '-' || name[23] != '-' {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		switch i {
+		case 8, 13, 18, 23:
+			continue
+		}
+		c := name[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// isImageName reports whether a file name looks like an enrollable image
+// (same extension set the enrollment scanner accepts).
+func isImageName(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif":
+		return true
+	}
+	return false
+}
+
+// repoHasImages reports whether the repository's dataset folder exists and at
+// least one person folder under it holds at least one image file.
+func repoHasImages(repoDir string) bool {
+	entries, err := os.ReadDir(repoDir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		files, err := os.ReadDir(filepath.Join(repoDir, e.Name()))
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if !f.IsDir() && isImageName(f.Name()) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func runEnroll(cfg config.Config, repoSpec string, force, prune, thresholdSet bool) error {
+	if strings.TrimSpace(repoSpec) == "" {
+		requireRepoSpec(cfg, "see 'recogn enroll -h'")
+	}
 	eng, database, err := openEngine(cfg, thresholdSet)
 	if err != nil {
 		return err
@@ -243,12 +377,18 @@ func runEnroll(cfg config.Config, force, prune, thresholdSet bool) error {
 	defer eng.Close()
 	defer database.Close()
 
-	fmt.Printf("Enrolling from %s (model warmup may take a moment)...\n", cfg.PeopleDir)
+	repo, err := resolveRepo(database, repoSpec)
+	if err != nil {
+		return err
+	}
+	repoDir := filepath.Join(cfg.PeopleDir, repo.ID)
+	fmt.Printf("Enrolling repository %q from %s (model warmup may take a moment)...\n", repo.Name, repoDir)
 	if err := eng.Ping(); err != nil {
 		return fmt.Errorf("inference backend failed to start: %w", err)
 	}
 	res, err := enroll.Scan(eng, database, enroll.Options{
 		PeopleDir: cfg.PeopleDir,
+		RepoID:    repo.ID,
 		Force:     force,
 		Prune:     prune,
 		Workers:   resolveWorkers(cfg),
@@ -270,8 +410,9 @@ func runEnroll(cfg config.Config, force, prune, thresholdSet bool) error {
 			fmt.Printf("  - %s / %s: %s\n", s.Person, filepath.Base(s.Path), s.Reason)
 		}
 	}
-	fmt.Printf("Database: %s (%d people, %d embeddings)\n",
-		cfg.DBPath, len(database.People()), countEmbeddings(database))
+	repoPeople := database.PeopleByRepo(repo.ID)
+	fmt.Printf("Database: %s (repository %q: %d people, %d embeddings)\n",
+		cfg.DBPath, repo.Name, len(repoPeople), countEmbeddings(repoPeople))
 	return nil
 }
 
@@ -284,15 +425,31 @@ type fileResult struct {
 	raw   []byte
 }
 
-func runRecognize(cfg config.Config, images []string, jsonOut bool, drawArg string, thresholdSet bool) error {
+func runRecognize(cfg config.Config, repoSpec string, images []string, jsonOut bool, drawArg string, thresholdSet bool) error {
+	if strings.TrimSpace(repoSpec) == "" {
+		requireRepoSpec(cfg, "see 'recogn recognize -h'")
+	}
 	eng, database, err := openEngine(cfg, thresholdSet)
 	if err != nil {
 		return err
 	}
 	defer eng.Close()
 	defer database.Close()
-	if len(database.People()) == 0 {
-		fmt.Fprintln(os.Stderr, "warning: face database is empty — run 'recogn enroll' first")
+
+	repo, err := resolveRepo(database, repoSpec)
+	if err != nil {
+		return err
+	}
+	// Matching is scoped to the repository: build the allowed identity set
+	// from the repo's own people. A repo with no people yields a non-nil
+	// empty set, so every detected face stays unknown.
+	people := database.PeopleByRepo(repo.ID)
+	if len(people) == 0 {
+		fmt.Fprintf(os.Stderr, "warning: repository has no enrolled people — run 'recogn enroll --repo %s' first\n", repo.Name)
+	}
+	allowed := make(map[string]struct{}, len(people))
+	for _, p := range people {
+		allowed[p.ID] = struct{}{}
 	}
 	if err := eng.Ping(); err != nil {
 		return fmt.Errorf("inference backend failed to start: %w", err)
@@ -311,7 +468,7 @@ func runRecognize(cfg config.Config, images []string, jsonOut bool, drawArg stri
 	}
 	if workers <= 1 {
 		for i, imgPath := range images {
-			results[i] = recognizeOne(eng, imgPath)
+			results[i] = recognizeOne(eng, imgPath, allowed)
 		}
 	} else {
 		next := make(chan int, workers)
@@ -321,7 +478,7 @@ func runRecognize(cfg config.Config, images []string, jsonOut bool, drawArg stri
 			go func() {
 				defer wg.Done()
 				for i := range next {
-					results[i] = recognizeOne(eng, images[i])
+					results[i] = recognizeOne(eng, images[i], allowed)
 				}
 			}()
 		}
@@ -373,15 +530,16 @@ func runRecognize(cfg config.Config, images []string, jsonOut bool, drawArg stri
 }
 
 // recognizeOne runs the full pipeline on one image file, producing the
-// per-image CLI/JSON record (embeddings stripped from the faces).
-func recognizeOne(eng *engine.Engine, imgPath string) fileResult {
+// per-image CLI/JSON record (embeddings stripped from the faces). allowed
+// scopes matching to one repository's identities (nil = unrestricted).
+func recognizeOne(eng *engine.Engine, imgPath string, allowed map[string]struct{}) fileResult {
 	fr := fileResult{Image: imgPath}
 	b, err := os.ReadFile(imgPath)
 	if err != nil {
 		fr.Error = err.Error()
 		return fr
 	}
-	faces, err := eng.Recognize(b)
+	faces, err := eng.RecognizeScoped(b, allowed)
 	if err != nil {
 		fr.Error = err.Error()
 		return fr
@@ -444,23 +602,47 @@ func isJPGExt(ext string) bool {
 	return e == ".jpg" || e == ".jpeg"
 }
 
-func runPeople(cfg config.Config, jsonOut bool) error {
+// repoPeopleJSON is the --json shape of `recogn people`: the repository (id +
+// name only — the share-token hash is not a CLI concern) plus its people.
+type repoPeopleJSON struct {
+	Repo   repoInfoJSON `json:"repo"`
+	People []db.Person  `json:"people"`
+}
+
+type repoInfoJSON struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+func runPeople(cfg config.Config, repoSpec string, jsonOut bool) error {
+	if strings.TrimSpace(repoSpec) == "" {
+		requireRepoSpec(cfg, "see 'recogn people -h'")
+	}
 	database, err := db.Open(cfg.DBPath)
 	if err != nil {
 		return err
 	}
 	defer database.Close()
-	people := database.People()
+	repo, err := resolveRepo(database, repoSpec)
+	if err != nil {
+		return err
+	}
+	people := database.PeopleByRepo(repo.ID)
+
 	if jsonOut {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		return enc.Encode(people)
+		return enc.Encode(repoPeopleJSON{
+			Repo:   repoInfoJSON{ID: repo.ID, Name: repo.Name},
+			People: people,
+		})
 	}
+	fmt.Printf("Repository %q (%s): %d people\n", repo.Name, repo.ID, len(people))
 	if len(people) == 0 {
-		fmt.Println("No people enrolled. Run 'recogn enroll'.")
+		fmt.Printf("No people enrolled in this repository — run 'recogn enroll --repo %s'.\n", repo.Name)
 		return nil
 	}
-	fmt.Printf("%d people enrolled:\n", len(people))
+	fmt.Printf("%d photo embedding(s) in total\n", countEmbeddings(people))
 	for _, p := range people {
 		fmt.Printf("  %-24s %2d photo(s)  id=%s\n", p.Name, len(p.Photos), p.ID)
 	}
@@ -478,72 +660,188 @@ func runExport(cfg config.Config, out string) error {
 		return err
 	}
 	fmt.Printf("Exported %d people (%d embeddings) → %s\n",
-		len(database.People()), countEmbeddings(database), path)
+		len(database.People()), countEmbeddings(database.People()), path)
 	return nil
 }
 
-// runHashPassword prints an argon2id PHC hash of an admin password for
-// RECOGN_ADMIN_PASSWORD_HASH. The password comes from --password (scripts;
-// exposed in shell history and process lists), from a stdin pipe (e.g.
-// `openssl rand -base64 18 | recogn hash-password`), or from a hidden-input
-// prompt when run on a terminal. Only the hash goes to stdout so the output
-// can be captured directly (`RECOGN_ADMIN_PASSWORD_HASH=$(./recogn
-// hash-password ...)`); prompts and hints go to stderr. The command never
-// touches the engine, database or models.
-func runHashPassword(flagPassword string) error {
-	var password []byte // zeroed after hashing
-	if flagPassword != "" {
-		password = []byte(flagPassword)
-	} else if stdinIsTerminal() {
-		fmt.Fprintln(os.Stderr, "Enter admin password (input hidden):")
-		first, err := readPassword()
-		if err != nil {
-			return err
-		}
-		fmt.Fprintln(os.Stderr, "Confirm password:")
-		second, err := readPassword()
-		if err != nil {
-			return err
-		}
-		if !bytes.Equal(first, second) {
-			return fmt.Errorf("passwords do not match")
-		}
-		password = first
-	} else {
-		b, err := readPasswordLine()
-		if err != nil {
-			return err
-		}
-		password = b
-	}
-	if len(password) == 0 {
-		return fmt.Errorf("password is empty")
-	}
-	hash, err := auth.HashPassword(password)
-	for i := range password {
-		password[i] = 0 // best-effort scrub of the plaintext buffer
-	}
+// runRepoImport wraps the legacy flat people/<Person>/ folders into one new
+// repository: every non-repo folder under the people root moves under
+// people/<repo-uuid>/, each already-enrolled person's DB record is rewritten
+// into the repo (fresh <repoUUID>-<slug> ID with photos, metadata and
+// thumbnail carried over), and the legacy record is removed. Folders that
+// were never enrolled stay for a later 'recogn enroll --repo X'. The command
+// is pure file + DB surgery: no engine, no models, no inference, no model
+// downloads.
+func runRepoImport(cfg config.Config, name string) error {
+	peopleRoot := cfg.PeopleDir
+	database, err := db.Open(cfg.DBPath)
 	if err != nil {
 		return err
 	}
-	fmt.Println(hash)
-	fmt.Fprintln(os.Stderr, "\nSet the hash as the admin password credential, e.g.:")
-	fmt.Fprintf(os.Stderr, "  RECOGN_ADMIN_PASSWORD_HASH=%s\n", hash)
-	return nil
+	defer database.Close()
+
+	// Find the legacy person folders: every non-hidden directory directly
+	// under the people root that is NOT a repository UUID. Repository
+	// folders (people/<uuid>/) are left alone.
+	repos := database.Repos()
+	entries, err := os.ReadDir(peopleRoot)
+	if err != nil {
+		return fmt.Errorf("read people dir %s: %w", peopleRoot, err)
+	}
+	var legacy []string
+	for _, e := range entries {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		if isRepoUUID(e.Name()) {
+			continue
+		}
+		legacy = append(legacy, e.Name())
+	}
+	sort.Strings(legacy)
+	if len(legacy) == 0 {
+		if len(repos) == 0 {
+			fmt.Printf("Nothing to import: no legacy person folders under %s.\n", peopleRoot)
+		} else {
+			fmt.Printf("Nothing to import: %s holds only repository folders (%d repositories).\n", peopleRoot, len(repos))
+		}
+		return nil
+	}
+
+	// The name must be free. (Re-running a completed or partially failed
+	// import therefore fails here — the leftover legacy folders, if any,
+	// are reported in the message.)
+	if _, ok := database.GetRepoByName(name); ok {
+		return fmt.Errorf("repository name %q is already in use; %d legacy person folder(s) remain under %s",
+			name, len(legacy), peopleRoot)
+	}
+
+	repo, err := database.CreateRepo(name)
+	if err != nil {
+		return err
+	}
+	repoDir := filepath.Join(peopleRoot, repo.ID)
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		return fmt.Errorf("create repository folder %s (repository %q was created — remove it before retrying): %w",
+			repoDir, repo.Name, err)
+	}
+
+	// Move the person folders into the repository first. A mid-way failure
+	// stops the moves but does not abort outright: the folders already in
+	// place are migrated into the repository (their files live there now —
+	// leaving their DB records legacy would strand them), the summary is
+	// printed, and the recorded move error is returned at the end.
+	moved := make([]string, 0, len(legacy))
+	var moveErr error
+	for _, folder := range legacy {
+		dst := filepath.Join(repoDir, folder)
+		if err := os.Rename(filepath.Join(peopleRoot, folder), dst); err != nil {
+			moveErr = fmt.Errorf("move person folder %s: %w", folder, err)
+			if len(moved) > 0 {
+				fmt.Fprintf(os.Stderr, "repo import: aborted; %d of %d folder(s) were already moved into %s:\n  %s\n",
+					len(moved), len(legacy), repo.ID, strings.Join(moved, "\n  "))
+			}
+			break
+		}
+		moved = append(moved, folder)
+	}
+
+	// Rewrite the DB records of the already-enrolled people into the repo.
+	allPeople := database.People()
+	migrated, photosCopied := 0, 0
+	var failed []string
+	for _, folder := range moved {
+		// Match the DB record among LEGACY persons only (RepoID "") —
+		// db.Get is a global view and could hand back another repository's
+		// person when the name is shared.
+		var person *db.Person
+		for i := range allPeople {
+			if allPeople[i].RepoID == "" && strings.EqualFold(allPeople[i].Name, folder) {
+				p := allPeople[i]
+				person = &p
+				break
+			}
+		}
+		if person == nil {
+			continue // the folder was never enrolled; enroll handles it later
+		}
+		n, why := migrateLegacyPerson(database, repo, person)
+		if why == "" {
+			migrated++
+			photosCopied += n
+		} else {
+			failed = append(failed, fmt.Sprintf("%s: %s", person.Name, why))
+		}
+	}
+
+	// Summary.
+	fmt.Printf("Imported %d people (%d photos) into repository %q (%s)\n",
+		len(moved), photosCopied, repo.Name, repo.ID)
+	fmt.Printf("Enrolled records migrated to the database: %d of %d folder(s).\n", migrated, len(moved))
+	if notEnrolled := len(moved) - migrated - len(failed); notEnrolled > 0 {
+		fmt.Printf("%d folder(s) were not in the database yet — run 'recogn enroll --repo %s' to embed them.\n",
+			notEnrolled, repo.Name)
+	}
+	if len(failed) > 0 {
+		fmt.Fprintf(os.Stderr, "warning: %d enrolled person(s) could not be migrated (their folders moved, but the legacy DB record was kept):\n", len(failed))
+		for _, f := range failed {
+			fmt.Fprintf(os.Stderr, "  - %s\n", f)
+		}
+	}
+	// The recorded move failure (nil on a clean run) — reported only now,
+	// after what did move was migrated and summarised.
+	return moveErr
 }
 
-// readPasswordLine reads one line from stdin without touching terminal
-// settings, trimming the trailing newline. It is the pipe path and the
-// fallback used when the terminal echo cannot be disabled.
-func readPasswordLine() ([]byte, error) {
-	b, err := bufio.NewReader(os.Stdin).ReadBytes('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return nil, err
+// migrateLegacyPerson rewrites one legacy person record into the repository:
+// every photo (hash + embedding) is re-created through the repo-scoped
+// mutator under a fresh <repoUUID>-<slug> ID, the metadata and the thumbnail
+// sidecar carry over, and the legacy record (with its photo bucket and old
+// sidecar) is removed at the end. Returns the number of photos migrated and
+// an empty reason on success; on failure the legacy record is left untouched
+// so nothing is lost (the already-copied photos, if any, stay in the repo —
+// a retry replaces them by path).
+func migrateLegacyPerson(database *db.DB, repo db.Repo, person *db.Person) (int, string) {
+	newID := database.NewPersonID(repo.ID, person.Name)
+
+	// 1. Photos: re-create each through the repo-scoped mutator, which
+	// creates the person under the new ID on the first call.
+	for _, ph := range person.Photos {
+		if err := database.AddPhotoHashedForRepo(repo.ID, person.Name, ph.Path, ph.Hash, ph.Embedding); err != nil {
+			return 0, fmt.Sprintf("copy photo %s: %v", ph.Path, err)
+		}
 	}
-	for len(b) > 0 && (b[len(b)-1] == '\n' || b[len(b)-1] == '\r') {
-		b = b[:len(b)-1]
+
+	// 2. Metadata: a freshly created record has no meta, so copy the legacy
+	// metadata explicitly. person.Meta may be nil (IsEmpty reports it);
+	// SetMetaInRepo stores an empty meta as none.
+	if !person.Meta.IsEmpty() {
+		if _, err := database.SetMetaInRepo(repo.ID, person.Name, person.Meta); err != nil {
+			return len(person.Photos), fmt.Sprintf("copy metadata: %v", err)
+		}
 	}
-	return b, nil
+
+	// 3. Thumbnail sidecar (best-effort, must never fail the import): the
+	// legacy sidecar is data/thumbs/<oldID>.jpg; re-write its bytes through
+	// SetThumbnail so the new record both gains the file data/thumbs/<newID>.jpg
+	// and references it (Thumb + ThumbSrc). If that fails, the sidecar is
+	// simply not migrated: the legacy one is removed with the legacy record
+	// and the next enroll rescan regenerates a thumbnail for the new ID.
+	if old := database.ThumbFile(person.ID); old != "" {
+		jpg, err := os.ReadFile(old)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: thumbnail for %s not migrated (%v) — the next enroll rescan regenerates it\n", person.Name, err)
+		} else if err := database.SetThumbnail(newID, jpg, person.ThumbSrc); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: thumbnail for %s not migrated (%v) — the next enroll rescan regenerates it\n", person.Name, err)
+		}
+	}
+
+	// 4. Drop the legacy record: its people entry, photo bucket and old
+	// thumbnail sidecar.
+	if _, err := database.RemovePerson(person.Name); err != nil {
+		return len(person.Photos), fmt.Sprintf("remove legacy record: %v", err)
+	}
+	return len(person.Photos), ""
 }
 
 func runServe(cfg config.Config, thresholdSet bool) error {
@@ -562,29 +860,9 @@ func runServe(cfg config.Config, thresholdSet bool) error {
 	defer eng.Close()
 	defer database.Close()
 
-	// Auto-enroll from people/ if the DB is empty so the server is useful on
-	// first run without a separate enroll step.
-	if len(database.People()) == 0 {
-		if _, statErr := os.Stat(cfg.PeopleDir); statErr == nil {
-			fmt.Println("Face DB is empty; enrolling from people/ first...")
-			if err := eng.Ping(); err != nil {
-				return fmt.Errorf("inference backend failed to start: %w", err)
-			}
-			res, err := enroll.Scan(eng, database, enroll.Options{
-				PeopleDir: cfg.PeopleDir,
-				Workers:   resolveWorkers(cfg),
-				Progress: func(person, file string, idx, total int) {
-					fmt.Printf("\r  %-24s [%d/%d] %-40s", person, idx, total, truncate(file, 40))
-				},
-			})
-			fmt.Println()
-			if err != nil {
-				return err
-			}
-			refreshEngine(eng, database)
-			fmt.Printf("Enrolled %d people (%d photos).\n", res.PeopleSeen, res.PhotosAdded)
-		}
-	}
+	// Auto-enroll repositories whose dataset folders hold photos but whose
+	// DB records are empty (a fresh store without repositories gets none).
+	autoEnrollRepos(eng, database, cfg)
 
 	server, err := api.New(cfg, eng, database, func(e api.Engine, d *db.DB) {
 		if ce, ok := e.(*engine.Engine); ok {
@@ -592,7 +870,7 @@ func runServe(cfg config.Config, thresholdSet bool) error {
 		}
 	})
 	if err != nil {
-		return err // e.g. corrupt passkeys.json must fail startup loudly
+		return err
 	}
 	handler := server.Handler()
 
@@ -612,13 +890,19 @@ func runServe(cfg config.Config, thresholdSet bool) error {
 		IdleTimeout:       120 * time.Second,
 	}
 	printServing(ln.Addr().String(), len(database.People()), eng.Threshold())
-	fmt.Printf("Admin auth: %s\n", server.Mode())
-	if server.Mode() == "open" {
-		// Open mode is backward-compatible but worth one loud line: every
-		// endpoint, including enrollment and deletion, is public — and
-		// passkey registration is refused there, so the only way to secure
-		// the server is to set a password hash (SECURITY-REVIEW.md H2/H3).
-		slog.Warn("admin authentication is disabled — all endpoints are public and passkey registration is refused; set RECOGN_ADMIN_PASSWORD_HASH (generate one with 'recogn hash-password') to secure the admin surface")
+	mode := server.Mode()
+	fmt.Printf("Admin auth: %s\n", mode)
+	slog.Info("admin authentication: " + mode + " mode")
+	if mode == "setup" {
+		// First run: no users exist yet, so the auth service holds a one-time
+		// setup key that completes POST /api/setup. It lives in memory only —
+		// regenerated on every start until an admin exists — so it must be
+		// handed to the operator right here.
+		if key, ok := server.SetupKey(); ok {
+			fmt.Printf("setup key: %s\n", key)
+			slog.Info("setup key: " + key)
+		}
+		fmt.Fprintln(os.Stderr, "First-run setup required: open the web UI's setup view and enter this key together with an admin username and password.")
 	}
 
 	errCh := make(chan error, 1)
@@ -643,11 +927,61 @@ func runServe(cfg config.Config, thresholdSet bool) error {
 	return nil
 }
 
+// autoEnrollRepos runs an enrollment scan for every repository that has no
+// people yet but already holds person folders with images on disk (e.g. a
+// repository created or wrapped before anything was enrolled through it, or
+// one whose face DB was deleted). Repositories that already have people are
+// untouched. A store without any repository is left alone — there is no
+// default repository; the operator creates one via the admin UI or
+// 'recogn repo import'.
+func autoEnrollRepos(eng *engine.Engine, database *db.DB, cfg config.Config) {
+	repos := database.Repos()
+	if len(repos) == 0 {
+		slog.Info("no repositories exist yet — create one via the admin UI or 'recogn repo import'")
+		return
+	}
+	var empty []db.Repo
+	for _, r := range repos {
+		if database.PeopleCount(r.ID) == 0 && repoHasImages(filepath.Join(cfg.PeopleDir, r.ID)) {
+			empty = append(empty, r)
+		}
+	}
+	if len(empty) == 0 {
+		return
+	}
+	if err := eng.Ping(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: skipping auto-enroll — inference backend failed to start: %v\n", err)
+		return
+	}
+	for _, repo := range empty {
+		fmt.Printf("Repository %q has no enrolled people; enrolling from %s...\n",
+			repo.Name, filepath.Join(cfg.PeopleDir, repo.ID))
+		res, err := enroll.Scan(eng, database, enroll.Options{
+			PeopleDir: cfg.PeopleDir,
+			RepoID:    repo.ID,
+			Workers:   resolveWorkers(cfg),
+			Progress: func(person, file string, idx, total int) {
+				fmt.Printf("\r  %-24s [%d/%d] %-40s", person, idx, total, truncate(file, 40))
+			},
+		})
+		fmt.Println()
+		if err != nil {
+			// One repository's failure must not keep the server down.
+			fmt.Fprintf(os.Stderr, "warning: auto-enroll of repository %q failed: %v\n", repo.Name, err)
+			continue
+		}
+		refreshEngine(eng, database)
+		fmt.Printf("Enrolled %d people (%d photos) into repository %q.\n", res.PeopleSeen, res.PhotosAdded, repo.Name)
+	}
+}
+
 // helpers
 
-func countEmbeddings(database *db.DB) int {
+// countEmbeddings counts the photo records (one embedding each) in the given
+// people list.
+func countEmbeddings(people []db.Person) int {
 	n := 0
-	for _, p := range database.People() {
+	for _, p := range people {
 		n += len(p.Photos)
 	}
 	return n

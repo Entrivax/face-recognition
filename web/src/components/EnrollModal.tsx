@@ -55,6 +55,8 @@ export interface EnrollPasteTarget {
 
 interface EnrollModalProps {
 	open: boolean;
+	/** the repository enrollment targets */
+	repoId: string;
 	peopleNames: string[];
 	onCloseRequest: () => void;
 	/** refresh people + health after a successful enroll */
@@ -70,6 +72,9 @@ interface EnrollModalProps {
 
 export function EnrollModal(props: EnrollModalProps) {
 	const toast = useToast();
+	// The repo enrollment targets, stable for imperative closures.
+	const repoRef = useRef(props.repoId);
+	repoRef.current = props.repoId;
 
 	const [name, setName] = useState("");
 	const [pending, setPending] = useState<PendingPhoto[]>([]);
@@ -187,7 +192,7 @@ export function EnrollModal(props: EnrollModalProps) {
 			return;
 		}
 		let stale = false;
-		api.getPerson(trimmed).then((j) => {
+		api.getPerson(trimmed, repoRef.current).then((j) => {
 			if (stale || nameRef.current !== trimmed || metaTouchedRef.current) return;
 			prefilledRef.current = trimmed;
 			setAliases([...(j.aliases ?? []), ""]);
@@ -244,7 +249,7 @@ export function EnrollModal(props: EnrollModalProps) {
 	const checkPendingFace = async (p: PendingPhoto) => {
 		if (!pendingRef.current.includes(p)) return; // removed while queued
 		try {
-			const j = await api.recognize(p.file);
+			const j = await api.recognize(p.file, repoRef.current);
 			if (!pendingRef.current.includes(p)) return;
 			const faces = j.faces || [];
 			updatePending(p, { faces, status: "checked" });
@@ -357,7 +362,7 @@ export function EnrollModal(props: EnrollModalProps) {
 		setSubmitMeta(`Enrolling ${pendingRef.current.length} photo${pendingRef.current.length === 1 ? "" : "s"} for ${person}…`);
 
 		try {
-			const j = await api.enrollPhotos(person, pendingRef.current.map((p) => p.file));
+			const j = await api.enrollPhotos(person, repoRef.current, pendingRef.current.map((p) => p.file));
 
 			if (j.added > 0) toast.show(`Enrolled ${j.added} photo${j.added === 1 ? "" : "s"} for ${person}.`, "ok");
 			props.onChange();
@@ -368,7 +373,7 @@ export function EnrollModal(props: EnrollModalProps) {
 			if (hasMeta && j.added > 0) {
 				setSubmitMeta(`Saving details for ${person}…`);
 				try {
-					await api.setPersonMeta(person, {
+					await api.setPersonMeta(person, repoRef.current, {
 						aliases: aliasList,
 						birthdate,
 						urls: urlList,

@@ -12,8 +12,12 @@ import { useToast } from "../toast";
 import { EditModal } from "./EditModal";
 
 interface StageProps {
-	/** logged in? gates the per-face "name this person" enroll form */
-	authed: boolean;
+	/** may enroll people in this repo (writer or admin)? gates the Edit
+	 *  buttons and the per-face "name this person" enroll form — readers and
+	 *  share visitors get a pure inspection stage */
+	canEnroll: boolean;
+	/** the repository recognition runs against */
+	repoId: string;
 	/** refresh people + health after a face was enrolled from a row */
 	onEnrolled: () => void;
 	/** register the paste-routing entry point (inspect a file on the stage) */
@@ -22,7 +26,7 @@ interface StageProps {
 	onEditOpenChange: (open: boolean) => void;
 }
 
-export function Stage({ authed, onEnrolled, registerInspect, onEditOpenChange }: StageProps) {
+export function Stage({ canEnroll, repoId, onEnrolled, registerInspect, onEditOpenChange }: StageProps) {
 	const toast = useToast();
 
 	const [previewURL, setPreviewURL] = useState<string | null>(null);
@@ -86,7 +90,7 @@ export function Stage({ authed, onEnrolled, registerInspect, onEditOpenChange }:
 		setEnrolled({});
 		setMeta("analyzing…");
 		try {
-			const j = await api.recognize(file);
+			const j = await api.recognize(file, repoId);
 			if (seq !== reqSeq.current) return; // another file took over
 			setFaces(j.faces || []);
 			setMeta(`${file.name} · ${(file.size / 1024).toFixed(0)} KB`);
@@ -95,7 +99,7 @@ export function Stage({ authed, onEnrolled, registerInspect, onEditOpenChange }:
 			setMeta("");
 			toast.show((e as Error).message || "Recognition failed.", "err");
 		}
-	}, [toast]);
+	}, [repoId, toast]);
 
 	// Paste routing entry point.
 	useEffect(() => {
@@ -148,7 +152,7 @@ export function Stage({ authed, onEnrolled, registerInspect, onEditOpenChange }:
 	const handleRowEnroll = useCallback((faceNo: number, person: string, done: (ok: boolean) => void) => {
 		const file = currentFileRef.current;
 		if (!file) { done(false); return; }
-		api.enrollFace(person, file, faceNo)
+		api.enrollFace(person, repoId, file, faceNo)
 			.then((j) => {
 				toast.show(`Enrolled ${person} (${j.saved}).`, "ok");
 				setEnrolled((m) => ({ ...m, [faceNo - 1]: person }));
@@ -159,7 +163,7 @@ export function Stage({ authed, onEnrolled, registerInspect, onEditOpenChange }:
 				toast.show(err.message || "Enrollment failed.", "err");
 				done(false);
 			});
-	}, [onEnrolled, toast]);
+	}, [repoId, onEnrolled, toast]);
 
 	const cursor = previewURL ? "default" : "pointer";
 
@@ -217,34 +221,38 @@ export function Stage({ authed, onEnrolled, registerInspect, onEditOpenChange }:
 			</div>
 
 			<div class="stage-actions">
-				<button
-					id="editBtn"
-					class="btn"
-					hidden={previewURL === null}
-					onClick={(e) => {
-						e.stopPropagation();
-						// Edit the pristine original (or the fresh upload) — never
-						// the previously exported bytes.
-						setEditSource(editOriginalRef.current ?? currentFileRef.current);
-					}}
-				>
-					Edit
-				</button>
-				<button
-					id="cancelEditsBtn"
-					class="btn btn-ghost"
-					hidden={editOriginalRef.current === null}
-					onClick={(e) => {
-						e.stopPropagation();
-						// Back to the pristine original: re-inspecting it without
-						// the edit lineage resets the editor session and re-runs
-						// recognition on the untouched bytes.
-						const original = editOriginalRef.current;
-						if (original) void handleFile(original);
-					}}
-				>
-					Cancel edits
-				</button>
+				{canEnroll && (
+					<>
+						<button
+							id="editBtn"
+							class="btn"
+							hidden={previewURL === null}
+							onClick={(e) => {
+								e.stopPropagation();
+								// Edit the pristine original (or the fresh upload) — never
+								// the previously exported bytes.
+								setEditSource(editOriginalRef.current ?? currentFileRef.current);
+							}}
+						>
+							Edit
+						</button>
+						<button
+							id="cancelEditsBtn"
+							class="btn btn-ghost"
+							hidden={editOriginalRef.current === null}
+							onClick={(e) => {
+								e.stopPropagation();
+								// Back to the pristine original: re-inspecting it without
+								// the edit lineage resets the editor session and re-runs
+								// recognition on the untouched bytes.
+								const original = editOriginalRef.current;
+								if (original) void handleFile(original);
+							}}
+						>
+							Cancel edits
+						</button>
+					</>
+				)}
 				<button id="clearBtn" class="btn btn-ghost" hidden={previewURL === null} onClick={resetStage}>Clear</button>
 				<button
 					id="againBtn"
@@ -266,9 +274,8 @@ export function Stage({ authed, onEnrolled, registerInspect, onEditOpenChange }:
 								key={i}
 								face={f}
 								index={i}
-								authed={authed}
+								canEnroll={canEnroll && currentFileRef.current !== null}
 								enrolledName={enrolled[i]}
-								canEnroll={currentFileRef.current !== null}
 								onEnroll={handleRowEnroll}
 							/>
 						))}
@@ -286,14 +293,13 @@ export function Stage({ authed, onEnrolled, registerInspect, onEditOpenChange }:
 }
 
 // One face row: index badge, identity, ranked matches (with a duplicate hint
-// when the top two scores are nearly tied), and — for unknown faces while
-// logged in — the inline "name this person" enroll form.
+// when the top two scores are nearly tied), and — for unknown faces when the
+// viewer may write to this repo — the inline "name this person" enroll form.
 function FaceRow(props: {
 	face: Face;
 	index: number;
-	authed: boolean;
-	enrolledName?: string;
 	canEnroll: boolean;
+	enrolledName?: string;
 	onEnroll: (faceNo: number, person: string, done: (ok: boolean) => void) => void;
 }) {
 	const f = props.face;
@@ -329,7 +335,7 @@ function FaceRow(props: {
 			<div>
 				<div class="face-name">{name}</div>
 				{matchesBlock}
-				{!known && props.authed && props.canEnroll && (
+				{!known && props.canEnroll && (
 					<form
 						class="face-enroll"
 						onSubmit={(e) => {

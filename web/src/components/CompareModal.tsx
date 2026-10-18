@@ -1,4 +1,4 @@
-// Compare modal (admin tool).
+// Compare modal (any signed-in user).
 // Face-to-face comparison of two arbitrary photos: the server embeds the
 // largest face of each and reports their cosine similarity. Nothing is
 // matched against the enrolled-people database. Photos can be added by

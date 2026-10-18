@@ -273,18 +273,43 @@ func LargestFace(faces []Face) (Face, bool) {
 	return best, true
 }
 
-// Recognize runs the full pipeline on one image: detect every face, embed and
-// match each, and annotate the returned faces with identities. Each face also
-// carries Matches: every enrolled person above the threshold, ranked — useful
-// for spotting near-tied identities (possible duplicate people).
+// Recognize runs the full pipeline on one image with the identity set
+// unrestricted: detect every face, embed and match each, and annotate the
+// returned faces with identities. Each face also carries Matches: every
+// enrolled person above the threshold, ranked best-first — useful for
+// spotting near-tied identities (possible duplicate people).
 //
-// The image is decoded exactly once here and the decoded image is reused for
+// It is exactly RecognizeScoped(imgBytes, nil).
+func (e *Engine) Recognize(imgBytes []byte) ([]Face, error) {
+	return e.RecognizeScoped(imgBytes, nil)
+}
+
+// RecognizeScoped runs the full pipeline on one image: detect every face,
+// embed and match each, and annotate the returned faces with identities. Each
+// face also carries Matches: every allowed person above the threshold, ranked
+// best-first — useful for spotting near-tied identities (possible duplicate
+// people).
+//
+// The engine keeps one global identity set (SetKnown); allowed only narrows
+// which of those identities this single call may match:
+//
+//   - allowed == nil: unscoped — the unrestricted behaviour Recognize asks
+//     for by delegating here with nil.
+//   - allowed != nil (including empty): for every face, candidates whose
+//     PersonID is not in allowed are dropped BEFORE the threshold filter and
+//     the best pick, so Name/PersonID/Confidence/Matches can only ever
+//     reference allowed identities. When no allowed identity clears the
+//     threshold the face stays "unknown" and Confidence keeps the best score
+//     among allowed identities as a near-miss hint (0 for an empty set).
+//
+// The detect/align/embed pipeline and the matching math are unchanged. The
+// image is decoded exactly once here and the decoded image is reused for
 // both the detector's letterbox and every face's alignment crop (both used to
 // decode independently, and per-face alignment before that re-decoded per
 // face). The aligned faces go to the inferencer's embedBatch, which fans
 // per-face Runs across the concurrency gate, so multi-face photos use
-// several cores.
-func (e *Engine) Recognize(imgBytes []byte) ([]Face, error) {
+// several cores. Safe for concurrent use.
+func (e *Engine) RecognizeScoped(imgBytes []byte, allowed map[string]struct{}) ([]Face, error) {
 	// Decode once for detection and all alignments below. decodeLimited
 	// gates the declared pixel count first: a decompression bomb would
 	// otherwise allocate its full RGBA size here.
@@ -337,6 +362,17 @@ func (e *Engine) Recognize(imgBytes []byte) ([]Face, error) {
 		// One bestPerPerson pass feeds both the threshold-filtered Matches and
 		// (when nothing clears the threshold) the near-miss confidence hint.
 		all := e.bestPerPerson(emb)
+		// A scoped call drops every identity outside allowed before both the
+		// threshold filter and the near-miss fallback below. all is freshly
+		// built for this face by bestPerPerson, so trimming it in place is
+		// safe and needs no copy.
+		if allowed != nil {
+			for id := range all {
+				if _, ok := allowed[id]; !ok {
+					delete(all, id)
+				}
+			}
+		}
 		matches := matchesAboveThreshold(all, e.Threshold())
 		faces[i].Matches = matches
 		if len(matches) > 0 {

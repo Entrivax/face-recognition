@@ -6,9 +6,13 @@
 
 Face recognition for a known set of people — **CLI + REST API + minimal web UI**, in Go.
 
-Point it at a folder of people, enroll them once, then feed it any photo: it
-detects **every face** in the image and tells you who each one is (or
-`unknown`), with a confidence score.
+People live in **repositories** — each one a dataset of person photo folders
+(`people/<repo-uuid>/<Person>/*.jpg`), created by the admin. Users log in and
+work inside the repositories they've been granted (read or write). Enroll the
+people once, then feed the recognizer any photo: it detects **every face** in
+the image and tells you who each one is (or `unknown`), with a confidence
+score. The server always requires login — the admin is created once through a
+first-run setup key, and there is no open mode.
 
 ## How it works
 
@@ -16,6 +20,7 @@ detects **every face** in the image and tells you who each one is (or
 - **Alignment** — each face is warped to a canonical 112×112 crop (Umeyama similarity transform, in Go).
 - **Recognition** — [ArcFace](https://github.com/deepinsight/insightface) (`w600k_r50`) turns the crop into a 512-d embedding; a face is identified by **cosine similarity** against every enrolled embedding, matched per-person by best score.
 - A match above the **threshold** (default `0.45`, tunable) names the person; below it the face is reported as `unknown`.
+- Recognition is **scoped to one repository** — CLI flags and API routes take a `repo` (name or id) and match only that repository's enrolled people.
 
 Go owns the whole pipeline: CLI, HTTP API, web UI, face database, face
 alignment (Umeyama), matching (cosine similarity), and the detection
@@ -29,7 +34,7 @@ shared library. Everything runs on CPU.
 
 ```
 recogn                 the single binary (built)
-main.go                CLI entry: enroll | recognize | people | export | serve
+main.go                CLI entry: enroll | recognize | people | repo | export | serve
 internal/
   config/              paths, threshold, env/flags
   onnxrt/              minimal CGO binding to the ONNX Runtime C API
@@ -38,7 +43,10 @@ internal/
     scrfd.go             SCRFD output decode + NMS
     cgo_backend.go       in-process inference backend (onnxrt)
   db/                  face database: bbolt store (data/faces.db) + JSON import/export
-  enroll/              people/ folder scanning + embedding
+  users/               user accounts, sessions, per-repo grants, API keys
+                       (data/users.db)
+  auth/                login sessions + rate limiting
+  enroll/              repository folder scanning + embedding
   api/                 REST API handlers
   web/                 serves the embedded UI bundle (dist/ via go:embed)
 web/                   the web UI sources: Preact + TypeScript, built by Vite
@@ -46,8 +54,11 @@ web/                   the web UI sources: Preact + TypeScript, built by Vite
 third_party/onnxruntime/  ORT C header + libonnxruntime (via `make ort`)
 third_party/onnxruntime-win/  Windows ORT C header + onnxruntime.dll (via `make ort-win`)
 models/                det_10g.onnx, w600k_r50.onnx  (downloaded)
-people/                <Person Name>/*.jpg ...       (your dataset)
-data/faces.db          generated face DB (bbolt, single file)
+people/                <repo-uuid>/<Person Name>/*.jpg ...  (repositories;
+                       legacy flat <Person>/ folders until `recogn repo import`)
+data/faces.db          generated face DB (bbolt, single file; schema v2 —
+                       a repos bucket, person IDs <repo-uuid>-<slug>)
+data/users.db          users, per-repo grants, hashed API keys (bbolt)
 data/embeddings.json   JSON interchange copy — auto-imported when the DB is
                        empty, written by `recogn export`
 ```
@@ -60,22 +71,30 @@ baked into the image (they'd add ~191 MB): on first start they download into
 the mounted `./models` folder, or you can pre-populate it with `make models`.
 
 ```sh
-docker compose run --rm recogn hash-password   # 1. choose an admin password
-# 2. paste the printed $argon2id$... hash over the placeholder in docker-compose.yml
-docker compose up --build                      # 3. build and start
-# open http://localhost:8080 and log in
+docker compose up --build    # 1. build and start
+docker compose logs recogn   # 2. look for: setup key: XXXX-XXXX-XXXX-XXXX
+# 3. open http://localhost:8080, enter the setup key and pick the admin
+#    username + password — then create repositories and users from the
+#    admin UI (users get per-repo reader/writer roles and can mint
+#    personal API keys)
 ```
 
-The compose sample ships **secure by default**: it publishes the port on
-`127.0.0.1` only and refuses to start until `RECOGN_ADMIN_PASSWORD_HASH` is
-replaced (the placeholder hash makes the container exit with an error — see
-`docker compose logs`), so a fresh deployment is never exposed unauthenticated.
-To serve other machines, point a TLS reverse proxy at it (or switch the
-commented `8080:8080` binding) once the hash is set.
+The compose sample ships **secure by default**: login is always required —
+there is no open mode (only the setup view, `/api/login`, `/api/health` and
+any enabled share link are reachable unauthenticated) — and it publishes the
+port on `127.0.0.1` only. To serve other machines, point a TLS reverse proxy
+at it (or switch the commented `8080:8080` binding).
 
-On first start, if the face DB is empty, the container **auto-enrolls** from
-the mounted `./people` folder before serving. The generated database persists
-in `./data` (mounted at `/data/db`) so it survives rebuilds and restarts.
+There is no default repository. To wrap an existing legacy dataset (flat
+`people/<Person>/` folders) into one repository, then enroll it:
+
+```sh
+docker compose run --rm recogn repo import --name "My people"
+docker compose run --rm recogn enroll --repo "My people"
+```
+
+The databases persist in `./data` (mounted at `/data/db` — the face DB and
+the user DB) so they survive rebuilds and restarts.
 
 - **Models**: `./models` is mounted at `/data/models`. On first start the app
   downloads the insightface buffalo_l pack (~289 MB) into it and keeps only
@@ -84,17 +103,20 @@ in `./data` (mounted at `/data/db`) so it survives rebuilds and restarts.
   it with `make models` and nothing is downloaded (a read-only mount then
   works too). Point `RECOGN_MODELS_URL` at your own pack for mirrors /
   air-gapped hosts; `RECOGN_AUTO_DOWNLOAD=0` disables the download entirely.
-- **Dataset**: `./people` is mounted writable at `/data/people` so photos
-  enrolled through the API/UI are saved back into it (as `<Name>/<sha1>.<ext>`).
+- **Datasets**: `./people` is the **repos root** — one folder per repository
+  (`./people/<repo-uuid>/<Person>/*.jpg`), mounted writable so photos
+  enrolled through the API/UI are saved back into it (as
+  `<Person>/<sha1>.<ext>`).
 - **Threshold**: set `RECOGN_THRESHOLD` in `docker-compose.yml`.
-- **Admin login**: optional — set `RECOGN_ADMIN_PASSWORD_HASH` (or register
-  passkeys); see [Securing the admin interface](#securing-the-admin-interface).
-- **One-off CLI** (against the same image):
+- **Users**: created from the admin UI (or `POST /api/users`); per-repo
+  reader/writer roles, personal API keys, optional per-repo share links —
+  see [Users and access control](#users-and-access-control).
+- **One-off CLI** (against the same image; `--repo` takes a name or id):
 
   ```sh
-  docker compose run --rm recogn people
-  docker compose run --rm recogn recognize /data/people/Yana/img_0103.jpg
-  docker compose run --rm recogn enroll --force
+  docker compose run --rm recogn people --repo "My people"
+  docker compose run --rm recogn recognize --repo "My people" /data/people/<repo-uuid>/Yana/img_0103.jpg
+  docker compose run --rm recogn enroll --repo "My people" --force
   ```
 
 Without compose, plain Docker works too:
@@ -132,6 +154,12 @@ loaded at runtime: on first use it is extracted to
 `~/.cache/recogn/ort/<version>/` and dlopen'd, so no external files are
 needed. Deploy just the executable — models load from `models/` or
 auto-download when missing.
+
+First run: `./recogn serve --addr :8080` — with zero users the console prints
+a one-time setup key (`setup key: XXXX-XXXX-XXXX-XXXX`); open the web UI,
+enter the key and pick the admin username + password (the key is in-memory
+only and regenerated on every start until an admin exists). Then create
+repositories and users from the admin UI.
 
 ### Web UI development
 
@@ -181,22 +209,34 @@ Unzip on a Windows machine, open a terminal in the folder, and use
 
 ### CLI
 
+Dataset subcommands are per-repository — they take a required `--repo`
+(a repository's name or id):
+
 ```sh
-# Enroll everyone under people/ (incremental; --force re-embeds everything)
-./recogn enroll
+# Enroll a repository's dataset (incremental; --force re-embeds everything,
+# --prune drops DB entries whose files are missing)
+./recogn enroll --repo "My people"
 
 # Identify every face in one or more photos
 # (flags go before the image paths)
-./recogn recognize --json photo.jpg group.jpg
+./recogn recognize --repo "My people" --json photo.jpg group.jpg
 
 # The same, plus an annotated copy with numbered boxes + labels drawn on it:
 # single image  -> --draw takes an output .jpg path
 # several files -> --draw takes a directory (one <name>.annotated.jpg each)
-./recogn recognize --draw annotated.jpg photo.jpg
-./recogn recognize --draw out/ photo1.jpg photo2.jpg
+./recogn recognize --repo "My people" --draw annotated.jpg photo.jpg
+./recogn recognize --repo "My people" --draw out/ photo1.jpg photo2.jpg
 
-# List enrolled identities
-./recogn people
+# List the enrolled identities of a repository
+./recogn people --repo "My people" --json
+
+# Wrap the legacy flat dataset (root-level people/<Person>/ folders) into one
+# new repository: moves the folders under people/<uuid>/, rewrites the person
+# IDs to <uuid>-<slug> and renames the thumbnail sidecars
+./recogn repo import --name "My people"
+
+# Write the whole database (all repositories) to the JSON interchange file
+./recogn export
 ```
 
 ### Web UI + API
@@ -206,14 +246,18 @@ Unzip on a Windows machine, open a terminal in the folder, and use
 # open http://localhost:8080
 ```
 
-The web UI lets you drag-and-drop a photo to see every detected face boxed and
-labelled, browse the enrolled people, add a new person by uploading photos, and
-re-scan the `people/` folder. Unknown faces can be named right in the results
+After login, the web UI lets you drag-and-drop a photo to see every detected
+face boxed and labelled, browse the enrolled people of the selected
+repository, add a new person by uploading photos, and re-scan the
+repository's folder. Unknown faces can be named right in the results
 list ("Enroll" under an unknown face enrolls that specific face — matched by
 its row number, which the canvas overlay also shows next to the name). The
 people panel has a filter box and a threshold slider (persisted server-side).
+Admins additionally manage repositories (create/rename/delete, optional
+per-repo share links), users and their per-repo reader/writer roles from the
+UI; every user manages their own password and personal API keys there.
 
-**Compare two photos** (admin): the people panel has a *Compare two photos*
+**Compare two photos** (any logged-in user): the people panel has a *Compare two photos*
 button that opens a face-to-face comparison tool — drop in any two photos and
 it reports how similar their faces are. The largest face of each photo is
 detected, aligned and embedded, and the two embeddings' **cosine similarity**
@@ -228,144 +272,177 @@ always come from the photos the modal currently shows.
 
 #### REST API
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/api/recognize` | multipart `image` → `{count, faces:[{bbox,name,person_id,confidence,score,landmarks,matches}]}` — `matches` ranks every identity above the threshold (best per person); near-tied top scores hint at duplicate people. `?draw=1` responds with the annotated JPEG (numbered boxes + labels) instead of JSON |
-| `GET`  | `/api/people` | list enrolled people + photo counts (incl. `thumb` URL when a face thumbnail exists, and `aliases` when the person has metadata) |
-| `GET`  | `/api/people/{name}` | one person's public **details document**: `{id, name, photos:<count>, aliases?, birthdate?, urls?, description?}` — optional metadata only, no enrolled photo paths; never-filled fields are omitted |
-| `GET`  | `/api/people/{name}/photos` | one person's enrolled photos (`thumb_src` = photo the avatar comes from) — the photos manager's payload |
-| `POST` | `/api/people/{name}/meta` | replace a person's metadata — JSON `{"aliases": [...], "birthdate": {"year","month","day"}, "urls": [...], "description": "<markdown>"}`; every field optional, omitted/empty fields clear the stored value (full-replace). Validation: aliases deduped (max 20 × 120 chars), URLs must be absolute `http(s)` (max 50 × 2048), birthdate parts are range-checked with a day requiring a month or year (max year 2100; a complete date must exist on the calendar), description max 20 000 chars |
-| `POST` | `/api/people/{name}/enroll` | add photo(s) (field `images`) for a new/existing person; each enrolled image is also saved into `people/<name>/` |
-| `POST` | `/api/people/{name}/enroll-face` | enroll one specific face of an uploaded photo: multipart `image` + `face_index` (1-based, in the detection order `/api/recognize` reports) — used by the UI's "name this face" action on unknown results |
-| `GET`  | `/api/people/{name}/photos/{path}` | one of the person's enrolled photo files (from the people folder) |
-| `GET`  | `/api/people/{name}/photos/{path}/detect` | detect + recognize faces on an enrolled photo (for the photos-manager quality check) |
-| `DELETE` | `/api/people/{name}/photos/{path}` | remove one photo: DB entry + file in `people/<name>/`; the avatar is regenerated from another photo (or cleared) if it was the thumbnail source |
-| `POST` | `/api/people/{name}/thumbnail` | regenerate the face thumbnail from a chosen enrolled photo — JSON `{"photo": "<path>"}` |
-| `POST` | `/api/people/{name}/rename` | rename a person — JSON `{"name": "<new name>"}`; moves `people/<name>/`, re-derives the person ID, renames the thumbnail sidecar and updates the DB in one step |
-| `GET`  | `/api/thumbs/{id}.jpg` | a person's face thumbnail (square face crop; `?v=` cache-buster follows the chosen photo) |
-| `DELETE` | `/api/people/{name}` | remove a person |
-| `POST` | `/api/enroll?force=true` | re-scan the `people/` folder (incremental unless `force`); `?prune=true` also drops DB photo entries whose files are missing (CLI: `recogn enroll --prune`) |
-| `POST` | `/api/compare` | compare the faces of two photos without the identity DB — multipart `image1` + `image2` → `{similarity, threshold, image1: {count, faces: [{index, bbox, score, used}]}, image2: {…}}`; the largest face of each photo is embedded and their cosine similarity returned (`used` marks the compared face; `threshold` is the recognizer's match threshold, for the same-person verdict) |
-| `GET`/`POST` | `/api/config` | read/set the match threshold; POSTed values are persisted in the DB and survive restarts (an explicit `--threshold` flag still wins) |
-| `GET`  | `/api/health` | status, people count, threshold, configured admin auth (`"auth":{"password":…,"passkey":…}`) |
+Routes are grouped by access level below: **public** (no login), **any user**
+(any logged-in account), **admin**, and **reader/writer** — the per-repo role
+required from the caller's grant on the repository a person belongs to.
+Scripts authenticate with the session cookie or a personal API key
+(`Authorization: Bearer rk_...`); a share link grants anonymous reader access
+to one repository via `X-Share-Token: <repoID>/<token>`.
+
+| Method | Endpoint | Access | Description |
+|--------|----------|--------|-------------|
+| `GET`  | `/api/health` | public | `{"status":"ok"}` |
+| `GET`  | `/api/auth/session` | public | `{authenticated, user:{name, admin}, setup_required}` — drives the UI's login vs. setup view |
+| `POST` | `/api/setup` | public (first run) | create the admin: setup key + username + password; a wrong key or a call after completion → 403 |
+| `POST` | `/api/login` | public | username + password → HttpOnly `recogn_session` cookie (`POST /api/logout` clears it) |
+| `GET`  | `/api/repos` | any user | the repositories the caller can access |
+| `POST` | `/api/repos` | admin | create a repository (a new `people/<uuid>/` dataset folder) |
+| `POST` | `/api/repos/{id}/rename` | admin | rename a repository's display name (the folder stays `<uuid>`) |
+| `DELETE` | `/api/repos/{id}` | admin | delete a repository |
+| `POST` | `/api/repos/{id}/share` | admin | toggle the read-only share link — JSON `{"enabled": true}` or `{"enabled": false}` → `{share_url: "/share/<id>/<token>"}` (enabling mints a fresh token, i.e. rotates the link) |
+| `GET` | `/api/repos/{id}/share` | admin | re-read the current share link `{share_url}` (same token — no rotation; `share_url: null` while unshared) |
+| `GET`/`POST` | `/api/users` | admin | list / create users |
+| `DELETE` | `/api/users/{u}` | admin | delete a user (refused for the caller's own account and the last remaining admin — with several admins, any of them may delete another) |
+| `POST` | `/api/users/{u}/password` | admin | reset a user's password (sessions revoked; API keys left intact — the response's `notice` asks the caller to have the user review them) |
+| `POST` | `/api/users/{u}/repos` | admin | set a user's per-repo grants — JSON `{"grants":[{"repo":"<name or id>","role":"reader"}]}` |
+| `POST` | `/api/auth/password` | any user | change your own password |
+| `GET`/`POST`/`DELETE` | `/api/auth/keys` | any user | personal API keys (created key shown once as `rk_...`; a key acts as its user) |
+| `GET`  | `/api/config` | any user | read the match threshold (global) |
+| `POST` | `/api/config` | admin | set the match threshold; POSTed values are persisted in the DB and survive restarts (an explicit `--threshold` flag still wins) |
+| `POST` | `/api/compare` | any user | compare the faces of two photos without the identity DB — multipart `image1` + `image2` → `{similarity, threshold, image1: {count, faces: [{index, bbox, score, used}]}, image2: {…}}`; the largest face of each photo is embedded and their cosine similarity returned (`used` marks the compared face; `threshold` is the recognizer's match threshold, for the same-person verdict) |
+| `GET`  | `/api/people?repo=` | reader+ | list a repository's enrolled people + photo counts (incl. `thumb` URL when a face thumbnail exists, and `aliases` when the person has metadata) |
+| `GET`  | `/api/people/{name}` | reader+ | one person's **details document**: `{id, name, photos:<count>, aliases?, birthdate?, urls?, description?}` — optional metadata only, no enrolled photo paths; never-filled fields are omitted |
+| `GET`  | `/api/people/{name}/photos` | reader+ | one person's enrolled photos (`thumb_src` = photo the avatar comes from) — the photos manager's payload |
+| `POST` | `/api/people/{name}/meta` | writer+ | replace a person's metadata — JSON `{"aliases": [...], "birthdate": {"year","month","day"}, "urls": [...], "description": "<markdown>"}`; every field optional, omitted/empty fields clear the stored value (full-replace). Validation: aliases deduped (max 20 × 120 chars), URLs must be absolute `http(s)` (max 50 × 2048), birthdate parts are range-checked with a day requiring a month or year (max year 2100; a complete date must exist on the calendar), description max 20 000 chars |
+| `POST` | `/api/people/{name}/enroll` | writer+ | add photo(s) (field `images`) for a new/existing person; each enrolled image is also saved into the person's folder |
+| `POST` | `/api/people/{name}/enroll-face` | writer+ | enroll one specific face of an uploaded photo: multipart `image` + `face_index` (1-based, in the detection order `/api/recognize` reports) — used by the UI's "name this face" action on unknown results |
+| `GET`  | `/api/people/{name}/photos/{path}` | writer+ | one of the person's enrolled photo files (full resolution) |
+| `GET`  | `/api/people/{name}/photos/{path}/detect` | reader+ | detect + recognize faces on an enrolled photo (for the photos-manager quality check) |
+| `DELETE` | `/api/people/{name}/photos/{path}` | writer+ | remove one photo: DB entry + file in the person's folder; the avatar is regenerated from another photo (or cleared) if it was the thumbnail source |
+| `POST` | `/api/people/{name}/thumbnail` | writer+ | regenerate the face thumbnail from a chosen enrolled photo — JSON `{"photo": "<path>"}` |
+| `POST` | `/api/people/{name}/rename` | writer+ | rename a person — JSON `{"name": "<new name>"}`; moves the person's folder, updates the DB record and the thumbnail sidecar in one step |
+| `DELETE` | `/api/people/{name}` | writer+ | remove a person |
+| `GET`  | `/api/thumbs/{id}.jpg` | reader+ | a person's face thumbnail (square face crop; `?v=` cache-buster follows the chosen photo) |
+| `POST` | `/api/recognize?repo=` | reader+ | multipart `image` → `{count, faces:[{bbox,name,person_id,confidence,score,landmarks,matches}]}` — `matches` ranks every identity above the threshold (best per person); near-tied top scores hint at duplicate people. `?draw=1` responds with the annotated JPEG (numbered boxes + labels) instead of JSON; **400 when `repo` is missing** |
+| `POST` | `/api/enroll?repo=` | writer+ | re-scan the repository's folder (incremental unless `force`); `?prune=true` also drops DB photo entries whose files are missing (CLI: `recogn enroll --repo … --prune`) |
 
 Example:
 
 ```sh
-curl -F "image=@photo.jpg" http://localhost:8080/api/recognize
-curl -F "image1=@a.jpg" -F "image2=@b.jpg" http://localhost:8080/api/compare
+# Log in once and reuse the cookie — or skip this by sending a personal API
+# key instead: -H "Authorization: Bearer rk_..."
+curl -s -c cookies.txt -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"change-me"}' http://localhost:8080/api/login
+curl -s -b cookies.txt -F "image=@photo.jpg" \
+  "http://localhost:8080/api/recognize?repo=My%20people"
+curl -s -b cookies.txt -F "image1=@a.jpg" -F "image2=@b.jpg" \
+  http://localhost:8080/api/compare
 ```
 
-Admin endpoints (enroll, people/photo edits, face comparison, threshold config) require a login
-once admin auth is configured — see [Securing the admin
-interface](#securing-the-admin-interface).
+Every route requires a logged-in user (session cookie or API key) except
+`/api/setup`, `/api/login`, `/api/logout`, `/api/auth/session`, `/api/health`
+and any enabled share link — see
+[Users and access control](#users-and-access-control). The per-repo reader /
+writer role is checked against the repository the route acts on.
 
-## Securing the admin interface
+## Users and access control
 
-Admin actions — enroll, edit people/photos, threshold config, serving
-full-resolution enrolled photos — require a login **once admin auth is
-configured**. With no auth configured the server behaves exactly as before
-(everything public) and logs a warning at startup.
+The server **always requires login** — there is no open mode. The only
+unauthenticated routes are the first-run setup view, `/api/login`,
+`/api/logout`, `/api/auth/session`, `/api/health` and any enabled share link
+(below).
 
-| Access | Routes |
-|--------|--------|
-| Public | UI recognize stage, `POST /api/recognize`, `GET /api/people` (read-only list incl. `thumb` URLs), `GET /api/people/{name}` (public details document incl. metadata), `GET /api/thumbs/{id}.jpg`, `GET /api/health`, auth endpoints below |
-| Admin (login) | everything else: enroll/rescan, add/rename/delete people, metadata edits (`POST /api/people/{name}/meta`), photo add/delete/detect and the per-person photos list, thumbnail regen, face comparison (`POST /api/compare`), `GET`/`POST /api/config`, full-resolution enrolled photo files, passkey management |
+**First run — setup key**: `recogn serve` with zero users prints a one-time
+setup key to the console (`setup key: XXXX-XXXX-XXXX-XXXX`, on stdout and in
+the log). Enter it in the UI's setup view together with the admin username
+and password (`POST /api/setup`). The key lives only in memory and is
+regenerated on every start until an admin exists; `/api/setup` answers 403
+for a wrong key or once an admin has been created.
 
-Auth endpoints: `POST /api/login`, `POST /api/logout`, `GET /api/auth/session`,
-`POST /api/auth/passkey/register/begin|finish` (admin),
-`POST /api/auth/passkey/login/begin|finish` (public),
-`GET|DELETE /api/auth/passkeys` (admin). Failed logins are rate-limited per IP
-(10 failures / 5 min → HTTP 429 with `Retry-After`). Passkey **registration**
-is refused with HTTP 403 while no admin credential exists at all (open mode) —
-otherwise the first visitor could register themselves as admin; see the
-passkey-only setup below for the bootstrap path.
+**Users and roles**: users log in with username + password and are granted a
+per-repository role:
 
-Two login methods; either or both can be configured:
+| Role | Access |
+|------|--------|
+| reader | browse a repository's people, details and thumbnails; recognize against it |
+| writer | reader + enroll / photo management / full-resolution photos |
+| admin | implicitly full access everywhere, plus user/repo/share management |
 
-- **Password** — `RECOGN_ADMIN_PASSWORD_HASH`: an **argon2id hash** of the
-  admin password (PHC format), never the plaintext. Generate one with
-  `recogn hash-password` (trimmed; empty = unset):
+Users change their own password (`POST /api/auth/password`); the admin resets
+anyone's (`POST /api/users/{u}/password`). Accounts are deletable except the
+caller's own and the last remaining admin.
 
-  ```sh
-  ./recogn hash-password                                # prompts (hidden input)
-  openssl rand -base64 18 | ./recogn hash-password      # or pipe one in
-  docker compose run --rm recogn hash-password          # inside Docker
-  # → set RECOGN_ADMIN_PASSWORD_HASH to the printed $argon2id$... value
-  ```
+**API keys**: every user can create personal API keys in the UI (`GET`/`POST`/`DELETE /api/auth/keys`; the full `rk_...` key is shown once at creation)
+and revoke them there. A key acts as its user — scripts send `Authorization:
+Bearer rk_...` and get that user's roles on every route.
 
-  In the browser, the login modal exchanges the password for an HttpOnly
-  session cookie (`recogn_session`, `SameSite=Lax`, `Secure` over TLS).
-- **Passkey (WebAuthn)** — register in the UI's Passkeys modal while logged
-  in; credentials persist in `data/passkeys.json` (corrupt file refuses
-  startup). Passkey login needs a secure context: **HTTPS or localhost**.
-  The WebAuthn spec also forbids bare-IP hosts as RPID, so open the UI via
-  `localhost` or a domain (behind a proxy set `RECOGN_WEBAUTHN_RPID`) —
-  reaching the server as `127.0.0.1` cannot run passkey ceremonies.
+**Share links**: the admin can enable one optional read-only link per
+repository (`POST /api/repos/{id}/share {"enabled": true}` → the
+`/share/<repoID>/<token>` URL). The URL can be re-read at any time
+(`GET /api/repos/{id}/share`, or the "Show link" button in the Repositories
+dialog) — revealing it never rotates the token; only disabling and
+re-enabling does. Non-admins can neither see nor list share links — hand the
+URL to the people who need it. Visiting it in the browser, or sending
+`X-Share-Token: <repoID>/<token>`, grants anonymous **reader** access to that
+one repository only.
+
+Sessions are in-memory (HttpOnly `recogn_session` cookie, `SameSite=Lax`,
+`Secure` over TLS): a restart logs everyone out, and `RECOGN_SESSION_TTL`
+(default 24h, sliding) bounds their lifetime. Failed logins are rate-limited
+per IP (10 failures / 5 min → HTTP 429 with `Retry-After`).
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `RECOGN_ADMIN_PASSWORD_HASH` | unset | enables password admin login (argon2id PHC from `recogn hash-password`) |
 | `RECOGN_SESSION_TTL` | `24h` | sliding session lifetime (Go duration); sessions are in-memory, so restarts log everyone out |
-| `RECOGN_WEBAUTHN_RPID` | unset | WebAuthn Relying Party ID (your domain) — recommended behind a reverse proxy/TLS |
-| `RECOGN_WEBAUTHN_ORIGIN` | unset | expected WebAuthn origin, e.g. `https://recogn.example.com` |
-| `RECOGN_WEBAUTHN_RP_NAME` | `recogn` | Relying Party display name |
 | `RECOGN_TRUSTED_PROXY_CIDR` | unset | comma-separated reverse-proxy CIDRs trusted for client-IP extraction (e.g. `10.0.0.0/8`) — gives each proxied client its own login rate-limit bucket; the proxy must append client IPs. Unset (default) keys rate limiting on the peer address and ignores `X-Forwarded-For`, so all clients behind one proxy share a bucket |
 
-Scripts log in once and reuse the session:
+Scripts log in once and reuse the session — or send a personal API key:
 
 ```sh
-# Login once, keep the cookie, call an admin endpoint with it
+# Login once, keep the cookie, call a scoped endpoint with it
 curl -s -c cookies.txt -X POST http://localhost:8080/api/login \
-  -H 'Content-Type: application/json' -d '{"password":"change-me"}'
-curl -s -b cookies.txt -X POST http://localhost:8080/api/enroll
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"change-me"}'
+curl -s -b cookies.txt "http://localhost:8080/api/people?repo=My%20people"
 
-# Or present the session token as a Bearer credential instead of the cookie
-# (the value of the recogn_session cookie):
-curl -s -X POST http://localhost:8080/api/enroll \
-  -H "Authorization: Bearer $(sed -n 's/.*recogn_session\s*//p' cookies.txt)"
+# Or present a personal API key (acts as its user) as a Bearer credential
+curl -s -H "Authorization: Bearer rk_..." \
+  "http://localhost:8080/api/people?repo=My people"
 ```
 
-**Passkey-only setup**: set a temporary `RECOGN_ADMIN_PASSWORD_HASH` → log
-in → register a passkey in the Passkeys modal → remove the hash env and
-restart; the passkey keeps working. This temporary hash is the only way to
-bootstrap a passkey-only install: with no admin credential configured at all
-the server refuses passkey registration (403), so a fresh deployment cannot
-be captured by the first network peer to reach it.
-
 **Security notes**: over plain HTTP the password crosses the wire in
-cleartext — put a TLS reverse proxy in front for anything remote. The people
-list and face thumbnails stay public by design.
+cleartext — put a TLS reverse proxy in front for anything remote.
 
 ## Expanding the database
 
-To add someone new, either:
+People live in **repositories** — admin-created datasets, each a folder
+`people/<repo-uuid>/` of person folders. To add someone new, either:
 
-1. **Drop a folder** `people/<Their Name>/` with a few photos and run
-   `./recogn enroll` (or `POST /api/enroll`), **or**
-2. **Upload photos** at runtime: `POST /api/people/<name>/enroll`. Each
-   successfully enrolled upload is written to `people/<name>/<sha1>.<ext>`
-   (content-derived name, so re-uploading the same photo is idempotent) and
-   its DB entry points at that file — a later `POST /api/enroll` rescan
+1. **Drop a folder** `people/<repo-uuid>/<Their Name>/` with a few photos and
+   run `./recogn enroll --repo <name|id>` (or `POST /api/enroll?repo=`), **or**
+2. **Upload photos** at runtime: `POST /api/people/<name>/enroll` (writer).
+   Each successfully enrolled upload is written into the person's folder as
+   `<sha1>.<ext>` (content-derived name, so re-uploading the same photo is
+   idempotent) and its DB entry points at that file — a later rescan
    recognizes it as already enrolled.
 
-**Storage**: the database lives in a single bbolt file, `data/faces.db` —
-writes touch only the changed person/photo record (no whole-file rewrite),
-startup loads it directly, and a file lock refuses two `recogn` processes on
-the same DB. For humans and backups there is a JSON interchange file,
-`data/embeddings.json`: it is **imported automatically whenever the store is
-empty** (so deleting `faces.db` and restarting restores the last exported
-snapshot — the JSON is never renamed or consumed), and `./recogn export
-[--out path]` **writes** the current database to it. The JSON is not kept in
-sync by day-to-day enrollment; run `recogn export` to refresh it. Corrupt
-JSON fails startup loudly rather than silently starting empty.
+**Coming from the old flat layout?** `recogn repo import --name "My people"`
+wraps the legacy root-level `people/<Person>/` folders into one new
+repository: it moves the folders under `people/<uuid>/`, rewrites the person
+IDs to `<uuid>-<slug>` and renames the thumbnail sidecars. Run it once, then
+enroll the repository as above.
+
+**Storage**: the face database lives in a single bbolt file, `data/faces.db`
+(schema v2 — a repos bucket plus every person's repository ID; person IDs are
+`<repo-uuid>-<slug>`) — writes touch only the changed person/photo record (no
+whole-file rewrite), startup loads it directly, and a file lock refuses two
+`recogn` processes on the same DB. Users, per-repo grants and hashed API keys
+live in a second bbolt file, `data/users.db`. For humans and backups there is
+a JSON interchange file, `data/embeddings.json`: it is **imported
+automatically whenever the store is empty** (so deleting `faces.db` and
+restarting restores the last exported snapshot — the JSON is never renamed or
+consumed), and `./recogn export [--out path]` **writes** the current database
+— all repositories — to it. The JSON is not kept in sync by day-to-day
+enrollment; run `recogn export` to refresh it. Corrupt JSON fails startup
+loudly rather than silently starting empty.
 
 **Face thumbnails**: the first enrolled photo that yields a face also produces
 a square face-crop thumbnail, stored as a sidecar next to the database file
 (`data/thumbs/<person-id>.jpg`) and served at `/api/thumbs/<id>.jpg` — the web
 UI's people list shows it as the person's avatar. Clicking a person (their
-avatar or row) opens the **details modal**: a public view of who they are
-(see *Person metadata* below) plus, for logged-in admins, the entry points
+avatar or row) opens the **details modal**: a view of who they are
+(see *Person metadata* below), visible to any reader of the repository,
+plus, for logged-in writers, the entry points
 into managing them — **Edit details** (inline metadata form) and
 **Manage photos** (the photos-manager modal, stacked on top). In the photos
 manager you can add photos (upload happens immediately) or remove them;
@@ -375,8 +452,8 @@ runs detection and draws the found face(s) over it, so you can judge whether
 it's a good enrollment shot, and re-select it as the avatar. The enroll modal
 runs the same face check on every photo *before* you confirm, so a photo with
 no detectable face is flagged before it's ever sent. The **Rename** button in
-the same modal renames a person everywhere at once — the `people/<Name>/`
-folder, their derived person ID, the `thumbs/<id>.jpg` sidecar and the DB
+the same modal renames a person everywhere at once — the person's folder, the
+`thumbs/<id>.jpg` sidecar and the DB
 record — so recognition results, photo URLs and avatars all follow the new
 name (`POST /api/people/{name}/rename` does the same from a script). Datasets
 enrolled before thumbnails existed backfill automatically on the next rescan,
@@ -395,15 +472,15 @@ assembled date plus the age (exact for a full date, `≈` for partial ones,
 floored to the start of the month/year when the day/month is unknown) and
 the days until the next birthday when month and day are known. Metadata is
 consulted in the UI by clicking a person in the list (the details modal is
-public; only the
-fields that were actually filled are shown) and edited by admins through the
+visible to any reader of the repository; only the
+fields that were actually filled are shown) and edited by writers through the
 modal's **Edit details** form or the enroll modal's **Person details**
 section. Under the hood it lives on the person's DB
 record: rescans and photo changes can't lose it, renames and exports carry it
 (`embeddings.json` round-trips it), and deleting the person deletes it with
 the record — re-enrolling their folder starts with empty metadata. The
-details document is served publicly at `GET /api/people/{name}` and written
-(admin-only) via `POST /api/people/{name}/meta`.
+details document is served to readers at `GET /api/people/{name}` and written
+(writer-only) via `POST /api/people/{name}/meta`.
 
 ## Notes & tuning
 

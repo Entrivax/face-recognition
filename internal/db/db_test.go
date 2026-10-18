@@ -435,7 +435,7 @@ func TestExportDefaultPath(t *testing.T) {
 	if err := json.Unmarshal(b, &ff); err != nil {
 		t.Fatalf("exported file is not valid interchange JSON: %v", err)
 	}
-	if ff.Version != 1 || len(ff.People) != 1 {
+	if ff.Version != 2 || len(ff.People) != 1 {
 		t.Errorf("unexpected exported document: %+v", ff)
 	}
 	// Repeated exports must be byte-stable (people name-sorted).
@@ -557,6 +557,47 @@ func TestGetReturnsCopy(t *testing.T) {
 	fresh := d.Get("Alice")
 	if fresh == nil || fresh.Name != "Alice" || len(fresh.Photos) != 1 {
 		t.Fatalf("stored record was mutated through the returned pointer: %+v", fresh)
+	}
+}
+
+// TestGetLegacyScope checks the legacy-only read accessor: a repo person
+// with the same name never matches, a repo-only name is nil, and a legacy
+// name resolves to the legacy record.
+func TestGetLegacyScope(t *testing.T) {
+	d := openTemp(t)
+	// A legacy Alice...
+	if err := d.AddPhoto("Alice", "a/1.jpg", []byte("x"), []float32{1}); err != nil {
+		t.Fatal(err)
+	}
+	legacy := d.GetLegacy("alice")
+	if legacy == nil || legacy.RepoID != "" || len(legacy.Photos) != 1 {
+		t.Fatalf("GetLegacy(alice) = %+v, want the legacy person", legacy)
+	}
+	// ...and a repo Alice sharing the name.
+	repo, err := d.CreateRepo("Team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.AddPhotoHashedForRepo(repo.ID, "Alice", "a/2.jpg", HashBytes([]byte("y")), []float32{2}); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := d.GetLegacy("ALICE"); got == nil || got.RepoID != "" || got.ID != legacy.ID {
+		t.Fatalf("GetLegacy with a repo namesake = %+v, want the legacy record %s", got, legacy.ID)
+	}
+	inRepo := d.GetInRepo(repo.ID, "alice")
+	if inRepo == nil {
+		t.Fatal("GetInRepo lost the repo person")
+	}
+	if inRepo.RepoID != repo.ID {
+		t.Fatalf("GetInRepo(alice) = %+v, want the repo person", inRepo)
+	}
+	// A repo-only name is invisible to the legacy accessor.
+	if err := d.AddPhotoHashedForRepo(repo.ID, "Bob", "b/1.jpg", HashBytes([]byte("z")), []float32{3}); err != nil {
+		t.Fatal(err)
+	}
+	if got := d.GetLegacy("Bob"); got != nil {
+		t.Fatalf("GetLegacy(repo-only name) = %+v, want nil", got)
 	}
 }
 

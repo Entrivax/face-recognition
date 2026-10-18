@@ -21,16 +21,19 @@ import (
 // test request simulates "connection arrived from inside the trusted proxy".
 const testTrustedCIDR = "192.0.2.0/24"
 
-// newProxyTestService builds a password-mode Service with the given
-// RECOGN_TRUSTED_PROXY_CIDR value.
+// newProxyTestService builds a Service (one admin account "admin"/"sekret-pw")
+// with the given RECOGN_TRUSTED_PROXY_CIDR value.
 func newProxyTestService(t *testing.T, cidrs string) *Service {
 	t.Helper()
 	cfg := newTestConfig(t)
-	cfg.AdminPasswordHash = testPasswordHash
 	cfg.TrustedProxyCIDRs = cidrs
 	s, err := New(cfg)
 	if err != nil {
 		t.Fatalf("auth.New: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if err := s.CreateUser("admin", "sekret-pw", true); err != nil {
+		t.Fatalf("create admin user: %v", err)
 	}
 	return s
 }
@@ -39,7 +42,7 @@ func newProxyTestService(t *testing.T, cidrs string) *Service {
 // X-Forwarded-For header and returns the response code.
 func proxiedLogin(t *testing.T, s *Service, peer, xff, password string) int {
 	t.Helper()
-	b, _ := json.Marshal(map[string]string{"password": password})
+	b, _ := json.Marshal(map[string]string{"username": "admin", "password": password})
 	req := httptest.NewRequest("POST", "/api/login", bytes.NewReader(b))
 	req.Header.Set("Content-Type", "application/json")
 	req.RemoteAddr = peer
@@ -115,7 +118,6 @@ func TestClientIPUntrustedPeerSpoofIgnored(t *testing.T) {
 func TestNewRejectsBadTrustedProxyCIDR(t *testing.T) {
 	for _, bad := range []string{"banana", "192.0.2.0/24,nope", "192.0.2.1"} {
 		cfg := newTestConfig(t)
-		cfg.AdminPasswordHash = testPasswordHash
 		cfg.TrustedProxyCIDRs = bad
 		if _, err := New(cfg); err == nil {
 			t.Errorf("RECOGN_TRUSTED_PROXY_CIDR=%q must fail startup loudly", bad)
@@ -140,11 +142,11 @@ func TestLoginLimiterTrustedProxyIndependence(t *testing.T) {
 	if code := proxiedLogin(t, s, proxyPeer, "203.0.113.10", "bad"); code != http.StatusTooManyRequests {
 		t.Fatalf("locked client: got %d, want 429", code)
 	}
-	if code := proxiedLogin(t, s, proxyPeer, "203.0.113.10", "sekret"); code != http.StatusTooManyRequests {
+	if code := proxiedLogin(t, s, proxyPeer, "203.0.113.10", "sekret-pw"); code != http.StatusTooManyRequests {
 		t.Fatalf("locked client with right password: got %d, want 429", code)
 	}
 	// ...while client B behind the SAME proxy is unaffected.
-	if code := proxiedLogin(t, s, proxyPeer, "203.0.113.11", "sekret"); code != http.StatusOK {
+	if code := proxiedLogin(t, s, proxyPeer, "203.0.113.11", "sekret-pw"); code != http.StatusOK {
 		t.Fatalf("other proxied client: got %d, want 200", code)
 	}
 	// An untrusted peer with a spoofed X-Forwarded-For is keyed on its own
@@ -152,11 +154,11 @@ func TestLoginLimiterTrustedProxyIndependence(t *testing.T) {
 	if code := proxiedLogin(t, s, "10.9.9.9:5555", "203.0.113.10", "bad"); code != http.StatusUnauthorized {
 		t.Fatalf("spoofed XFF from untrusted peer: got %d, want 401 (XFF ignored)", code)
 	}
-	if code := proxiedLogin(t, s, "10.9.9.9:5555", "203.0.113.10", "sekret"); code != http.StatusOK {
+	if code := proxiedLogin(t, s, "10.9.9.9:5555", "203.0.113.10", "sekret-pw"); code != http.StatusOK {
 		t.Fatalf("untrusted peer must keep its own bucket: got %d, want 200", code)
 	}
 	// A remains locked out.
-	if code := proxiedLogin(t, s, proxyPeer, "203.0.113.10", "sekret"); code != http.StatusTooManyRequests {
+	if code := proxiedLogin(t, s, proxyPeer, "203.0.113.10", "sekret-pw"); code != http.StatusTooManyRequests {
 		t.Fatalf("A must still be locked: got %d, want 429", code)
 	}
 }
@@ -171,7 +173,7 @@ func TestLoginLimiterDefaultGroupsByPeer(t *testing.T) {
 			t.Fatalf("failure %d: got %d, want 401", i+1, code)
 		}
 	}
-	if code := proxiedLogin(t, s, "192.0.2.1:1234", "203.0.113.200", "sekret"); code != http.StatusTooManyRequests {
+	if code := proxiedLogin(t, s, "192.0.2.1:1234", "203.0.113.200", "sekret-pw"); code != http.StatusTooManyRequests {
 		t.Fatalf("shared bucket behind untrusted proxy: got %d, want 429", code)
 	}
 }

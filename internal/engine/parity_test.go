@@ -22,26 +22,52 @@ import (
 
 func datasetImages(t *testing.T) []string {
 	t.Helper()
+	// The people/ root holds person folders either directly (legacy flat
+	// layout, before `recogn repo import`) or one level down inside
+	// per-repository folders (people/<repo-uuid>/<Person>/*.jpg). Both
+	// layouts are walked; hidden directories are skipped everywhere.
 	root := "../../people"
 	var imgs []string
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		t.Skipf("no people dir: %v", err)
 	}
+	readImages := func(dir string) []string {
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			return nil
+		}
+		var found []string
+		for _, f := range files {
+			if f.IsDir() || strings.HasPrefix(f.Name(), ".") {
+				continue
+			}
+			ext := strings.ToLower(filepath.Ext(f.Name()))
+			if ext == ".jpg" || ext == ".jpeg" || ext == ".png" {
+				found = append(found, filepath.Join(dir, f.Name()))
+			}
+		}
+		return found
+	}
 	for _, e := range entries {
 		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
 		sub := filepath.Join(root, e.Name())
-		files, err := os.ReadDir(sub)
+		// Directly contained images make this a legacy person folder
+		// (people/<Person>/*.jpg, pre-`recogn repo import`).
+		imgs = append(imgs, readImages(sub)...)
+		inner, err := os.ReadDir(sub)
 		if err != nil {
 			continue
 		}
-		for _, f := range files {
-			ext := strings.ToLower(filepath.Ext(f.Name()))
-			if ext == ".jpg" || ext == ".jpeg" || ext == ".png" {
-				imgs = append(imgs, filepath.Join(sub, f.Name()))
+		for _, r := range inner {
+			if !r.IsDir() || strings.HasPrefix(r.Name(), ".") {
+				continue
 			}
+			// Otherwise treat the entry as a repository folder and walk
+			// its person dirs: people/<repo-uuid>/<Person>/*.jpg.
+			imgs = append(imgs, readImages(filepath.Join(sub, r.Name()))...)
 		}
 	}
 	sort.Strings(imgs)

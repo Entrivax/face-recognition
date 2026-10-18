@@ -3,7 +3,9 @@ package api
 // Tests for POST /api/compare: the face-to-face similarity endpoint. The
 // stub here distinguishes the two uploaded payloads by their bytes ("A" vs
 // anything else), so one stub serves both photos with different
-// faces/embeddings.
+// faces/embeddings. The endpoint is mounted under RequireAuth (any
+// authenticated principal; share tokens excluded), so the probes carry a
+// session.
 
 import (
 	"bytes"
@@ -27,7 +29,10 @@ type compareStub struct {
 	threshold      float64
 }
 
-func (s *compareStub) Recognize(b []byte) ([]engine.Face, error) { return nil, nil }
+func (s *compareStub) RecognizeScoped(_ []byte, _ map[string]struct{}) ([]engine.Face, error) {
+	return nil, nil
+}
+func (s *compareStub) Recognize([]byte) ([]engine.Face, error) { return nil, nil }
 func (s *compareStub) Detect(b []byte) ([]engine.Face, error) {
 	if s.detectErr != nil {
 		return nil, s.detectErr
@@ -66,15 +71,16 @@ func compareBody(t *testing.T, dataA, dataB []byte) (*bytes.Buffer, string) {
 	return &buf, w.FormDataContentType()
 }
 
-// postCompare POSTs a compare request built from the two payloads.
-func postCompare(t *testing.T, s *Server, dataA, dataB []byte) *httptest.ResponseRecorder {
+// postCompare POSTs a compare request built from the two payloads, as the
+// given actor (cookie; hdr adds e.g. an X-Share-Token probe).
+func postCompare(t *testing.T, s *Server, cookie *http.Cookie, dataA, dataB []byte, hdr ...map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
 	body, ct := compareBody(t, dataA, dataB)
-	req := httptest.NewRequest(http.MethodPost, "/api/compare", body)
-	req.Header.Set("Content-Type", ct)
-	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
-	return rec
+	var h map[string]string
+	if len(hdr) > 0 {
+		h = hdr[0]
+	}
+	return do(t, s, http.MethodPost, "/api/compare", body, ct, cookie, h)
 }
 
 type compareFaceJSON struct {
@@ -136,8 +142,9 @@ func TestCompareSimilarity(t *testing.T) {
 				embB:      tc.embB,
 				threshold: 0.45,
 			}
-			s, _ := newTestServer(t, eng)
-			rec := postCompare(t, s, []byte("A"), []byte("B"))
+			e := newEnv(t, eng, "", false, false)
+			_ = createAdmin(t, e.s)
+			rec := postCompare(t, e.s, e.admin, []byte("A"), []byte("B"))
 			if rec.Code != http.StatusOK {
 				t.Fatalf("compare: got %d (%s)", rec.Code, rec.Body.String())
 			}
@@ -169,7 +176,8 @@ func TestCompareSimilarity(t *testing.T) {
 }
 
 func TestCompareMissingImage(t *testing.T) {
-	s, _ := newTestServer(t, &compareStub{})
+	e := newEnv(t, &compareStub{}, "", false, false)
+	_ = createAdmin(t, e.s)
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
 	fw, _ := w.CreateFormFile("image1", "a.jpg")
@@ -177,8 +185,9 @@ func TestCompareMissingImage(t *testing.T) {
 	w.Close()
 	req := httptest.NewRequest(http.MethodPost, "/api/compare", &buf)
 	req.Header.Set("Content-Type", w.FormDataContentType())
+	req.AddCookie(e.admin)
 	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
+	e.s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("missing image2: got %d, want 400", rec.Code)
 	}
@@ -191,13 +200,15 @@ func TestCompareMissingImage(t *testing.T) {
 
 func TestCompareNoFace(t *testing.T) {
 	// First photo without faces.
-	s, _ := newTestServer(t, &compareStub{facesA: nil, facesB: []engine.Face{{BBox: [4]float64{1, 1, 2, 2}}}})
-	if rec := postCompare(t, s, []byte("A"), []byte("B")); rec.Code != http.StatusUnprocessableEntity {
+	e := newEnv(t, &compareStub{facesA: nil, facesB: []engine.Face{{BBox: [4]float64{1, 1, 2, 2}}}}, "", false, false)
+	_ = createAdmin(t, e.s)
+	if rec := postCompare(t, e.s, e.admin, []byte("A"), []byte("B")); rec.Code != http.StatusUnprocessableEntity {
 		t.Errorf("no face in first photo: got %d, want 422 (%s)", rec.Code, rec.Body.String())
 	}
 	// Second photo without faces.
-	s, _ = newTestServer(t, &compareStub{facesA: []engine.Face{{BBox: [4]float64{1, 1, 2, 2}}}, facesB: nil})
-	rec := postCompare(t, s, []byte("A"), []byte("B"))
+	e2 := newEnv(t, &compareStub{facesA: []engine.Face{{BBox: [4]float64{1, 1, 2, 2}}}, facesB: nil}, "", false, false)
+	_ = createAdmin(t, e2.s)
+	rec := postCompare(t, e2.s, e2.admin, []byte("A"), []byte("B"))
 	if rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("no face in second photo: got %d, want 422 (%s)", rec.Code, rec.Body.String())
 	}
@@ -209,23 +220,29 @@ func TestCompareNoFace(t *testing.T) {
 }
 
 func TestCompareDetectError(t *testing.T) {
-	s, _ := newTestServer(t, &compareStub{detectErr: errors.New("decode source image: broken")})
-	if rec := postCompare(t, s, []byte("A"), []byte("B")); rec.Code != http.StatusBadGateway {
+	e := newEnv(t, &compareStub{detectErr: errors.New("decode source image: broken")}, "", false, false)
+	_ = createAdmin(t, e.s)
+	if rec := postCompare(t, e.s, e.admin, []byte("A"), []byte("B")); rec.Code != http.StatusBadGateway {
 		t.Errorf("detect failure: got %d, want 502 (%s)", rec.Code, rec.Body.String())
 	}
 }
 
 func TestCompareMethodNotAllowed(t *testing.T) {
-	s, _ := newTestServer(t, &compareStub{})
+	e := newEnv(t, &compareStub{}, "", false, false)
+	_ = createAdmin(t, e.s)
 	req := httptest.NewRequest(http.MethodGet, "/api/compare", nil)
+	req.AddCookie(e.admin)
 	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
+	e.s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("GET /api/compare: got %d, want 405", rec.Code)
 	}
 }
 
-func TestCompareRequiresAdmin(t *testing.T) {
+// TestCompareRequiresAuth pins the relaxed mount: /api/compare is no longer
+// admin-only — any authenticated principal may use it (readers included);
+// share tokens do not (RequireAuth, not the scoped guard).
+func TestCompareRequiresAuth(t *testing.T) {
 	eng := &compareStub{
 		facesA:    []engine.Face{{BBox: [4]float64{10, 10, 50, 60}}},
 		facesB:    []engine.Face{{BBox: [4]float64{5, 5, 20, 20}}},
@@ -233,28 +250,21 @@ func TestCompareRequiresAdmin(t *testing.T) {
 		embB:      []float32{1, 0},
 		threshold: 0.45,
 	}
-	s, _ := newAuthTestServer(t, eng)
+	e := newEnv(t, eng, "Team", true, true)
 
-	// Anonymous: gated by the admin middleware.
-	body, ct := compareBody(t, []byte("A"), []byte("B"))
-	req := httptest.NewRequest(http.MethodPost, "/api/compare", body)
-	req.Header.Set("Content-Type", ct)
-	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
+	// Anonymous: gated by RequireAuth.
+	if rec := postCompare(t, e.s, nil, []byte("A"), []byte("B")); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("anonymous compare: got %d, want 401", rec.Code)
 	}
+	// A share token does not authorize compare either.
+	if rec := postCompare(t, e.s, nil, []byte("A"), []byte("B"), shareHdr(e.repoID, e.shareToken)); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("share-token compare: got %d, want 401", rec.Code)
+	}
 
-	// With the admin session cookie: allowed.
-	c := loginAdmin(t, s)
-	body, ct = compareBody(t, []byte("A"), []byte("B"))
-	req = httptest.NewRequest(http.MethodPost, "/api/compare", body)
-	req.Header.Set("Content-Type", ct)
-	req.AddCookie(c)
-	rec = httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
+	// With a plain reader session: allowed.
+	rec := postCompare(t, e.s, e.reader, []byte("A"), []byte("B"))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("authed compare: got %d (%s)", rec.Code, rec.Body.String())
+		t.Fatalf("reader compare: got %d (%s)", rec.Code, rec.Body.String())
 	}
 	var resp compareResp
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {

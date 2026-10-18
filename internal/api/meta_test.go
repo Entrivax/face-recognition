@@ -1,15 +1,14 @@
 package api
 
-// Tests for the person-details surface: the public GET /api/people/{name}
-// document, the admin POST /api/people/{name}/meta full-replace endpoint and
-// its validation rules, and the admin GET /api/people/{name}/photos list the
-// photos manager consumes.
+// Tests for the person-details surface: the reader-visible
+// GET /api/people/{name}?repo= document, the writer-only
+// POST /api/people/{name}/meta full-replace endpoint and its validation
+// rules, and the writer-only photos list the photos manager consumes.
 
 import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -19,11 +18,13 @@ import (
 
 // detailDoc is the public details document shape the UI consumes.
 type detailDoc struct {
-	ID      string   `json:"id"`
-	Name    string   `json:"name"`
-	Photos  int      `json:"photos"`
-	Aliases []string `json:"aliases"`
-	Birth   *struct {
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	Photos   int      `json:"photos"`
+	Repo     string   `json:"repo"`
+	RepoName string   `json:"repo_name"`
+	Aliases  []string `json:"aliases"`
+	Birth    *struct {
 		Year  *int `json:"year"`
 		Month *int `json:"month"`
 		Day   *int `json:"day"`
@@ -32,15 +33,15 @@ type detailDoc struct {
 	Description string   `json:"description"`
 }
 
-func TestPersonDetailPublic(t *testing.T) {
+func TestPersonDetail(t *testing.T) {
 	eng := &stubEngine{faces: []engine.Face{{BBox: [4]float64{10, 10, 40, 40}}}}
-	s, database := newTestServer(t, eng) // open mode: anonymous requests hit the handler
+	e := newEnv(t, eng, "Team", true, false)
 	img := []byte("fake-image")
-	if err := database.AddPhoto("Alice", "a.png", img, []float32{1}); err != nil {
+	if err := e.db.AddPhotoHashedForRepo(e.repoID, "Alice", "a.png", db.HashBytes(img), []float32{1}); err != nil {
 		t.Fatal(err)
 	}
 	y, mo, d := 1965, 3, 2
-	if _, err := database.SetMeta("Alice", &db.PersonMeta{
+	if _, err := e.db.SetMetaInRepo(e.repoID, "Alice", &db.PersonMeta{
 		Aliases:     []string{"A. Smith"},
 		Birth:       &db.BirthDate{Year: &y, Month: &mo, Day: &d},
 		URLs:        []string{"https://example.org/alice"},
@@ -50,10 +51,10 @@ func TestPersonDetailPublic(t *testing.T) {
 	}
 
 	var doc detailDoc
-	if rec := getJSON(t, s, "/api/people/Alice", &doc); rec.Code != http.StatusOK {
-		t.Fatalf("anonymous person detail: got %d (%s)", rec.Code, rec.Body.String())
+	if rec := getJSON(t, e.s, e.reader, "/api/people/Alice?repo="+e.repoID, &doc); rec.Code != http.StatusOK {
+		t.Fatalf("person detail: got %d (%s)", rec.Code, rec.Body.String())
 	}
-	if doc.Name != "Alice" || doc.ID != "alice" || doc.Photos != 1 {
+	if doc.Name != "Alice" || doc.Photos != 1 || doc.Repo != e.repoID || doc.RepoName != "Team" {
 		t.Errorf("unexpected identity block: %+v", doc)
 	}
 	if len(doc.Aliases) != 1 || doc.Aliases[0] != "A. Smith" {
@@ -69,32 +70,51 @@ func TestPersonDetailPublic(t *testing.T) {
 		t.Errorf("description missing: %q", doc.Description)
 	}
 
-	// The public document must not carry enrolled photo paths/hashes (the
-	// photos manager reads the admin /photos endpoint instead).
+	// The details document must not carry enrolled photo paths/hashes (the
+	// photos manager reads the writer-only /photos endpoint instead).
 	var raw map[string]any
-	if rec := getJSON(t, s, "/api/people/Alice", &raw); rec.Code != http.StatusOK {
+	if rec := getJSON(t, e.s, e.reader, "/api/people/Alice?repo="+e.repoID, &raw); rec.Code != http.StatusOK {
 		t.Fatalf("person detail: got %d", rec.Code)
 	}
 	if _, ok := raw["thumb_src"]; ok {
-		t.Errorf("public detail leaks thumb_src: %v", raw)
+		t.Errorf("detail leaks thumb_src: %v", raw)
 	}
 	if _, ok := raw["photos"].([]any); ok {
-		t.Errorf("public detail leaks the photo list: %v", raw["photos"])
+		t.Errorf("detail leaks the photo list: %v", raw["photos"])
 	}
 
-	// Unknown person and invalid name.
-	if rec := getJSON(t, s, "/api/people/Nobody", nil); rec.Code != http.StatusNotFound {
+	// The same person name in another repo resolves to THAT repo's person.
+	other := seedRepo(t, e.s, e.admin, "Other")
+	if err := e.db.AddPhotoHashedForRepo(other, "Alice", "b.png", db.HashBytes(img), []float32{1}); err != nil {
+		t.Fatal(err)
+	}
+	var otherDoc detailDoc
+	if rec := getJSON(t, e.s, e.admin, "/api/people/Alice?repo="+other, &otherDoc); rec.Code != http.StatusOK {
+		t.Fatalf("other repo detail: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if otherDoc.ID == doc.ID || otherDoc.RepoName != "Other" {
+		t.Errorf("same name in two repos must stay two people: %+v vs %+v", otherDoc, doc)
+	}
+
+	// Unknown person / unknown repo / invalid name / missing repo param.
+	if rec := get(t, e.s, e.reader, "/api/people/Nobody?repo="+e.repoID); rec.Code != http.StatusNotFound {
 		t.Errorf("unknown person: got %d", rec.Code)
 	}
-	if rec := getJSON(t, s, "/api/people/%2e%2e", nil); rec.Code != http.StatusBadRequest {
+	if rec := get(t, e.s, e.reader, "/api/people/Alice?repo=nosuch"); rec.Code != http.StatusForbidden {
+		t.Errorf("unknown repo: got %d, want 403", rec.Code)
+	}
+	if rec := get(t, e.s, e.reader, "/api/people/%2e%2e?repo="+e.repoID); rec.Code != http.StatusBadRequest {
 		t.Errorf("invalid name: got %d", rec.Code)
+	}
+	if rec := get(t, e.s, e.reader, "/api/people/Alice"); rec.Code != http.StatusBadRequest {
+		t.Errorf("missing repo param: got %d, want 400", rec.Code)
 	}
 }
 
 func TestSetMetaRoundTrip(t *testing.T) {
 	eng := &stubEngine{faces: []engine.Face{{BBox: [4]float64{10, 10, 40, 40}}}}
-	s, database := newTestServer(t, eng)
-	if err := database.AddPhoto("Alice", "a.png", []byte("img"), []float32{1}); err != nil {
+	e := newEnv(t, eng, "Team", true, false)
+	if err := e.db.AddPhotoHashedForRepo(e.repoID, "Alice", "a.png", db.HashBytes([]byte("img")), []float32{1}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -104,15 +124,13 @@ func TestSetMetaRoundTrip(t *testing.T) {
 		"urls":        []string{"https://example.org/a", "  ", "https://example.org/a"},
 		"description": "## Notes\n\n- born Alice",
 	}
-	rec := postJSON(t, s, "/api/people/Alice/meta", body)
+	rec := sendJSON(t, e.s, e.writer, "/api/people/Alice/meta?repo="+e.repoID, body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("set meta: got %d (%s)", rec.Code, rec.Body.String())
 	}
 	// The reply is the refreshed details document.
 	var doc detailDoc
-	if err := json.NewDecoder(rec.Body).Decode(&doc); err != nil {
-		t.Fatal(err)
-	}
+	decodeBody(t, rec, &doc)
 	// Trimmed, deduped (case-insensitive, first spelling wins), no empties.
 	if len(doc.Aliases) != 2 || doc.Aliases[0] != "A. Smith" || doc.Aliases[1] != "smith" {
 		t.Errorf("aliases not normalized: %v", doc.Aliases)
@@ -124,9 +142,9 @@ func TestSetMetaRoundTrip(t *testing.T) {
 		t.Errorf("urls not normalized: %v", doc.URLs)
 	}
 
-	// Persisted: visible through the public detail and the list summary.
+	// Persisted: visible through the detail view and the list summary.
 	var again detailDoc
-	if rec := getJSON(t, s, "/api/people/Alice", &again); rec.Code != http.StatusOK || len(again.Aliases) != 2 {
+	if rec := getJSON(t, e.s, e.writer, "/api/people/Alice?repo="+e.repoID, &again); rec.Code != http.StatusOK || len(again.Aliases) != 2 {
 		t.Fatalf("meta not persisted: %d %+v", rec.Code, again.Aliases)
 	}
 	var list struct {
@@ -135,7 +153,7 @@ func TestSetMetaRoundTrip(t *testing.T) {
 			Aliases []string `json:"aliases"`
 		} `json:"people"`
 	}
-	if rec := getJSON(t, s, "/api/people", &list); rec.Code != http.StatusOK {
+	if rec := getJSON(t, e.s, e.writer, "/api/people?repo="+e.repoID, &list); rec.Code != http.StatusOK {
 		t.Fatalf("people list: got %d", rec.Code)
 	}
 	if len(list.People) != 1 || len(list.People[0].Aliases) != 2 {
@@ -143,11 +161,11 @@ func TestSetMetaRoundTrip(t *testing.T) {
 	}
 
 	// Full-replace: an empty body clears everything.
-	if rec := postJSON(t, s, "/api/people/Alice/meta", map[string]any{}); rec.Code != http.StatusOK {
+	if rec := sendJSON(t, e.s, e.writer, "/api/people/Alice/meta?repo="+e.repoID, map[string]any{}); rec.Code != http.StatusOK {
 		t.Fatalf("clear meta: got %d (%s)", rec.Code, rec.Body.String())
 	}
 	var cleared map[string]any
-	if rec := getJSON(t, s, "/api/people/Alice", &cleared); rec.Code != http.StatusOK {
+	if rec := getJSON(t, e.s, e.writer, "/api/people/Alice?repo="+e.repoID, &cleared); rec.Code != http.StatusOK {
 		t.Fatal(rec.Code)
 	}
 	for _, key := range []string{"aliases", "birthdate", "urls", "description"} {
@@ -155,15 +173,15 @@ func TestSetMetaRoundTrip(t *testing.T) {
 			t.Errorf("cleared meta still carries %q: %v", key, cleared[key])
 		}
 	}
-	if p := database.Get("Alice"); p.Meta != nil {
+	if p := e.db.GetInRepo(e.repoID, "Alice"); p.Meta != nil {
 		t.Errorf("cleared meta still stored: %+v", p.Meta)
 	}
 }
 
 func TestSetMetaValidation(t *testing.T) {
 	eng := &stubEngine{faces: []engine.Face{{BBox: [4]float64{10, 10, 40, 40}}}}
-	s, database := newTestServer(t, eng)
-	if err := database.AddPhoto("Alice", "a.png", []byte("img"), []float32{1}); err != nil {
+	e := newEnv(t, eng, "Team", true, false)
+	if err := e.db.AddPhotoHashedForRepo(e.repoID, "Alice", "a.png", db.HashBytes([]byte("img")), []float32{1}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -188,7 +206,7 @@ func TestSetMetaValidation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			rec := postJSON(t, s, "/api/people/Alice/meta", tc.body)
+			rec := sendJSON(t, e.s, e.writer, "/api/people/Alice/meta?repo="+e.repoID, tc.body)
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("got %d, want 400 (%s)", rec.Code, rec.Body.String())
 			}
@@ -212,17 +230,17 @@ func TestSetMetaValidation(t *testing.T) {
 		{"year": 2000, "month": 2, "day": 29},
 		{"year": 1965, "day": 2},
 	} {
-		rec := postJSON(t, s, "/api/people/Alice/meta", map[string]any{"birthdate": birth})
+		rec := sendJSON(t, e.s, e.writer, "/api/people/Alice/meta?repo="+e.repoID, map[string]any{"birthdate": birth})
 		if rec.Code != http.StatusOK {
 			t.Fatalf("partial birthdate %v: got %d (%s)", birth, rec.Code, rec.Body.String())
 		}
 	}
 
 	// Unknown person and wrong method.
-	if rec := postJSON(t, s, "/api/people/Nobody/meta", map[string]any{}); rec.Code != http.StatusNotFound {
+	if rec := sendJSON(t, e.s, e.writer, "/api/people/Nobody/meta?repo="+e.repoID, map[string]any{}); rec.Code != http.StatusNotFound {
 		t.Errorf("unknown person: got %d", rec.Code)
 	}
-	if rec := req2(t, s, http.MethodGet, "/api/people/Alice/meta"); rec.Code != http.StatusMethodNotAllowed {
+	if rec := do(t, e.s, http.MethodGet, "/api/people/Alice/meta?repo="+e.repoID, nil, "", e.writer, nil); rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("GET meta: got %d", rec.Code)
 	}
 }
@@ -235,14 +253,14 @@ func manyStrings(n int, format string) []string {
 	return out
 }
 
-// TestPersonPhotosEndpoint covers the admin photos list the photos manager
-// loads: open mode answers it anonymously, secured mode requires the session.
+// TestPersonPhotosEndpoint covers the photos-manager list (writer-only):
+// paths + content hashes, no embeddings, the thumbnail source named.
 func TestPersonPhotosEndpoint(t *testing.T) {
 	eng := &stubEngine{faces: []engine.Face{{BBox: [4]float64{10, 10, 40, 40}}}}
-	s, database := newTestServer(t, eng)
+	e := newEnv(t, eng, "Team", true, false)
 	img := []byte("fake-image")
 	hash := db.HashBytes(img)
-	if err := database.AddPhoto("Alice", "a.png", img, []float32{1}); err != nil {
+	if err := e.db.AddPhotoHashedForRepo(e.repoID, "Alice", "a.png", hash, []float32{1}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -255,7 +273,7 @@ func TestPersonPhotosEndpoint(t *testing.T) {
 			Hash string `json:"hash"`
 		} `json:"photos"`
 	}
-	if rec := getJSON(t, s, "/api/people/Alice/photos", &list); rec.Code != http.StatusOK {
+	if rec := getJSON(t, e.s, e.writer, "/api/people/Alice/photos?repo="+e.repoID, &list); rec.Code != http.StatusOK {
 		t.Fatalf("photos list: got %d (%s)", rec.Code, rec.Body.String())
 	}
 	if list.Name != "Alice" || len(list.Photos) != 1 || list.Photos[0].Path != "a.png" || list.Photos[0].Hash != hash {
@@ -267,57 +285,14 @@ func TestPersonPhotosEndpoint(t *testing.T) {
 		t.Errorf("photos list leaks embeddings: %s", b)
 	}
 
-	if rec := postJSON(t, s, "/api/people/Alice/photos", map[string]any{}); rec.Code != http.StatusMethodNotAllowed {
+	if rec := sendJSON(t, e.s, e.writer, "/api/people/Alice/photos?repo="+e.repoID, map[string]any{}); rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("POST photos: got %d", rec.Code)
 	}
-	if rec := getJSON(t, s, "/api/people/Nobody/photos", nil); rec.Code != http.StatusNotFound {
+	if rec := get(t, e.s, e.writer, "/api/people/Nobody/photos?repo="+e.repoID); rec.Code != http.StatusNotFound {
 		t.Errorf("unknown person photos: got %d", rec.Code)
 	}
-}
-
-// TestSecuredModeMetaAccess checks the secured-server side of the new
-// surface: the details GET stays public, while the photos list and the meta
-// write need the admin session.
-func TestSecuredModeMetaAccess(t *testing.T) {
-	eng := &stubEngine{faces: []engine.Face{{BBox: [4]float64{10, 10, 40, 40}}}}
-	s, database := newAuthTestServer(t, eng)
-	if err := database.AddPhoto("Alice", "a.png", []byte("img"), []float32{1}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Anonymous: public detail OK, admin surfaces refused.
-	if rec := getJSON(t, s, "/api/people/Alice", nil); rec.Code != http.StatusOK {
-		t.Fatalf("public detail behind auth: got %d", rec.Code)
-	}
-	if rec := getJSON(t, s, "/api/people/Alice/photos", nil); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("anonymous photos list: got %d", rec.Code)
-	}
-	if rec := postJSON(t, s, "/api/people/Alice/meta", map[string]any{}); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("anonymous meta write: got %d", rec.Code)
-	}
-
-	// With the admin session both admin routes answer.
-	cookie := loginAdmin(t, s)
-	post := func(path string) *int {
-		req := authReq(t, s, http.MethodPost, path, "1.2.3.4",
-			strings.NewReader(`{"aliases":["A. Smith"]}`), map[string]string{"Content-Type": "application/json"})
-		req.AddCookie(cookie)
-		rec := httptest.NewRecorder()
-		s.Handler().ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("admin %s: got %d (%s)", path, rec.Code, rec.Body.String())
-		}
-		return nil
-	}
-	post("/api/people/Alice/meta")
-	req := authReq(t, s, http.MethodGet, "/api/people/Alice/photos", "1.2.3.4", nil, nil)
-	req.AddCookie(cookie)
-	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("admin photos list: got %d", rec.Code)
-	}
-	if p := database.Get("Alice"); p.Meta == nil || len(p.Meta.Aliases) != 1 {
-		t.Errorf("admin meta write not persisted: %+v", p.Meta)
+	// Reader (and share) → 403: the photos list is writer tooling.
+	if rec := get(t, e.s, e.reader, "/api/people/Alice/photos?repo="+e.repoID); rec.Code != http.StatusForbidden {
+		t.Errorf("reader photos list: got %d, want 403", rec.Code)
 	}
 }

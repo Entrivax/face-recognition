@@ -47,11 +47,22 @@ var imageExts = map[string]bool{
 // Options controls an enrollment run.
 type Options struct {
 	PeopleDir string
-	Force     bool // re-embed everything, ignoring content hashes
+	// RepoID scopes the scan to one repository. When empty the legacy
+	// flat layout applies: the dataset root is PeopleDir itself, folders
+	// are people/<Person>/ and every DB write goes through the legacy
+	// mutators. When set, the root is PeopleDir/<RepoID> (the repository's
+	// dataset folder; a missing directory fails the scan with the
+	// ReadDir error), folders are its direct subdirectories, and every DB
+	// write uses the repo-scoped mutators, so persons of other
+	// repositories are never touched.
+	RepoID string
+	Force  bool // re-embed everything, ignoring content hashes
 	// Prune drops DB photo entries whose file no longer exists in the
 	// person's folder (and, when a person's folder disappeared entirely,
 	// all of their photo entries). Opt-in: datasets may be temporarily
-	// unmounted, so staleness is never cleaned up automatically.
+	// unmounted, so staleness is never cleaned up automatically. Repo-
+	// scoped, like every other write: a repo scan prunes only that repo's
+	// persons.
 	Prune bool
 	// Workers is how many photos are detected+embedded in parallel. Values
 	// <= 1 (the default) run exactly like the original serial scan; larger
@@ -78,6 +89,7 @@ type FaceEngine interface {
 // parallel workers can pick jobs from any person's folder.
 type scanJob struct {
 	person string // person (folder) name
+	repoID string // repository scope ("" = legacy flat layout)
 	folder string // absolute folder path
 	file   string // image file name inside the folder
 	force  bool
@@ -103,9 +115,15 @@ type scanOutcome struct {
 // writers internally.
 func Scan(eng FaceEngine, database *db.DB, opts Options) (Result, error) {
 	var res Result
-	entries, err := os.ReadDir(opts.PeopleDir)
+	// The dataset root is the people dir itself (legacy flat layout) or
+	// the repository's own folder under it.
+	root := opts.PeopleDir
+	if opts.RepoID != "" {
+		root = filepath.Join(opts.PeopleDir, opts.RepoID)
+	}
+	entries, err := os.ReadDir(root)
 	if err != nil {
-		return res, fmt.Errorf("read people dir %s: %w", opts.PeopleDir, err)
+		return res, fmt.Errorf("read people dir %s: %w", root, err)
 	}
 
 	// Collect person folders (directories only).
@@ -123,7 +141,7 @@ func Scan(eng FaceEngine, database *db.DB, opts Options) (Result, error) {
 	filesPerPerson := make(map[string]int, len(personDirs))
 	for _, pd := range personDirs {
 		name := pd.Name()
-		folder := filepath.Join(opts.PeopleDir, name)
+		folder := filepath.Join(root, name)
 		files, err := listImages(folder)
 		if err != nil {
 			res.Skipped = append(res.Skipped, SkippedPhoto{name, folder, err.Error()})
@@ -131,11 +149,11 @@ func Scan(eng FaceEngine, database *db.DB, opts Options) (Result, error) {
 		}
 		res.PeopleSeen++
 		if opts.Prune {
-			res.PhotosPruned += pruneMissing(database, name, files)
+			res.PhotosPruned += pruneMissing(database, opts.RepoID, name, files)
 		}
 		filesPerPerson[name] = len(files)
 		for _, f := range files {
-			jobs = append(jobs, scanJob{person: name, folder: folder, file: f, force: opts.Force})
+			jobs = append(jobs, scanJob{person: name, repoID: opts.RepoID, folder: folder, file: f, force: opts.Force})
 		}
 	}
 
@@ -178,15 +196,16 @@ func Scan(eng FaceEngine, database *db.DB, opts Options) (Result, error) {
 	if opts.Prune {
 		// People whose dataset folder disappeared entirely never appear in
 		// the loop above; drop their photo entries too (the person stays
-		// enrolled, with zero photos).
-		res.PhotosPruned += pruneMissingPeople(database, opts.PeopleDir)
+		// enrolled, with zero photos). Repo-scoped: a repo scan only
+		// prunes the repo's own persons.
+		res.PhotosPruned += pruneMissingPeople(database, opts.PeopleDir, opts.RepoID)
 	}
 	return res, nil
 }
 
 // runScanJob processes one flattened photo job, returning its outcome.
 func runScanJob(eng FaceEngine, database *db.DB, job scanJob) scanOutcome {
-	added, reason, err := enrollOne(eng, database, job.person, job.folder, job.file, job.force)
+	added, reason, err := enrollOne(eng, database, job.repoID, job.person, job.folder, job.file, job.force)
 	return scanOutcome{added: added, reason: reason, err: err}
 }
 
@@ -220,8 +239,10 @@ func scanParallel(eng FaceEngine, database *db.DB, jobs []scanJob, workers int, 
 
 // pruneMissing removes DB photo entries of the named person whose file is not
 // among the folder's listed images. Returns how many entries were removed.
-func pruneMissing(database *db.DB, name string, files []string) int {
-	p := database.Get(name)
+// Legacy (repoID "") persons are matched through the legacy accessors; a set
+// repoID scopes every lookup and write to that repository's persons.
+func pruneMissing(database *db.DB, repoID, name string, files []string) int {
+	p := lookupPerson(database, repoID, name)
 	if p == nil || len(p.Photos) == 0 {
 		return 0
 	}
@@ -236,8 +257,56 @@ func pruneMissing(database *db.DB, name string, files []string) int {
 		paths = append(paths, ph.Path)
 	}
 	for _, path := range paths {
-		if !present[path] {
+		if present[path] {
+			continue
+		}
+		if repoID == "" {
 			if removed, err := database.RemovePhoto(name, path); err == nil && removed {
+				n++
+			}
+			continue
+		}
+		if removed, err := database.RemovePhotoInRepo(repoID, name, path); err == nil && removed {
+			n++
+		}
+	}
+	return n
+}
+
+// pruneMissingPeople removes every DB photo entry for people whose folder is
+// entirely gone from the dataset root. Returns the number of removed entries.
+// A set repoID scopes this to that repository's persons (folders under
+// PeopleDir/<RepoID>); the legacy layout prunes only legacy persons.
+func pruneMissingPeople(database *db.DB, peopleDir, repoID string) int {
+	root := peopleDir
+	if repoID != "" {
+		root = filepath.Join(peopleDir, repoID)
+	}
+	var people []db.Person
+	if repoID == "" {
+		// The legacy flat layout: prune only persons without a repo.
+		for _, p := range database.People() {
+			if p.RepoID == "" {
+				people = append(people, p)
+			}
+		}
+	} else {
+		people = database.PeopleByRepo(repoID)
+	}
+	n := 0
+	for _, p := range people {
+		folder := filepath.Join(root, p.Name)
+		if _, err := os.Stat(folder); !errors.Is(err, os.ErrNotExist) {
+			continue // folder exists (or stat failed) — leave it alone
+		}
+		for _, ph := range p.Photos {
+			if repoID == "" {
+				if removed, err := database.RemovePhoto(p.Name, ph.Path); err == nil && removed {
+					n++
+				}
+				continue
+			}
+			if removed, err := database.RemovePhotoInRepo(repoID, p.Name, ph.Path); err == nil && removed {
 				n++
 			}
 		}
@@ -245,22 +314,15 @@ func pruneMissing(database *db.DB, name string, files []string) int {
 	return n
 }
 
-// pruneMissingPeople removes every DB photo entry for people whose folder is
-// entirely gone from the people dir. Returns the number of removed entries.
-func pruneMissingPeople(database *db.DB, peopleDir string) int {
-	n := 0
-	for _, p := range database.People() {
-		folder := filepath.Join(peopleDir, p.Name)
-		if _, err := os.Stat(folder); !errors.Is(err, os.ErrNotExist) {
-			continue // folder exists (or stat failed) — leave it alone
-		}
-		for _, ph := range p.Photos {
-			if removed, err := database.RemovePhoto(p.Name, ph.Path); err == nil && removed {
-				n++
-			}
-		}
+// lookupPerson resolves a person within the scan's scope: db.GetLegacy
+// (LEGACY persons only — a repo person with the same name never matches)
+// for the legacy layout, db.GetInRepo for a repository scan. Returns a
+// deep copy (or nil).
+func lookupPerson(database *db.DB, repoID, name string) *db.Person {
+	if repoID == "" {
+		return database.GetLegacy(name)
 	}
-	return n
+	return database.GetInRepo(repoID, name)
 }
 
 // ThumbSize is the pixel size (square) of the generated face thumbnails.
@@ -268,9 +330,11 @@ const ThumbSize = 160
 
 // saveThumb stores a face thumbnail for the person if they do not have one
 // yet (first enrollment wins). Best-effort: thumbnail problems must never
-// fail an enrollment.
-func saveThumb(database *db.DB, name, photoPath string, imgBytes []byte, f engine.Face) {
-	p := database.Get(name)
+// fail an enrollment. The person is resolved within repoID's scope (the
+// same name can exist in two repositories), and the sidecar write is
+// ID-keyed, so it always lands on the right person's thumbnail.
+func saveThumb(database *db.DB, repoID, name, photoPath string, imgBytes []byte, f engine.Face) {
+	p := lookupPerson(database, repoID, name)
 	if p == nil || p.Thumb != "" {
 		return // person unknown, or thumbnail already set
 	}
@@ -281,26 +345,32 @@ func saveThumb(database *db.DB, name, photoPath string, imgBytes []byte, f engin
 	_ = database.SetThumbnail(p.ID, jpg, photoPath)
 }
 
-// thumbPending reports whether the named person exists but has no face
-// thumbnail yet (drives the one-time backfill during folder scans).
-func thumbPending(database *db.DB, name string) bool {
-	p := database.Get(name)
+// thumbPending reports whether the named person exists (within repoID's
+// scope) but has no face thumbnail yet (drives the one-time backfill during
+// folder scans).
+func thumbPending(database *db.DB, repoID, name string) bool {
+	p := lookupPerson(database, repoID, name)
 	return p != nil && p.Thumb == ""
 }
 
 // enrollOne processes a single image. It returns (added, skipReason, err).
 // added=false with empty reason means the file was unchanged (hash match).
 // Note: DB photo paths are basenames relative to the person's folder, so
-// PhotoHash is keyed by the bare file name.
-func enrollOne(eng FaceEngine, database *db.DB, name, folder, file string, force bool) (bool, string, error) {
+// PhotoHash is keyed by the bare file name. A set repoID routes every DB
+// access through the repo-scoped mutators.
+func enrollOne(eng FaceEngine, database *db.DB, repoID, name, folder, file string, force bool) (bool, string, error) {
 	full := filepath.Join(folder, file)
 	b, err := os.ReadFile(full)
 	if err != nil {
 		return false, "", err
 	}
 	h := db.HashBytes(b)
-	unchanged := !force && database.PhotoHash(name, file) == h
-	if unchanged && !thumbPending(database, name) {
+	photoHash := database.PhotoHash(name, file)
+	if repoID != "" {
+		photoHash = database.PhotoHashInRepo(repoID, name, file)
+	}
+	unchanged := !force && photoHash == h
+	if unchanged && !thumbPending(database, repoID, name) {
 		return false, "", nil // unchanged
 	}
 
@@ -316,17 +386,21 @@ func enrollOne(eng FaceEngine, database *db.DB, name, folder, file string, force
 	if unchanged {
 		// The photo is unchanged, but the person still lacks a thumbnail:
 		// crop only — no re-embedding, no DB write.
-		saveThumb(database, name, file, b, best)
+		saveThumb(database, repoID, name, file, b, best)
 		return false, "", nil
 	}
 	emb, err := eng.EmbedFace(b, best)
 	if err != nil {
 		return false, "", fmt.Errorf("embed: %w", err)
 	}
-	if err := database.AddPhotoHashed(name, file, h, emb); err != nil {
+	if repoID == "" {
+		if err := database.AddPhotoHashed(name, file, h, emb); err != nil {
+			return false, "", err
+		}
+	} else if err := database.AddPhotoHashedForRepo(repoID, name, file, h, emb); err != nil {
 		return false, "", err
 	}
-	saveThumb(database, name, file, b, best)
+	saveThumb(database, repoID, name, file, b, best)
 	return true, "", nil
 }
 
@@ -344,9 +418,11 @@ var (
 // 1-based index into the detection order (the same order /api/recognize
 // reports; detection is deterministic for the same bytes). The UI's
 // "name this face" action uses it to enroll one unknown face out of a
-// multi-person photo. See EnrollBytes for the file-naming and dataset
-// semantics.
-func EnrollFace(eng FaceEngine, database *db.DB, peopleDir, name, fileName string, imgBytes []byte, faceIndex int) (string, error) {
+// multi-person photo. A set repoID scopes the enrollment into that
+// repository (dataset folder PeopleDir/<RepoID> and the repo-scoped DB
+// mutators); empty keeps the legacy flat layout. See EnrollBytes for the
+// file-naming and dataset semantics.
+func EnrollFace(eng FaceEngine, database *db.DB, peopleDir, repoID, name, fileName string, imgBytes []byte, faceIndex int) (string, error) {
 	if err := CheckName(name); err != nil {
 		return "", err // fail before running inference
 	}
@@ -360,19 +436,23 @@ func EnrollFace(eng FaceEngine, database *db.DB, peopleDir, name, fileName strin
 	if faceIndex < 1 || faceIndex > len(faces) {
 		return "", fmt.Errorf("%w: %d (photo has %d face(s))", ErrFaceIndex, faceIndex, len(faces))
 	}
-	return saveEnrollment(eng, database, peopleDir, name, fileName, imgBytes, faces[faceIndex-1])
+	return saveEnrollment(eng, database, peopleDir, repoID, name, fileName, imgBytes, faces[faceIndex-1])
 }
 
 // EnrollBytes embeds a single uploaded image for a person, stores the
 // embedding in the database, and writes the original image bytes into the
-// people folder under the person's name, so runtime enrollments become part
-// of the dataset (a later Scan treats them like any other photo).
+// person's people folder, so runtime enrollments become part of the dataset
+// (a later Scan treats them like any other photo). A set repoID scopes the
+// enrollment into that repository: the file lands under
+// PeopleDir/<RepoID>/<Person>/ and the DB write goes through the
+// repo-scoped mutator.
 //
-// The file is saved as peopleDir/<Person>/<sha1[:12]><ext> — content-derived,
-// so re-uploading the same image is idempotent — and the DB photo path is the
-// same basename a folder rescan would derive for it, keeping rescans
-// duplicate-free.
-func EnrollBytes(eng FaceEngine, database *db.DB, peopleDir, name, fileName string, imgBytes []byte) (string, error) {
+// The file is saved as <dataset root>/<Person>/<sha1[:12]><ext> —
+// content-derived, so re-uploading the same image is idempotent — and the
+// DB photo path is the same basename a folder rescan would derive for it,
+// keeping rescans duplicate-free. The returned path is relative to
+// peopleDir (including the repo folder for a repo-scoped enrollment).
+func EnrollBytes(eng FaceEngine, database *db.DB, peopleDir, repoID, name, fileName string, imgBytes []byte) (string, error) {
 	faces, err := eng.Detect(imgBytes)
 	if err != nil {
 		return "", fmt.Errorf("detect: %w", err)
@@ -381,13 +461,13 @@ func EnrollBytes(eng FaceEngine, database *db.DB, peopleDir, name, fileName stri
 		return "", fmt.Errorf("%w in %s", ErrNoFace, fileName)
 	}
 	best, _ := engine.LargestFace(faces)
-	return saveEnrollment(eng, database, peopleDir, name, fileName, imgBytes, best)
+	return saveEnrollment(eng, database, peopleDir, repoID, name, fileName, imgBytes, best)
 }
 
 // saveEnrollment embeds the chosen face, writes the original image bytes into
 // the person's people folder under a content-derived name, and stores the
 // embedding in the database.
-func saveEnrollment(eng FaceEngine, database *db.DB, peopleDir, name, fileName string, imgBytes []byte, face engine.Face) (string, error) {
+func saveEnrollment(eng FaceEngine, database *db.DB, peopleDir, repoID, name, fileName string, imgBytes []byte, face engine.Face) (string, error) {
 	emb, err := eng.EmbedFace(imgBytes, face)
 	if err != nil {
 		return "", fmt.Errorf("embed: %w", err)
@@ -404,24 +484,41 @@ func saveEnrollment(eng FaceEngine, database *db.DB, peopleDir, name, fileName s
 	// Use the DB-canonical person name so enrolling "alice" when "Alice"
 	// exists lands in the existing folder instead of a case-duplicate one.
 	folder := name
-	if p := database.Get(name); p != nil {
+	if p := lookupPerson(database, repoID, name); p != nil {
 		folder = p.Name
 	}
 	fileName = h[:12] + ext
-	full := filepath.Join(peopleDir, folder, fileName)
+	// The dataset folder: people/<Name> (legacy) or people/<RepoID>/<Name>.
+	dir := peopleDir
+	if repoID != "" {
+		dir = filepath.Join(peopleDir, repoID)
+	}
+	full := filepath.Join(dir, folder, fileName)
 	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 		return "", fmt.Errorf("create people folder: %w", err)
 	}
 	if err := os.WriteFile(full, imgBytes, 0o644); err != nil {
 		return "", fmt.Errorf("write to people folder: %w", err)
 	}
-	if err := database.AddPhotoHashed(name, fileName, h, emb); err != nil {
+	if repoID == "" {
+		if err := database.AddPhotoHashed(name, fileName, h, emb); err != nil {
+			// The image is already on disk; leave it. The next folder rescan will
+			// enroll it, so the dataset self-heals.
+			return "", err
+		}
+	} else if err := database.AddPhotoHashedForRepo(repoID, name, fileName, h, emb); err != nil {
 		// The image is already on disk; leave it. The next folder rescan will
 		// enroll it, so the dataset self-heals.
 		return "", err
 	}
-	saveThumb(database, name, fileName, imgBytes, face)
-	return filepath.Join(folder, fileName), nil
+	saveThumb(database, repoID, name, fileName, imgBytes, face)
+	// The returned path is relative to peopleDir: folder-relative for the
+	// legacy layout, including the repo folder for a repo-scoped one.
+	rel := filepath.Join(folder, fileName)
+	if repoID != "" {
+		rel = filepath.Join(repoID, rel)
+	}
+	return rel, nil
 }
 
 // CheckName validates a person name that will also be used as a folder name
