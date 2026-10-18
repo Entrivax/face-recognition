@@ -48,13 +48,20 @@ export function SetupView({ onAuthed }: SetupViewProps) {
 		setError(null);
 		try {
 			await api.setup({ key: key.trim(), username: u, password });
-			// Setup created the admin — sign the new account in right away.
-			await api.login(u, password);
-			onAuthed();
 		} catch (err) {
 			setBusy(false);
 			setError((err as Error).message || "Setup failed.");
+			return;
 		}
+		// Setup created the admin — sign the new account in right away. A
+		// failed login is NOT a failed setup (resubmitting would 403): hand
+		// control back so the re-probe routes to the login view.
+		try {
+			await api.login(u, password);
+		} catch {
+			// fall through to onAuthed
+		}
+		onAuthed();
 	};
 
 	return (

@@ -429,6 +429,7 @@ export function PhotosModal(props: PhotosModalProps) {
 									<PhotoTile
 										key={ph.path}
 										person={props.person ?? ""}
+										repoId={props.repoId}
 										ph={ph}
 										cmpMark={cmpPath === ph.path}
 										onOpen={() => openDetail(ph.path)}
@@ -474,7 +475,12 @@ export function PhotosModal(props: PhotosModalProps) {
 						<div id="photoDetailView">
 							<button type="button" class="photo-back" id="photoBackBtn" onClick={backToGrid}>← All photos</button>
 							<div class="canvas-wrap photo-canvas">
-								<img ref={detailImgRef} id="photoDetailImg" alt="Enrolled photo" src={api.photoURL(props.person ?? "", detailPath)} />
+								<img
+									ref={detailImgRef}
+									id="photoDetailImg"
+									alt="Enrolled photo"
+									src={api.withRepoQuery(api.photoURL(props.person ?? "", detailPath), props.repoId)}
+								/>
 								<canvas ref={detailCanvasRef} id="photoOverlay" />
 							</div>
 							<p class={"photo-verdict" + (verdictWarn ? " warn" : "")} id="photoVerdict" aria-live="polite">{verdict}</p>
@@ -510,6 +516,7 @@ export function PhotosModal(props: PhotosModalProps) {
 // photo as photo A of a face-to-face comparison (second pick launches).
 function PhotoTile(props: {
 	person: string;
+	repoId: string;
 	ph: PersonPhoto;
 	cmpMark: boolean;
 	onOpen: () => void;
@@ -529,7 +536,9 @@ function PhotoTile(props: {
 			>
 				{broken
 					? "unavailable"
-					: <img alt={ph.path} src={api.photoURL(props.person, ph.path)} onError={() => setBroken(true)} />}
+					// The photo route is repo-scoped (?repo= is required), so the
+					// URL must carry the repository the person lives in.
+					: <img alt={ph.path} src={api.withRepoQuery(api.photoURL(props.person, ph.path), props.repoId)} onError={() => setBroken(true)} />}
 			</button>
 			<button
 				type="button"

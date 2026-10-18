@@ -22,6 +22,8 @@ import (
 	"crypto/subtle"
 	"net/http"
 	"strings"
+
+	"recogn/internal/db"
 )
 
 // Role names used by the guards. auth.RoleFor answers users.RoleReader /
@@ -67,6 +69,24 @@ func (s *Server) requireRepo(w http.ResponseWriter, r *http.Request) (string, bo
 		return "", false
 	}
 	return repoID, true
+}
+
+// requireExistingRepo refuses (404) a repoID that does not resolve to a
+// stored repository. It exists for the WRITE paths that turn repoID into a
+// filesystem location — enrollment builds people/<repoID>/... folders from
+// it: resolveRepoParam passes unknown values through (so the uniform-403
+// contract for readers survives) and admins pass the role check on ANY id,
+// so without this check a typo'd or crafted repo value would create
+// dataset folders and orphaned person records under a repository that does
+// not exist. Read paths don't need it: they address existing persons or
+// lists, and their uniform 403 keeps unknown ids indistinguishable from
+// no-access ones.
+func (s *Server) requireExistingRepo(w http.ResponseWriter, repoID string) bool {
+	if _, ok := s.db.GetRepo(repoID); ok {
+		return true
+	}
+	writeErr(w, http.StatusNotFound, db.ErrRepoNotFound.Error())
+	return false
 }
 
 // validShare validates the request's X-Share-Token header against repoID.

@@ -82,13 +82,16 @@ export async function createUser(username: string, password: string, admin: bool
 	return expectJSON(r, "could not create the user");
 }
 
-// The server refuses to delete the primary admin account.
+// Deleting an admin is refused only for the caller's own account and the
+// last remaining admin (server-side rule).
 export async function deleteUser(username: string): Promise<OkResponse> {
 	const r = await request(`/api/users/${encodeURIComponent(username)}`, { method: "DELETE" });
 	return expectJSON(r, "could not delete the user");
 }
 
 // Admin password reset — no current-password check (that's the point).
+// Sessions are revoked; the user's API keys are left intact and the reply's
+// notice reminds the caller to have the user review them.
 export async function resetUserPassword(username: string, password: string): Promise<OkResponse> {
 	const r = await request(`/api/users/${encodeURIComponent(username)}/password`, {
 		method: "POST",

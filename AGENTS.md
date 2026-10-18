@@ -292,8 +292,12 @@ command hits a permission error.
   (`POST /api/users/{u}/repos`, `{"grants":[{"repo":"<name|id>","role":
   "reader|writer"}]}` — reader = browse/recognize, writer = + enroll/photo
   management/full-res photos; admin is implicitly full), reset passwords
-  (users change their own via `POST /api/auth/password`; the admin cannot be
-  deleted), toggle per-repo share links (`POST /api/repos/{id}/share` →
+  (users change their own via `POST /api/auth/password`; the admin reset
+  revokes sessions but leaves API keys intact, and the response carries a
+  notice asking the caller to have the user review them), delete users
+  (refused for the caller's own account and the last remaining admin — with
+  several admins, any of them may delete another), toggle per-repo share
+  links (`POST /api/repos/{id}/share` →
   `/share/<repoID>/<token>`, anonymous reader via the URL or the
   `X-Share-Token` header; the token is stored plaintext in the repo record
   and can be re-read by the admin via `GET /api/repos/{id}/share` or

@@ -96,21 +96,38 @@ func (s *Server) handleUserByID(w http.ResponseWriter, r *http.Request) {
 	s.handleDeleteUser(w, r, r.PathValue("u"))
 }
 
-// handleDeleteUser answers DELETE /api/users/{u}. The administrator account
-// cannot be deleted (403): it is the last key to the server — rotate its
-// password or revoke grants instead. auth.DeleteUser double-checks the
-// admin flag (the defensive backstop) and cascades the user's API keys and
-// live sessions.
+// handleDeleteUser answers DELETE /api/users/{u}. Two refusals: deleting
+// the caller's own account (403) and deleting the LAST remaining admin
+// (403) — with several admins, any of them may delete another; the caller
+// is always an admin (RequireAdmin). auth.DeleteUser applies the same rule
+// as the defensive backstop and cascades the target's API keys and live
+// sessions.
 func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request, username string) {
-	// Look the target up first so an admin target is refused before the
+	caller := s.auth.Principal(r).Username
+	// Look the target up first so a refused target is answered before the
 	// store sees the delete (readable 403, not the store's generic error),
 	// and an unknown name is 404 without ambiguity.
 	exists := false
 	for _, u := range s.auth.Users() {
 		if strings.EqualFold(u.Username, username) {
-			if u.Admin {
-				writeErr(w, http.StatusForbidden, "the administrator account cannot be deleted")
+			if strings.EqualFold(caller, u.Username) {
+				writeErr(w, http.StatusForbidden, auth.ErrSelfProtected.Error())
 				return
+			}
+			if u.Admin {
+				admins := 0
+				for _, cand := range s.auth.Users() {
+					if cand.Admin {
+						admins++
+					}
+					if admins > 1 {
+						break
+					}
+				}
+				if admins <= 1 {
+					writeErr(w, http.StatusForbidden, auth.ErrAdminProtected.Error())
+					return
+				}
 			}
 			exists = true
 			break
@@ -120,25 +137,35 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request, userna
 		writeErr(w, http.StatusNotFound, "user not found")
 		return
 	}
-	deleted, err := s.auth.DeleteUser(username)
+	deleted, err := s.auth.DeleteUser(caller, username)
 	if err != nil {
-		if errors.Is(err, auth.ErrAdminProtected) {
-			writeErr(w, http.StatusForbidden, "the administrator account cannot be deleted")
-			return
+		switch {
+		case errors.Is(err, auth.ErrSelfProtected):
+			writeErr(w, http.StatusForbidden, auth.ErrSelfProtected.Error())
+		case errors.Is(err, auth.ErrAdminProtected):
+			writeErr(w, http.StatusForbidden, auth.ErrAdminProtected.Error())
+		default:
+			writeErr(w, http.StatusInternalServerError, err.Error())
 		}
-		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if !deleted {
 		writeErr(w, http.StatusNotFound, "user not found")
 		return
 	}
-	slog.Info("user deleted", "user", username, "by", s.auth.Principal(r).Username)
+	slog.Info("user deleted", "user", username, "by", caller)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// resetNotice is the informational field the admin reset response carries:
+// the user's API keys are deliberately left intact (a password reset is not
+// a compromise verdict and keys are unrecoverable once lost), so the caller
+// is reminded to have the user review them instead.
+const resetNotice = "the user's API keys were not revoked — ask them to review their API keys if the account may be compromised"
+
 // handleUserPassword answers POST /api/users/{u}/password {"password"}: the
 // admin reset path (self-service changes go through /api/auth/password).
+// Sessions are revoked; API keys are left intact (see resetNotice).
 func (s *Server) handleUserPassword(w http.ResponseWriter, r *http.Request, username string) {
 	if r.Method != http.MethodPost {
 		writeErr(w, http.StatusMethodNotAllowed, "POST required")
@@ -161,7 +188,7 @@ func (s *Server) handleUserPassword(w http.ResponseWriter, r *http.Request, user
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "notice": resetNotice})
 }
 
 // grantReq is one entry of POST /api/users/{u}/repos: the repository (ID or

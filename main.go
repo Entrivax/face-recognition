@@ -727,17 +727,21 @@ func runRepoImport(cfg config.Config, name string) error {
 	}
 
 	// Move the person folders into the repository first. A mid-way failure
-	// leaves the earlier moves in place (safe: they live inside the new
-	// repository now) and reports exactly which ones moved.
+	// stops the moves but does not abort outright: the folders already in
+	// place are migrated into the repository (their files live there now —
+	// leaving their DB records legacy would strand them), the summary is
+	// printed, and the recorded move error is returned at the end.
 	moved := make([]string, 0, len(legacy))
+	var moveErr error
 	for _, folder := range legacy {
 		dst := filepath.Join(repoDir, folder)
 		if err := os.Rename(filepath.Join(peopleRoot, folder), dst); err != nil {
+			moveErr = fmt.Errorf("move person folder %s: %w", folder, err)
 			if len(moved) > 0 {
 				fmt.Fprintf(os.Stderr, "repo import: aborted; %d of %d folder(s) were already moved into %s:\n  %s\n",
 					len(moved), len(legacy), repo.ID, strings.Join(moved, "\n  "))
 			}
-			return fmt.Errorf("move person folder %s: %w", folder, err)
+			break
 		}
 		moved = append(moved, folder)
 	}
@@ -746,7 +750,7 @@ func runRepoImport(cfg config.Config, name string) error {
 	allPeople := database.People()
 	migrated, photosCopied := 0, 0
 	var failed []string
-	for _, folder := range legacy {
+	for _, folder := range moved {
 		// Match the DB record among LEGACY persons only (RepoID "") —
 		// db.Get is a global view and could hand back another repository's
 		// person when the name is shared.
@@ -784,7 +788,9 @@ func runRepoImport(cfg config.Config, name string) error {
 			fmt.Fprintf(os.Stderr, "  - %s\n", f)
 		}
 	}
-	return nil
+	// The recorded move failure (nil on a clean run) — reported only now,
+	// after what did move was migrated and summarised.
+	return moveErr
 }
 
 // migrateLegacyPerson rewrites one legacy person record into the repository:

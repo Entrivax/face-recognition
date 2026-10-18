@@ -136,7 +136,9 @@ func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("create users dir: %w", err)
 	}
-	bdb, err := bolt.Open(path, 0o644, &bolt.Options{Timeout: openTimeout})
+	// 0o600: the store holds password hashes and (hashed) API keys — it is
+	// private to the process's user, not world-readable like a data file.
+	bdb, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: openTimeout})
 	if err != nil {
 		return nil, fmt.Errorf("open users db %s (locked by another process?): %w", path, err)
 	}

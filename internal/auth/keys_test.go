@@ -237,7 +237,7 @@ func TestDeleteUserKillsSessionsAndKeys(t *testing.T) {
 		t.Fatal("precondition: carol's session must authenticate")
 	}
 
-	deleted, err := s.DeleteUser("carol")
+	deleted, err := s.DeleteUser("admin", "carol")
 	if err != nil || !deleted {
 		t.Fatalf("DeleteUser = %v, %v; want true, nil", deleted, err)
 	}
@@ -255,7 +255,7 @@ func TestDeleteUserKillsSessionsAndKeys(t *testing.T) {
 		t.Fatalf("cascaded keys remain: %+v", keys)
 	}
 	// ...and a second delete is a no-op.
-	if deleted, err := s.DeleteUser("carol"); deleted || err != nil {
+	if deleted, err := s.DeleteUser("admin", "carol"); deleted || err != nil {
 		t.Fatalf("second delete = %v, %v; want false, nil", deleted, err)
 	}
 }

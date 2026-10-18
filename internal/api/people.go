@@ -87,9 +87,15 @@ func (s *Server) handlePersonSubroutes(w http.ResponseWriter, r *http.Request) {
 		if !s.requireRepoRole(w, r, repoID, roleWriter) {
 			return
 		}
+		if !s.requireExistingRepo(w, repoID) {
+			return
+		}
 		s.handleEnrollPerson(w, r, name, repoID)
 	case parts[1] == "enroll-face":
 		if !s.requireRepoRole(w, r, repoID, roleWriter) {
+			return
+		}
+		if !s.requireExistingRepo(w, repoID) {
 			return
 		}
 		s.handleEnrollFace(w, r, name, repoID)

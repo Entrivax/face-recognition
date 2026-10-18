@@ -185,10 +185,10 @@ func (s *Server) handleEnrollFolder(w http.ResponseWriter, r *http.Request) {
 	if !s.requireRepoRole(w, r, repoID, roleWriter) {
 		return
 	}
-	// A repository that does not exist has no dataset folder either: 404
-	// beats enroll.Scan's generic read-dir failure.
-	if _, found := s.db.GetRepo(repoID); !found {
-		writeErr(w, http.StatusNotFound, "repository not found")
+	// Enrollment (and the rescan) turns repoID into a filesystem path:
+	// refuse values that resolve to no stored repository (the writer role
+	// check alone passes admins on any id).
+	if !s.requireExistingRepo(w, repoID) {
 		return
 	}
 	force := r.URL.Query().Get("force") == "true"

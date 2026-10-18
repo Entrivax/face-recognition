@@ -40,9 +40,11 @@ export interface LoginResponse {
 	user: SessionUser;
 }
 
-/** {"ok":true} replies from the auth endpoints. */
+/** {"ok":true} replies from the auth endpoints. resetUserPassword's reply
+ *  carries an informational notice (its API keys were left intact). */
 export interface OkResponse {
 	ok: boolean;
+	notice?: string;
 }
 
 // ---- repositories ----

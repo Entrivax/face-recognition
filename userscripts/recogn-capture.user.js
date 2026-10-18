@@ -514,7 +514,11 @@
 	// The repository is a required ?repo= query parameter and the credential
 	// rides in its mode's header. The GM transport is preferred (the API sets
 	// no CORS headers, so cross-origin pages cannot use fetch for the
-	// credential headers anyway); fetch only ever runs same-origin.
+	// credential headers anyway); fetch only ever runs same-origin. Both
+	// transports carry ONLY the selected credential: GM requests run
+	// anonymous (no browser cookies) and fetch drops its credentials, so a
+	// recogn session cookie signed in elsewhere in this browser can never
+	// authenticate captures as a different (more privileged) principal.
 	async function recognize(blob) {
 		const cred = resolveCredential();
 		if (!cred) {
@@ -531,6 +535,7 @@
 					headers: Object.assign({ "Content-Type": "image/jpeg" }, cred.headers),
 					data: blob,
 					timeout: CONFIG.requestTimeoutMs,
+					anonymous: true, // no cookies: the header credential decides alone
 				});
 				return readRecognResponse(res.status, res.responseText);
 			} catch (err) { /* network-level failure: fall through to fetch */ }
@@ -542,7 +547,7 @@
 				+ " On cross-origin pages the manager must grant GM_xmlhttpRequest (see @connect).");
 		}
 		try {
-			const r = await fetch(url, { method: "POST", headers: Object.assign({ "Content-Type": "image/jpeg" }, cred.headers), body: blob });
+			const r = await fetch(url, { method: "POST", headers: Object.assign({ "Content-Type": "image/jpeg" }, cred.headers), credentials: "omit", body: blob });
 			return readRecognResponse(r.status, await r.text());
 		} catch (err) {
 			throw new Error("cannot reach recogn at " + url + " — is the server running (make serve)?"
@@ -553,12 +558,14 @@
 	// ---- access probe (credential self-check) ----
 
 	// GET a probe endpoint with the active credential's headers. Same
-	// transport rules as recognize(): GM anywhere, fetch only same-origin.
+	// transport rules as recognize(): GM anywhere, fetch only same-origin —
+	// and, like recognize(), only the selected credential rides along (GM
+	// requests run anonymous, fetch drops its credentials).
 	async function probeRequest(url, headers) {
 		const gm = gmHttp();
 		if (gm) {
 			try {
-				const res = await gmSend({ method: "GET", url, headers, timeout: CONFIG.requestTimeoutMs });
+				const res = await gmSend({ method: "GET", url, headers, timeout: CONFIG.requestTimeoutMs, anonymous: true });
 				return { status: res.status, text: res.responseText || "" };
 			} catch (err) {
 				if (!sameOrigin(url)) throw err; // fetch would fail out there too
@@ -566,7 +573,7 @@
 		} else if (!sameOrigin(url)) {
 			throw new Error("cross-origin pages need GM_xmlhttpRequest (see @connect)");
 		}
-		const r = await fetch(url, { method: "GET", headers });
+		const r = await fetch(url, { method: "GET", headers, credentials: "omit" });
 		return { status: r.status, text: await r.text() };
 	}
 

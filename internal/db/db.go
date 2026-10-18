@@ -295,12 +295,12 @@ func (d *DB) load() error {
 }
 
 // importJSONIfNeeded imports the JSON interchange file into the bbolt store
-// when the store has no people. The file is read but never renamed or
-// rewritten; on parse failure Open fails, so corrupt data is never silently
-// dropped.
+// when the store has neither people nor repos (a store that already holds
+// either is in use). The file is read but never renamed or rewritten; on
+// parse failure Open fails, so corrupt data is never silently dropped.
 func (d *DB) importJSONIfNeeded() error {
-	if len(d.data.People) != 0 {
-		return nil
+	if len(d.data.People) != 0 || len(d.data.Repos) != 0 {
+		return nil // already initialized: never resurrect the stale copy
 	}
 	jsonPath := d.interchangePath()
 	b, err := os.ReadFile(jsonPath)
@@ -579,6 +579,23 @@ func (d *DB) findLocked(name string) *Person {
 	return nil
 }
 
+// GetLegacy returns a LEGACY person (RepoID "") by name
+// (case-insensitive), or nil. It is the read-side counterpart of the
+// legacy mutators: a repo person with the same name never matches (Get is
+// the global view that sees both scopes). The returned pointer refers to a
+// deep copy: mutating it (including its Photos slice) never affects the
+// stored record.
+func (d *DB) GetLegacy(name string) *Person {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	for _, p := range d.data.People {
+		if p.RepoID == "" && strings.EqualFold(p.Name, name) {
+			return copyPersonLocked(p)
+		}
+	}
+	return nil
+}
+
 // GetByID returns a person by ID, or nil. The returned pointer refers to a
 // deep copy: mutating it (including its Photos slice) never affects the
 // stored record.
@@ -637,6 +654,13 @@ func (d *DB) addPhotoCore(repoID, name, relPath, hash string, embedding []float3
 	val := encodePhoto(hash, embedding)
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	// A repo-scoped write must address a repository that exists — checked
+	// under d.mu, so a concurrent repo deletion cannot slip in between the
+	// check and the write. Otherwise the person created below would point
+	// at a repository no accessor ever sees (orphaned record + photo bucket).
+	if repoID != "" && d.findRepoLocked(repoID) == nil {
+		return fmt.Errorf("%w: %q", ErrRepoNotFound, repoID)
+	}
 	p := d.lookupPersonLocked(repoID, name)
 	var person Person
 	isNew := p == nil

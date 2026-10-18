@@ -333,7 +333,8 @@ func TestUsersEndpointsAdminOnly(t *testing.T) {
 }
 
 // TestUsersCRUD covers account creation, listing, validation and deletion
-// (with the admin undeletable).
+// (self-deletion and the last remaining admin are refused; a non-last admin
+// is deletable by another admin).
 func TestUsersCRUD(t *testing.T) {
 	e := newEnv(t, &stubEngine{}, "Team", false, false)
 
@@ -386,16 +387,29 @@ func TestUsersCRUD(t *testing.T) {
 		t.Errorf("error body = %q", errBody["error"])
 	}
 
-	// Delete: the admin account is protected.
+	// Delete: the caller's own account is refused.
 	rec = del(t, e.s, e.admin, "/api/users/admin")
 	if rec.Code != http.StatusForbidden {
-		t.Errorf("delete admin: got %d (%s), want 403", rec.Code, rec.Body.String())
+		t.Errorf("delete self: got %d (%s), want 403", rec.Code, rec.Body.String())
 	}
 	var body map[string]string
 	decodeBody(t, rec, &body)
-	if body["error"] != "the administrator account cannot be deleted" {
-		t.Errorf("admin-delete error = %q", body["error"])
+	if body["error"] != "you cannot delete your own account" {
+		t.Errorf("self-delete error = %q", body["error"])
 	}
+
+	// A second admin is deletable by the first (the last remaining admin is
+	// the only protected admin).
+	if rec = sendJSON(t, e.s, e.admin, "/api/users", map[string]any{"username": "Root", "password": "root-password-1", "admin": true}); rec.Code != http.StatusOK {
+		t.Fatalf("create second admin: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if rec = del(t, e.s, e.admin, "/api/users/Root"); rec.Code != http.StatusOK {
+		t.Errorf("delete non-last admin: got %d (%s), want 200", rec.Code, rec.Body.String())
+	}
+	if rec = del(t, e.s, e.admin, "/api/users/Root"); rec.Code != http.StatusNotFound {
+		t.Errorf("delete deleted admin: got %d, want 404", rec.Code)
+	}
+
 	// Unknown user → 404; the deleted user's login stops working.
 	if rec := del(t, e.s, e.admin, "/api/users/nobody"); rec.Code != http.StatusNotFound {
 		t.Errorf("delete unknown: got %d, want 404", rec.Code)

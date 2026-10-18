@@ -289,11 +289,11 @@ to one repository via `X-Share-Token: <repoID>/<token>`.
 | `POST` | `/api/repos` | admin | create a repository (a new `people/<uuid>/` dataset folder) |
 | `POST` | `/api/repos/{id}/rename` | admin | rename a repository's display name (the folder stays `<uuid>`) |
 | `DELETE` | `/api/repos/{id}` | admin | delete a repository |
-| `POST` | `/api/repos/{id}/share` | admin | toggle the read-only share link — JSON `{"enabled": true|false}` → `{share_url: "/share/<id>/<token>"}` (enabling mints a fresh token, i.e. rotates the link) |
+| `POST` | `/api/repos/{id}/share` | admin | toggle the read-only share link — JSON `{"enabled": true}` or `{"enabled": false}` → `{share_url: "/share/<id>/<token>"}` (enabling mints a fresh token, i.e. rotates the link) |
 | `GET` | `/api/repos/{id}/share` | admin | re-read the current share link `{share_url}` (same token — no rotation; `share_url: null` while unshared) |
 | `GET`/`POST` | `/api/users` | admin | list / create users |
-| `DELETE` | `/api/users/{u}` | admin | delete a user (the admin cannot be deleted) |
-| `POST` | `/api/users/{u}/password` | admin | reset a user's password |
+| `DELETE` | `/api/users/{u}` | admin | delete a user (refused for the caller's own account and the last remaining admin — with several admins, any of them may delete another) |
+| `POST` | `/api/users/{u}/password` | admin | reset a user's password (sessions revoked; API keys left intact — the response's `notice` asks the caller to have the user review them) |
 | `POST` | `/api/users/{u}/repos` | admin | set a user's per-repo grants — JSON `{"grants":[{"repo":"<name or id>","role":"reader"}]}` |
 | `POST` | `/api/auth/password` | any user | change your own password |
 | `GET`/`POST`/`DELETE` | `/api/auth/keys` | any user | personal API keys (created key shown once as `rk_...`; a key acts as its user) |
@@ -324,7 +324,7 @@ Example:
 curl -s -c cookies.txt -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"change-me"}' http://localhost:8080/api/login
 curl -s -b cookies.txt -F "image=@photo.jpg" \
-  "http://localhost:8080/api/recognize?repo=My people"
+  "http://localhost:8080/api/recognize?repo=My%20people"
 curl -s -b cookies.txt -F "image1=@a.jpg" -F "image2=@b.jpg" \
   http://localhost:8080/api/compare
 ```
@@ -359,7 +359,8 @@ per-repository role:
 | admin | implicitly full access everywhere, plus user/repo/share management |
 
 Users change their own password (`POST /api/auth/password`); the admin resets
-anyone's (`POST /api/users/{u}/password`) and cannot be deleted.
+anyone's (`POST /api/users/{u}/password`). Accounts are deletable except the
+caller's own and the last remaining admin.
 
 **API keys**: every user can create personal API keys in the UI (`GET`/`POST`/`DELETE /api/auth/keys`; the full `rk_...` key is shown once at creation)
 and revoke them there. A key acts as its user — scripts send `Authorization:
@@ -392,7 +393,7 @@ Scripts log in once and reuse the session — or send a personal API key:
 curl -s -c cookies.txt -X POST http://localhost:8080/api/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"change-me"}'
-curl -s -b cookies.txt "http://localhost:8080/api/people?repo=My people"
+curl -s -b cookies.txt "http://localhost:8080/api/people?repo=My%20people"
 
 # Or present a personal API key (acts as its user) as a Bearer credential
 curl -s -H "Authorization: Bearer rk_..." \

@@ -46,12 +46,18 @@ func (s *Service) LoginHandler() http.Handler {
 			writeError(w, http.StatusBadRequest, "invalid JSON")
 			return
 		}
-		u, ok := s.users.GetUser(body.Username)
-		if ok && !users.VerifyPassword(u.PasswordHash, body.Password) {
-			ok = false
-		}
-		if !ok {
-			s.dummyVerify(body.Password) // uniform latency for unknown usernames
+		u, found := s.users.GetUser(body.Username)
+		authed := found && users.VerifyPassword(u.PasswordHash, body.Password)
+		if !authed {
+			if !found {
+				// Unknown username: burn the same argon2 derivation a real
+				// user's wrong-password attempt just paid, so the 401
+				// latency does not reveal that no such account exists. A
+				// found user's VerifyPassword already did that work — a
+				// second derivation here would double the cost and leak
+				// account existence the other way around.
+				s.dummyVerify(body.Password)
+			}
 			s.limiter.RecordFailure(ip)
 			writeError(w, http.StatusUnauthorized, "invalid username or password")
 			return
@@ -160,7 +166,11 @@ func (s *Service) SetupHandler() http.Handler {
 			writeError(w, http.StatusForbidden, "setup already completed")
 			return
 		}
-		if !s.checkSetupKey(body.Key) {
+		// The setup key is read here under the held setupMu (see the
+		// comment on checkSetupKey) and the whole sequence below — count
+		// re-check, key comparison, creation, consumption — is serialized
+		// by it, so two racing setups cannot both create the admin.
+		if !checkSetupKey(s.setupKey, body.Key) {
 			s.setupLim.RecordFailure(ip)
 			writeError(w, http.StatusForbidden, "invalid setup key")
 			return

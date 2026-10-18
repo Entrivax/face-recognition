@@ -634,6 +634,63 @@ func TestScanRepoScoped(t *testing.T) {
 	}
 }
 
+// TestLegacyScanIgnoresRepoPersons checks the read side of the legacy
+// scoping rule: a legacy scan resolving a name that also exists as a repo
+// person must resolve the LEGACY record — a thumbnail generated for the
+// flat folder's photo goes to the legacy person, never to the repo person.
+func TestLegacyScanIgnoresRepoPersons(t *testing.T) {
+	peopleDir := t.TempDir()
+	database, err := db.Open(filepath.Join(t.TempDir(), "emb.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := &stubEngine{faces: testFace()}
+	repo, err := database.CreateRepo("Team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A repo-scoped DB record for "Alice" with no thumbnail yet (the way a
+	// first enrollment whose thumbnail failed looks) — and no files on
+	// disk for the repo.
+	img := pngBytes(t, 40, 40)
+	if err := database.AddPhotoHashedForRepo(repo.ID, "Alice", "a.png", db.HashBytes(img), []float32{0.5}); err != nil {
+		t.Fatal(err)
+	}
+	// A legacy flat folder with the SAME name next to the repo folder.
+	if err := os.MkdirAll(filepath.Join(peopleDir, "Alice"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(peopleDir, "Alice", "flat.png"), img, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := Scan(eng, database, Options{PeopleDir: peopleDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.PhotosAdded != 1 {
+		t.Fatalf("legacy scan: %+v, want 1 added", res)
+	}
+
+	// The flat photo belongs to a NEW legacy person, with its thumbnail.
+	legacy := database.GetLegacy("Alice")
+	if legacy == nil || legacy.RepoID != "" || len(legacy.Photos) != 1 {
+		t.Fatalf("legacy Alice: %+v, want one legacy person with 1 photo", legacy)
+	}
+	if legacy.Thumb == "" || legacy.ThumbSrc != "flat.png" {
+		t.Fatalf("legacy Alice thumb = %q src %q, want a generated sidecar from flat.png", legacy.Thumb, legacy.ThumbSrc)
+	}
+	// The repo person was not touched — old global-lookup behavior would
+	// have attributed the legacy photo's thumbnail to them.
+	repoAlice := database.GetInRepo(repo.ID, "Alice")
+	if repoAlice == nil || len(repoAlice.Photos) != 1 || repoAlice.Photos[0].Path != "a.png" {
+		t.Fatalf("repo Alice photos: %+v, want unchanged (1 photo, a.png)", repoAlice)
+	}
+	if repoAlice.Thumb != "" || repoAlice.ThumbSrc != "" {
+		t.Errorf("repo Alice must not gain a thumbnail from the legacy scan: %+v", repoAlice)
+	}
+}
+
 // TestScanRepoScopedIncrementalByHash checks the incremental contract inside
 // a repository: unchanged files keep, a changed file re-enrols.
 func TestScanRepoScopedIncrementalByHash(t *testing.T) {

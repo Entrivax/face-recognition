@@ -11,6 +11,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"recogn/internal/users"
@@ -120,7 +121,7 @@ func TestPrincipalOfDeletedUser(t *testing.T) {
 	}
 	session, _ := s.sessions.New("temp")
 
-	if _, err := s.DeleteUser("temp"); err != nil {
+	if _, err := s.DeleteUser("admin", "temp"); err != nil {
 		t.Fatal(err)
 	}
 	// Both the key and the session of the deleted user stop authenticating.
@@ -255,12 +256,32 @@ func TestRequireAdminViaAPIKey(t *testing.T) {
 
 func TestServiceDeleteUserRefusesAdmin(t *testing.T) {
 	s := newTestService(t, "sekret-pw")
-	deleted, err := s.DeleteUser("admin")
-	if deleted || !errors.Is(err, ErrAdminProtected) {
-		t.Fatalf("deleting an admin = %v, %v; want (false, ErrAdminProtected)", deleted, err)
+
+	// The sole admin deleting themselves: self-protection fires first.
+	deleted, err := s.DeleteUser("admin", "admin")
+	if deleted || !errors.Is(err, ErrSelfProtected) {
+		t.Fatalf("self-delete = %v, %v; want (false, ErrSelfProtected)", deleted, err)
 	}
 	if _, ok := s.users.GetUser("admin"); !ok {
 		t.Fatal("the admin must survive the refused delete")
+	}
+
+	// A second admin makes the first deletable by the other.
+	if err := s.CreateUser("root", "long-enough", true); err != nil {
+		t.Fatal(err)
+	}
+	if deleted, err := s.DeleteUser("admin", "root"); err != nil || !deleted {
+		t.Fatalf("delete non-last admin = %v, %v; want (true, nil)", deleted, err)
+	}
+	if _, ok := s.users.GetUser("root"); ok {
+		t.Fatal("the deleted admin must be gone")
+	}
+
+	// The now-last admin, deleted by a caller string that is not their own
+	// name: the last-admin rule fires (unreachable over HTTP, where it
+	// coincides with self-deletion — the service layer is the backstop).
+	if deleted, err := s.DeleteUser("root", "admin"); deleted || !errors.Is(err, ErrAdminProtected) {
+		t.Fatalf("delete last admin = %v, %v; want (false, ErrAdminProtected)", deleted, err)
 	}
 
 	// Users() exposes the Admin flag so the api layer can pre-check.
@@ -272,6 +293,62 @@ func TestServiceDeleteUserRefusesAdmin(t *testing.T) {
 	}
 	if !sawAdmin {
 		t.Fatal("Users() must expose the Admin flag")
+	}
+}
+
+// TestServiceDeleteUserConcurrentAdmins pins the serialization of the
+// last-administrator check and the deletion: with two admins deleting each
+// other concurrently, both callers can pass the count check unless the
+// check-then-delete sequence is atomic — and then no administrator remains.
+// With s.deleteMu held across the operation, exactly one delete succeeds
+// and the other is refused with ErrAdminProtected.
+func TestServiceDeleteUserConcurrentAdmins(t *testing.T) {
+	s := newTestService(t, "sekret-pw")
+	if err := s.CreateUser("root", "long-enough", true); err != nil {
+		t.Fatal(err)
+	}
+
+	type outcome struct {
+		deleted bool
+		err     error
+	}
+	results := make([]outcome, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		d, e := s.DeleteUser("root", "admin")
+		results[0] = outcome{deleted: d, err: e}
+	}()
+	go func() {
+		defer wg.Done()
+		d, e := s.DeleteUser("admin", "root")
+		results[1] = outcome{deleted: d, err: e}
+	}()
+	wg.Wait()
+
+	succeeded := 0
+	for i, r := range results {
+		switch {
+		case r.deleted && r.err == nil:
+			succeeded++
+		case !r.deleted && errors.Is(r.err, ErrAdminProtected):
+			// refused by the last-admin rule — expected for the loser
+		default:
+			t.Errorf("delete #%d = (%v, %v); want (true, nil) or (false, ErrAdminProtected)", i, r.deleted, r.err)
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("exactly one concurrent delete must succeed, got %d: %+v", succeeded, results)
+	}
+	remaining := 0
+	for _, u := range s.Users() {
+		if u.Admin {
+			remaining++
+		}
+	}
+	if remaining != 1 {
+		t.Fatalf("want exactly one administrator to survive, got %d", remaining)
 	}
 }
 

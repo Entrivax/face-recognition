@@ -314,12 +314,13 @@ func pruneMissingPeople(database *db.DB, peopleDir, repoID string) int {
 	return n
 }
 
-// lookupPerson resolves a person within the scan's scope: db.Get for the
-// legacy layout, db.GetInRepo for a repository scan. Returns a deep copy
-// (or nil).
+// lookupPerson resolves a person within the scan's scope: db.GetLegacy
+// (LEGACY persons only — a repo person with the same name never matches)
+// for the legacy layout, db.GetInRepo for a repository scan. Returns a
+// deep copy (or nil).
 func lookupPerson(database *db.DB, repoID, name string) *db.Person {
 	if repoID == "" {
-		return database.Get(name)
+		return database.GetLegacy(name)
 	}
 	return database.GetInRepo(repoID, name)
 }

@@ -1,9 +1,9 @@
 // Users manager (admin). Lists accounts (username, admin badge, grants
-// summary), creates users, resets passwords, deletes users (the admin
-// account is refused server-side, so its delete button is hidden), and
-// edits per-repo grants: one row per existing repository with a
-// no-access/reader/writer select, saved as a FULL-REPLACE of that user's
-// grants.
+// summary), creates users, resets passwords, deletes users (the caller's
+// own account and the last remaining admin are refused server-side; the
+// self row's delete button is hidden), and edits per-repo grants: one row
+// per existing repository with a no-access/reader/writer select, saved as a
+// FULL-REPLACE of that user's grants.
 
 import { useEffect, useRef, useState } from "preact/hooks";
 import type { TargetedEvent } from "preact";
@@ -113,7 +113,10 @@ export function UsersModal(props: UsersModalProps) {
 
 	// ---- grants editor ----
 	function openGrants(u: UserInfo) {
-		if (busyRef.current) return;
+		if (busyRef.current || repos === null) return;
+		// repos === null means the list is still loading: an editor opened
+		// now would show no repo rows and its Save would full-replace the
+		// user's grants with an empty list — wiping real access.
 		setPwUser(null);
 		const sel: Record<string, GrantChoice> = {};
 		for (const r of repos ?? []) sel[r.id] = "none";
@@ -172,8 +175,11 @@ export function UsersModal(props: UsersModalProps) {
 		}
 		setBusy(true);
 		try {
-			await api.resetUserPassword(pwUser, pwVal);
-			toast.show(`Password reset for ${pwUser}.`, "ok");
+			const j = await api.resetUserPassword(pwUser, pwVal);
+			// One toast (single-slot): the confirmation carries the server's
+			// API-key notice — the user's keys were left intact and should be
+			// reviewed if the account may be compromised.
+			toast.show(`Password reset for ${pwUser}.${j.notice ? " " + j.notice : ""}`, "ok");
 			setPwUser(null);
 			setPwVal("");
 		} catch (err) {
@@ -262,13 +268,19 @@ export function UsersModal(props: UsersModalProps) {
 									<span class="admin-row-sub" title="Repository access">{grantsText(u)}</span>
 								</div>
 								<div class="admin-row-actions">
-									<button type="button" class="btn btn-ghost btn-sm" disabled={busy} onClick={() => (grantsUser === u.username ? setGrantsUser(null) : openGrants(u))}>
+									<button
+										type="button"
+										class="btn btn-ghost btn-sm"
+										disabled={busy || repos === null}
+										title={repos === null ? "Loading repositories…" : undefined}
+										onClick={() => (grantsUser === u.username ? setGrantsUser(null) : openGrants(u))}
+									>
 										{grantsUser === u.username ? "Close grants" : "Grants"}
 									</button>
 									<button type="button" class="btn btn-ghost btn-sm" disabled={busy} onClick={() => (pwUser === u.username ? setPwUser(null) : openReset(u))}>
 										{pwUser === u.username ? "Close" : "Reset password"}
 									</button>
-									{!u.admin && (
+									{u.username !== props.currentUser && (
 										<button type="button" class="btn btn-ghost btn-sm admin-danger" disabled={busy} onClick={() => remove(u)}>
 											Delete
 										</button>

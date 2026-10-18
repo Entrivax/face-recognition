@@ -130,16 +130,26 @@ export function MainApp({ user, onSessionEnd }: MainAppProps) {
 		}
 	}, []);
 
+	// The people fetch is async and the selected repo can change while it is
+	// in flight: loadPeople records the repo it fetches for and ignores both
+	// the success and the failure of a request that has since been
+	// superseded (an older repo's list must not land under the new repo).
+	const peopleReqRef = useRef<string | null>(null);
 	const loadPeople = useCallback(async () => {
-		if (!repoId) {
+		const want = repoId;
+		if (!want) {
+			peopleReqRef.current = null;
 			setPeople([]);
 			return;
 		}
+		peopleReqRef.current = want;
 		try {
-			const j = await api.getPeople(repoId);
+			const j = await api.getPeople(want);
+			if (peopleReqRef.current !== want) return; // superseded request
 			setPeople(j.people || []);
 			setPeopleErr(false);
 		} catch {
+			if (peopleReqRef.current !== want) return; // superseded request
 			setPeopleErr(true);
 		}
 	}, [repoId]);

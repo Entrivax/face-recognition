@@ -82,10 +82,12 @@ func TestVerifyPasswordRejectsBadHashes(t *testing.T) {
 		"not-a-hash",
 	}
 	for _, b := range bad {
-		if VerifyPassword("long-enough", b) {
+		// VerifyPassword(hash, password): the malformed value must hit the
+		// parser, not ride through as the candidate password.
+		if VerifyPassword(b, "long-enough") {
 			t.Fatalf("malformed stored hash must not verify: %q", b)
 		}
-		if VerifyPassword("long-enough", b+"trailing") {
+		if VerifyPassword(b+"trailing", "long-enough") {
 			t.Fatalf("tampered hash must not verify: %q", b+"trailing")
 		}
 	}

@@ -76,6 +76,13 @@ type Service struct {
 	setupMu  sync.Mutex
 	setupKey string // in memory only; "" once consumed or unavailable
 
+	// deleteMu serializes DeleteUser end-to-end: the last-administrator
+	// count and the store deletion are separate store operations, so
+	// without this mutex two concurrent deletes (of each other's admin
+	// accounts) could both pass the count check and leave the server with
+	// no administrator at all.
+	deleteMu sync.Mutex
+
 	trusted []*net.IPNet // trusted reverse-proxy CIDRs for client-IP extraction (M4)
 }
 
@@ -137,15 +144,18 @@ func normalizeSetupKey(v string) string {
 	return strings.ReplaceAll(v, " ", "")
 }
 
-// checkSetupKey reports whether the presented (normalized) setup key matches
-// the live one, in constant time. An unconsumed key of the wrong length
-// simply fails the comparison.
-func (s *Service) checkSetupKey(presented string) bool {
-	if s.setupKey == "" {
+// checkSetupKey reports whether the presented (normalized) setup key
+// matches the live one, in constant time. live is the service's current
+// setup key; the caller reads it while holding setupMu (SetupHandler holds
+// the mutex across its whole check-consume-create sequence, so no locking
+// happens here — sync.Mutex is not reentrant). An unconsumed key of the
+// wrong length simply fails the comparison.
+func checkSetupKey(live, presented string) bool {
+	if live == "" {
 		return false
 	}
 	got := normalizeSetupKey(presented)
-	want := normalizeSetupKey(s.setupKey)
+	want := normalizeSetupKey(live)
 	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
