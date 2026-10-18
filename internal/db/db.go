@@ -8,7 +8,10 @@
 // The bbolt file maps people (stable ID + display name) to the set of face
 // embeddings computed from their enrolled photos. It is deliberately simple
 // so the dataset is easy to expand: add a folder under people/ and
-// re-enroll, or upload photos through the API.
+// re-enroll, or upload photos through the API. Schema v2 groups persons into
+// repositories (the repos bucket + Person.RepoID); persons without a repo
+// (RepoID "") are legacy and are only reachable through the pre-repo
+// methods, while repo persons get their own scope via the repo API.
 package db
 
 import (
@@ -75,10 +78,13 @@ func (m *PersonMeta) IsEmpty() bool {
 	return m.Description == "" && len(m.Aliases) == 0 && len(m.URLs) == 0
 }
 
-// Person is one enrolled identity.
+// Person is one enrolled identity. RepoID names the repository the person
+// belongs to (schema v2); "" is a legacy/unassigned person, reachable only
+// through the pre-repo (legacy) methods.
 type Person struct {
 	ID       string      `json:"id"`
 	Name     string      `json:"name"`
+	RepoID   string      `json:"repo_id,omitempty"`
 	Photos   []Photo     `json:"photos"`
 	Thumb    string      `json:"thumb,omitempty"`     // face thumbnail sidecar file name in ThumbDir
 	ThumbSrc string      `json:"thumb_src,omitempty"` // enrolled photo the thumbnail was generated from
@@ -102,11 +108,13 @@ var (
 )
 
 // fileFormat is the JSON interchange document schema (versioned for future
-// migrations). Threshold is an additive, optional setting: nil when never set
-// (older files and fresh databases), and a pointer so an explicitly stored 0
-// survives. The same shape serves as the DB's in-memory mirror.
+// migrations; see interchangeVersion). Threshold is an additive, optional
+// setting: nil when never set (older files and fresh databases), and a
+// pointer so an explicitly stored 0 survives. The same shape serves as the
+// DB's in-memory mirror.
 type fileFormat struct {
 	Version   int       `json:"version"`
+	Repos     []*Repo   `json:"repos"`
 	People    []*Person `json:"people"`
 	Threshold *float64  `json:"threshold,omitempty"`
 }
@@ -116,11 +124,22 @@ var (
 	bktMeta   = []byte("meta")
 	bktPeople = []byte("people")
 	bktPhotos = []byte("photos")
+	bktRepos  = []byte("repos")
 
 	metaVersionKey   = []byte("version")
 	metaThresholdKey = []byte("threshold")
 
-	dbVersion = uint32(1)
+	// dbVersion is the bbolt layout version stored in the meta bucket. v2
+	// adds the repos bucket and person RepoID fields; a stored v1 is
+	// migrated on open by rewriting the marker — persons keep RepoID ""
+	// (legacy/unassigned) and a newer marker fails Open loudly.
+	dbVersion = uint32(2)
+
+	// interchangeVersion is the version written to the JSON interchange
+	// document. v1 documents (no repos key) are still imported — their
+	// persons land as legacy (RepoID "") — while a document claiming a
+	// newer version fails Open loudly instead of being mis-read.
+	interchangeVersion = 2
 
 	// interchangeName is the JSON interchange file, looked up next to the
 	// bbolt file (data/embeddings.json for a DB at data/faces.db).
@@ -158,12 +177,34 @@ func Open(path string) (*DB, error) {
 		if _, err := tx.CreateBucketIfNotExists(bktPhotos); err != nil {
 			return err
 		}
-		if len(mb.Get(metaVersionKey)) == 0 {
-			var v [4]byte
-			binary.LittleEndian.PutUint32(v[:], dbVersion)
-			return mb.Put(metaVersionKey, v[:])
+		if _, err := tx.CreateBucketIfNotExists(bktRepos); err != nil {
+			return err
 		}
-		return nil
+		v := mb.Get(metaVersionKey)
+		switch {
+		case len(v) == 0:
+			// Fresh store: stamp the current version.
+			var b [4]byte
+			binary.LittleEndian.PutUint32(b[:], dbVersion)
+			return mb.Put(metaVersionKey, b[:])
+		case len(v) != 4:
+			// Corrupt or unknown marker length: left untouched, exactly as
+			// before (load ignores non-4-byte markers).
+			return nil
+		}
+		ver := binary.LittleEndian.Uint32(v)
+		if ver > dbVersion {
+			return fmt.Errorf("unsupported database version %d (want %d)", ver, dbVersion)
+		}
+		if ver == dbVersion {
+			return nil
+		}
+		// Older store (v1): migrate the marker to the current layout. The
+		// repos bucket was created above; persons keep RepoID ""
+		// (legacy/unassigned), so every legacy accessor keeps finding them.
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], dbVersion)
+		return mb.Put(metaVersionKey, b[:])
 	}); err != nil {
 		bdb.Close()
 		return nil, fmt.Errorf("init db %s: %w", path, err)
@@ -203,7 +244,7 @@ func (d *DB) interchangePath() string {
 // load rebuilds the in-memory mirror from the bbolt file. Used only while
 // opening, before the DB is shared.
 func (d *DB) load() error {
-	d.data = fileFormat{Version: 1}
+	d.data = fileFormat{Version: interchangeVersion}
 	return d.bdb.View(func(tx *bolt.Tx) error {
 		mb := tx.Bucket(bktMeta)
 		if v := mb.Get(metaVersionKey); len(v) == 4 {
@@ -214,6 +255,17 @@ func (d *DB) load() error {
 		if v := mb.Get(metaThresholdKey); len(v) == 8 {
 			f := float64FromBytes(v)
 			d.data.Threshold = &f
+		}
+		rb := tx.Bucket(bktRepos)
+		if err := rb.ForEach(func(id, v []byte) error {
+			var r Repo
+			if err := json.Unmarshal(v, &r); err != nil {
+				return fmt.Errorf("decode repo %q: %w", id, err)
+			}
+			d.data.Repos = append(d.data.Repos, &r)
+			return nil
+		}); err != nil {
+			return err
 		}
 		pb := tx.Bucket(bktPeople)
 		phb := tx.Bucket(bktPhotos)
@@ -265,7 +317,26 @@ func (d *DB) importJSONIfNeeded() error {
 	if err := json.Unmarshal(b, &ff); err != nil {
 		return fmt.Errorf("parse %s: %w", jsonPath, err)
 	}
+	if ff.Version > interchangeVersion {
+		return fmt.Errorf("parse %s: unsupported interchange version %d (want <= %d)", jsonPath, ff.Version, interchangeVersion)
+	}
 	err = d.bdb.Update(func(tx *bolt.Tx) error {
+		// Repos import leniently, like people: records without an ID are
+		// skipped, everything else is stored as-is. v1 documents carry no
+		// repos at all, so their persons land as legacy (RepoID "").
+		rb := tx.Bucket(bktRepos)
+		for _, r := range ff.Repos {
+			if r == nil || strings.TrimSpace(r.ID) == "" {
+				continue
+			}
+			v, err := json.Marshal(*r)
+			if err != nil {
+				return err
+			}
+			if err := rb.Put([]byte(r.ID), v); err != nil {
+				return err
+			}
+		}
 		pb := tx.Bucket(bktPeople)
 		phb := tx.Bucket(bktPhotos)
 		for _, p := range ff.People {
@@ -320,14 +391,28 @@ func (d *DB) Export() (string, error) { return d.ExportTo("") }
 
 // ExportTo writes the JSON interchange file to path (empty means the default
 // location) and returns the path used. The write is atomic (temp file +
-// rename) and never touches the bbolt store. People are written name-sorted,
-// so repeated exports produce byte-stable files that diff cleanly.
+// rename) and never touches the bbolt store. Repos and people are written
+// name-sorted, so repeated exports produce byte-stable files that diff
+// cleanly.
 func (d *DB) ExportTo(path string) (string, error) {
 	if path == "" {
 		path = d.interchangePath()
 	}
 	d.mu.RLock()
-	doc := fileFormat{Version: d.data.Version, Threshold: d.data.Threshold, People: make([]*Person, len(d.data.People))}
+	doc := fileFormat{
+		Version:   d.data.Version,
+		Threshold: d.data.Threshold,
+		Repos:     make([]*Repo, len(d.data.Repos)),
+		People:    make([]*Person, len(d.data.People)),
+	}
+	for i, r := range d.data.Repos {
+		// Repo holds no reference fields, so a struct copy is already
+		// deep; the explicit copy keeps the mirror independent of any
+		// mutation a caller might make to the document before it is
+		// marshalled.
+		cp := *r
+		doc.Repos[i] = &cp
+	}
 	for i, p := range d.data.People {
 		// Deep copy (not just the struct): the JSON is marshalled after the
 		// lock is released, so the Photos slice must not alias the live
@@ -335,6 +420,14 @@ func (d *DB) ExportTo(path string) (string, error) {
 		doc.People[i] = copyPersonLocked(p)
 	}
 	d.mu.RUnlock()
+	// Repos are written name-sorted like the people, so repeated exports
+	// produce byte-stable files that diff cleanly.
+	sort.Slice(doc.Repos, func(i, j int) bool {
+		if doc.Repos[i].Name != doc.Repos[j].Name {
+			return doc.Repos[i].Name < doc.Repos[j].Name
+		}
+		return doc.Repos[i].ID < doc.Repos[j].ID
+	})
 	sort.Slice(doc.People, func(i, j int) bool {
 		if doc.People[i].Name != doc.People[j].Name {
 			return doc.People[i].Name < doc.People[j].Name
@@ -462,9 +555,11 @@ func foldKey(s string) string {
 	return strings.ToLower(b.String())
 }
 
-// Get returns a person by name (case-insensitive), or nil. The returned
-// pointer refers to a deep copy: mutating it (including its Photos slice)
-// never affects the stored record.
+// Get returns a person by name (case-insensitive), or nil. Get is a global
+// view: it sees legacy and repo persons alike (a name held in both scopes
+// resolves to one of them), while the mutating methods are scoped. The
+// returned pointer refers to a deep copy: mutating it (including its Photos
+// slice) never affects the stored record.
 func (d *DB) Get(name string) *Person {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -507,18 +602,32 @@ func (d *DB) findByIDLocked(id string) *Person {
 }
 
 // AddPhoto appends (or replaces, if the same path exists) a photo embedding
-// for the named person, creating the person if needed, and persists the
-// change.
+// for the named legacy person (RepoID ""), creating the person if needed,
+// and persists the change.
 func (d *DB) AddPhoto(name, relPath string, imgBytes []byte, embedding []float32) error {
-	return d.addPhoto(name, relPath, hashBytes(imgBytes), embedding)
+	return d.addPhotoCore("", name, relPath, hashBytes(imgBytes), embedding)
 }
 
 // AddPhotoHashed is AddPhoto when the caller already knows the content hash.
 func (d *DB) AddPhotoHashed(name, relPath, hash string, embedding []float32) error {
-	return d.addPhoto(name, relPath, hash, embedding)
+	return d.addPhotoCore("", name, relPath, hash, embedding)
 }
 
-func (d *DB) addPhoto(name, relPath, hash string, embedding []float32) error {
+// AddPhotoHashedForRepo appends (or replaces, if the same path exists) a
+// photo embedding for the named person of repository repoID, creating the
+// person (RepoID set, ID derived via NewPersonID) if needed. A legacy
+// enrollment must never touch a repo person's record and vice versa, so an
+// empty repoID is refused instead of silently creating an unassigned person
+// through the repo path.
+func (d *DB) AddPhotoHashedForRepo(repoID, name, relPath, hash string, embedding []float32) error {
+	repoID = normRepoID(repoID)
+	if repoID == "" {
+		return errors.New("repo id is empty")
+	}
+	return d.addPhotoCore(repoID, name, relPath, hash, embedding)
+}
+
+func (d *DB) addPhotoCore(repoID, name, relPath, hash string, embedding []float32) error {
 	if strings.TrimSpace(name) == "" {
 		return errors.New("person name is empty")
 	}
@@ -528,23 +637,28 @@ func (d *DB) addPhoto(name, relPath, hash string, embedding []float32) error {
 	val := encodePhoto(hash, embedding)
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	p := d.findLocked(name)
+	p := d.lookupPersonLocked(repoID, name)
 	var person Person
 	isNew := p == nil
 	if isNew {
-		person = Person{ID: newID(name), Name: name}
+		id := newID(name)
+		if repoID != "" {
+			id = d.NewPersonID(repoID, name)
+		}
+		person = Person{ID: id, Name: name, RepoID: repoID}
 		// Two different names can slugify to the same ID; in the bbolt
 		// layout they would share one photo bucket, so refuse instead of
-		// silently letting them corrupt each other's photos.
+		// silently letting them corrupt each other's photos. The check is
+		// global: photo buckets are keyed by ID across all repositories.
 		if other := d.findByIDLocked(person.ID); other != nil {
 			return fmt.Errorf("%w: %q (in use by %q)", ErrIDTaken, person.ID, other.Name)
 		}
 	} else {
-		// Copy the stored record (name, thumbnail fields, metadata) rather
-		// than rebuilding it field-by-field: a rebuild here would silently
-		// drop whatever the record gained since it was written (person
-		// metadata, e.g.). Photos live in their own bucket, never in the
-		// people record.
+		// Copy the stored record (name, repo, thumbnail fields, metadata)
+		// rather than rebuilding it field-by-field: a rebuild here would
+		// silently drop whatever the record gained since it was written
+		// (person metadata, e.g.). Photos live in their own bucket, never
+		// in the people record.
 		person = *p
 		person.Photos = nil
 	}
@@ -570,7 +684,7 @@ func (d *DB) addPhoto(name, relPath, hash string, embedding []float32) error {
 	}
 	// The disk commit succeeded; now update the in-memory mirror.
 	if isNew {
-		p = &Person{ID: person.ID, Name: person.Name}
+		p = &Person{ID: person.ID, Name: person.Name, RepoID: person.RepoID}
 		d.data.People = append(d.data.People, p)
 	}
 	photo := Photo{Path: relPath, Hash: hash, Embedding: embedding}
@@ -589,11 +703,28 @@ func (d *DB) addPhoto(name, relPath, hash string, embedding []float32) error {
 	return nil
 }
 
-// PhotoHash returns the stored content hash for a person's photo path, or "".
+// PhotoHash returns the stored content hash for a legacy person's photo
+// path, or "". Like the other legacy mutators it only sees legacy persons
+// (RepoID "") — use PhotoHashInRepo for a person inside a repository.
 func (d *DB) PhotoHash(name, relPath string) string {
+	return d.photoHashCore("", name, relPath)
+}
+
+// PhotoHashInRepo returns the stored content hash for a person's photo path
+// inside repository repoID, or "". Only persons belonging to repoID match;
+// legacy persons are never seen through this accessor.
+func (d *DB) PhotoHashInRepo(repoID, name, relPath string) string {
+	repoID = normRepoID(repoID)
+	if repoID == "" {
+		return "" // repo-scoped accessors never touch legacy persons
+	}
+	return d.photoHashCore(repoID, name, relPath)
+}
+
+func (d *DB) photoHashCore(repoID, name, relPath string) string {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	p := d.findLocked(name)
+	p := d.lookupPersonLocked(repoID, name)
 	if p == nil {
 		return ""
 	}
@@ -605,19 +736,28 @@ func (d *DB) PhotoHash(name, relPath string) string {
 	return ""
 }
 
-// RemovePerson deletes a person (by name, case-insensitive). Returns whether
-// one existed. The person's face thumbnail sidecar, if any, is deleted too.
+// RemovePerson deletes a legacy person (by name, case-insensitive; only
+// persons with RepoID "" match). Returns whether one existed. The person's
+// face thumbnail sidecar, if any, is deleted too.
 func (d *DB) RemovePerson(name string) (bool, error) {
+	return d.removePersonCore("", name)
+}
+
+// RemovePersonInRepo deletes a person of repository repoID (by name,
+// case-insensitive), together with their thumbnail sidecar. Returns whether
+// one existed.
+func (d *DB) RemovePersonInRepo(repoID, name string) (bool, error) {
+	repoID = normRepoID(repoID)
+	if repoID == "" {
+		return false, nil // repo-scoped accessors never touch legacy persons
+	}
+	return d.removePersonCore(repoID, name)
+}
+
+func (d *DB) removePersonCore(repoID, name string) (bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	idx := -1
-	var p *Person
-	for i, cand := range d.data.People {
-		if strings.EqualFold(cand.Name, name) {
-			idx, p = i, cand
-			break
-		}
-	}
+	idx, p := d.indexPersonLocked(repoID, name)
 	if p == nil {
 		return false, nil
 	}
@@ -642,23 +782,40 @@ func (d *DB) RemovePerson(name string) (bool, error) {
 	return true, nil
 }
 
-// SetMeta replaces the optional metadata of the named person (matched
-// case-insensitively). A meta with no content at all is stored as nil so
-// records stay clean. The record copy pattern matters here: the persisted
-// record must carry everything the mirror entry has (thumbnails, metadata),
-// not just the fields this method touches. Returns the updated person
-// (deep copy). Errors: ErrPersonNotFound, or a wrapped persistence failure.
+// SetMeta replaces the optional metadata of the named legacy person
+// (RepoID "", matched case-insensitively). A meta with no content at all is
+// stored as nil so records stay clean. The record copy pattern matters
+// here: the persisted record must carry everything the mirror entry has
+// (thumbnails, metadata), not just the fields this method touches. Returns
+// the updated person (deep copy). Errors: ErrPersonNotFound, or a wrapped
+// persistence failure.
 //
 // Field validation (ranges, URL schemes, sizes) happens in the API layer;
 // the store is deliberately permissive.
 func (d *DB) SetMeta(name string, m *PersonMeta) (*Person, error) {
+	return d.setMetaCore("", name, m)
+}
+
+// SetMetaInRepo replaces the optional metadata of a person inside repository
+// repoID (matched case-insensitively). Behavior matches SetMeta, scoped to
+// the repo's persons. Errors: ErrPersonNotFound, or a wrapped persistence
+// failure.
+func (d *DB) SetMetaInRepo(repoID, name string, m *PersonMeta) (*Person, error) {
+	repoID = normRepoID(repoID)
+	if repoID == "" {
+		return nil, ErrPersonNotFound // repo-scoped accessors never touch legacy persons
+	}
+	return d.setMetaCore(repoID, name, m)
+}
+
+func (d *DB) setMetaCore(repoID, name string, m *PersonMeta) (*Person, error) {
 	m = cloneMeta(m)
 	if m.IsEmpty() {
 		m = nil
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	p := d.findLocked(name)
+	p := d.lookupPersonLocked(repoID, name)
 	if p == nil {
 		return nil, ErrPersonNotFound
 	}
@@ -678,32 +835,65 @@ func (d *DB) ThumbDir() string {
 	return filepath.Join(filepath.Dir(d.path), "thumbs")
 }
 
-// RenamePerson renames a person (oldName matched case-insensitively) and
-// re-derives their ID from the new name, keeping every derived artifact
-// consistent: the thumbnail sidecar file is renamed <newID>.jpg and the
-// person record (with its whole photo set) moves to the new ID inside one
-// bbolt transaction. Photo paths and ThumbSrc are folder-relative basenames,
-// so they are unaffected by a rename. Returns the updated person.
+// RenamePerson renames a legacy person (RepoID ""; oldName matched
+// case-insensitively) and re-derives their ID from the new name, keeping
+// every derived artifact consistent: the thumbnail sidecar file is renamed
+// <newID>.jpg and the person record (with its whole photo set) moves to the
+// new ID inside one bbolt transaction. Photo paths and ThumbSrc are
+// folder-relative basenames, so they are unaffected by a rename. Returns
+// the updated person (deep copy).
 //
-// Errors: ErrPersonNotFound, ErrNameTaken (another person already uses the
-// new name, or the derived ID), or a wrapped filesystem/persistence failure.
+// Errors: ErrPersonNotFound, ErrNameTaken (another legacy person already
+// uses the new name, or the derived ID), or a wrapped filesystem/
+// persistence failure.
 func (d *DB) RenamePerson(oldName, newName string) (*Person, error) {
+	return d.renamePersonCore("", oldName, newName)
+}
+
+// RenamePersonInRepo renames a person of repository repoID (oldName matched
+// case-insensitively) and re-derives their ID from the new name, keeping
+// every derived artifact consistent: the thumbnail sidecar file is renamed
+// <newID>.jpg and the person record (with its whole photo set) moves to the
+// new ID inside one bbolt transaction. Name uniqueness is scoped to the
+// repository — the same name may exist in another repo or in the legacy
+// set — while the derived ID is still checked globally, because bbolt keys
+// photo buckets by ID across all repositories. Photo paths and ThumbSrc are
+// folder-relative basenames, so they are unaffected. Returns the updated
+// person (deep copy).
+//
+// Errors: ErrPersonNotFound, ErrNameTaken, or a wrapped filesystem /
+// persistence failure.
+func (d *DB) RenamePersonInRepo(repoID, oldName, newName string) (*Person, error) {
+	repoID = normRepoID(repoID)
+	if repoID == "" {
+		return nil, ErrPersonNotFound // repo-scoped accessors never touch legacy persons
+	}
+	return d.renamePersonCore(repoID, oldName, newName)
+}
+
+func (d *DB) renamePersonCore(repoID, oldName, newName string) (*Person, error) {
 	newName = strings.TrimSpace(newName)
 	if newName == "" {
 		return nil, errors.New("person name is empty")
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	p := d.findLocked(oldName)
+	p := d.lookupPersonLocked(repoID, oldName)
 	if p == nil {
 		return nil, ErrPersonNotFound
 	}
 	id := newID(newName)
+	if repoID != "" {
+		id = d.NewPersonID(repoID, newName)
+	}
 	for _, cand := range d.data.People {
 		if cand == p {
 			continue
 		}
-		if strings.EqualFold(cand.Name, newName) || cand.ID == id {
+		// Names are unique within a scope (a repo person and a legacy
+		// person may share a name); the derived ID is unique globally,
+		// because bbolt keys photo buckets by ID across all repositories.
+		if cand.ID == id || (cand.RepoID == p.RepoID && strings.EqualFold(cand.Name, newName)) {
 			return nil, fmt.Errorf("%w: %q", ErrNameTaken, newName)
 		}
 	}
@@ -776,8 +966,7 @@ func (d *DB) RenamePerson(oldName, newName string) (*Person, error) {
 		return nil, err
 	}
 	p.ID, p.Name, p.Thumb, p.ThumbSrc = id, newName, thumb, thumbSrc
-	updated := *p
-	return &updated, nil
+	return copyPersonLocked(p), nil
 }
 
 // SetThumbnail stores jpg as the person's face thumbnail sidecar
@@ -863,11 +1052,49 @@ func (d *DB) putPersonLocked(p Person) error {
 	})
 }
 
-// RemovePhoto deletes a single photo from a person.
+// lookupPersonLocked finds the person a mutating call addresses: legacy
+// calls (repoID "") match only legacy persons (RepoID ""), repo-scoped calls
+// only persons of that repo — a legacy enrollment must never touch a repo
+// person's record and vice versa. Names match case-insensitively.
+func (d *DB) lookupPersonLocked(repoID, name string) *Person {
+	idx, p := d.indexPersonLocked(repoID, name)
+	if idx < 0 {
+		return nil
+	}
+	return p
+}
+
+func (d *DB) indexPersonLocked(repoID, name string) (int, *Person) {
+	for i, cand := range d.data.People {
+		if cand.RepoID != repoID {
+			continue
+		}
+		if strings.EqualFold(cand.Name, name) {
+			return i, cand
+		}
+	}
+	return -1, nil
+}
+
+// RemovePhoto deletes a single photo from a legacy person (RepoID "").
 func (d *DB) RemovePhoto(name, relPath string) (bool, error) {
+	return d.removePhotoCore("", name, relPath)
+}
+
+// RemovePhotoInRepo deletes a single photo from a person of repository
+// repoID. Returns whether the photo existed.
+func (d *DB) RemovePhotoInRepo(repoID, name, relPath string) (bool, error) {
+	repoID = normRepoID(repoID)
+	if repoID == "" {
+		return false, nil // repo-scoped accessors never touch legacy persons
+	}
+	return d.removePhotoCore(repoID, name, relPath)
+}
+
+func (d *DB) removePhotoCore(repoID, name, relPath string) (bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	p := d.findLocked(name)
+	p := d.lookupPersonLocked(repoID, name)
 	if p == nil {
 		return false, nil
 	}

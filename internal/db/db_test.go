@@ -435,7 +435,7 @@ func TestExportDefaultPath(t *testing.T) {
 	if err := json.Unmarshal(b, &ff); err != nil {
 		t.Fatalf("exported file is not valid interchange JSON: %v", err)
 	}
-	if ff.Version != 1 || len(ff.People) != 1 {
+	if ff.Version != 2 || len(ff.People) != 1 {
 		t.Errorf("unexpected exported document: %+v", ff)
 	}
 	// Repeated exports must be byte-stable (people name-sorted).

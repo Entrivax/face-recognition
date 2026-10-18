@@ -1,15 +1,16 @@
 // Person details modal.
-// Opens from a click on the people list — for everyone (the details endpoint
-// is public). Shows the person's optional metadata — aliases, partial
+// Opens from a click on the people list — for any viewer (signed-in user or
+// share visitor). Shows the person's optional metadata — aliases, partial
 // birthdate, reference URLs and a markdown description — and hides every
 // field that was never filled; a person with no metadata shows name, photo
 // count and a "no details recorded" hint.
 //
-// Admin extras (rendered only while logged in):
+// Writer extras (rendered only for writer/admin of the person's repo):
 //  - "Edit details" turns the body into an inline form and saves through
 //    POST /api/people/{name}/meta (full-replace semantics);
 //  - "Manage photos" opens the photos-manager modal stacked on top of this
-//    one (the photos grid itself stays admin-only).
+//    one (the photos grid itself stays writer-only).
+// A share visitor gets none of these — the modal is purely read-only.
 
 import { useEffect, useRef, useState } from "preact/hooks";
 import * as api from "../api";
@@ -31,8 +32,10 @@ import { Modal } from "./Modal";
 interface PersonModalProps {
 	/** name of the open person; null = closed */
 	person: string | null;
-	/** logged in? gates the Edit details / Manage photos actions */
-	authed: boolean;
+	/** the repository the person lives in ("" while closed) */
+	repoId: string;
+	/** may edit meta / manage photos? (writer or admin of this repo) */
+	canManage: boolean;
 	/** avatar URL for the open person (from the people-list summary) */
 	thumb: string | null;
 	onCloseRequest: () => void;
@@ -40,6 +43,8 @@ interface PersonModalProps {
 	onManagePhotos: (name: string) => void;
 	/** meta saved → refresh people + health (aliases feed the list search) */
 	onChange: () => void;
+	/** details document arrived (share mode learns repo_name from it) */
+	onDetailLoaded?: (d: PersonDetail) => void;
 }
 
 export function PersonModal(props: PersonModalProps) {
@@ -78,7 +83,7 @@ export function PersonModal(props: PersonModalProps) {
 		setLoadHint("Loading details…");
 		setEditing(false);
 		loadDetail(props.person);
-	}, [props.person]);
+	}, [props.person, props.repoId]);
 
 	// Editing: focus the form's first input.
 	useEffect(() => {
@@ -88,9 +93,10 @@ export function PersonModal(props: PersonModalProps) {
 	// Drop responses for a person the user already left behind.
 	async function loadDetail(name: string) {
 		try {
-			const j = await api.getPerson(name);
+			const j = await api.getPerson(name, props.repoId);
 			if (personRef.current !== name) return;
 			setDetail(j);
+			props.onDetailLoaded?.(j);
 		} catch (e) {
 			if (personRef.current === name) {
 				setLoadHint((e as Error).message || "Could not load the details.");
@@ -163,7 +169,7 @@ export function PersonModal(props: PersonModalProps) {
 			: { year: parts.year ?? null, month: parts.month ?? null, day: parts.day ?? null };
 		setBusy(true);
 		try {
-			const j = await api.setPersonMeta(name, {
+			const j = await api.setPersonMeta(name, props.repoId, {
 				aliases: aliases.map((a) => a.trim()).filter(Boolean),
 				birthdate,
 				urls: urls.map((u) => u.trim()).filter(Boolean),
@@ -187,8 +193,8 @@ export function PersonModal(props: PersonModalProps) {
 
 	// The list row editors themselves are the shared MetaRows component.
 
-	// ---- admin header actions ----
-	const adminActions = props.authed && (
+	// ---- writer-only header actions ----
+	const writerActions = props.canManage && (
 		<>
 			<button type="button" class="btn btn-ghost btn-sm" id="personEditBtn" hidden={editing} onClick={startEdit}>
 				Edit details
@@ -209,7 +215,7 @@ export function PersonModal(props: PersonModalProps) {
 			eyebrow="person"
 			titleId="personTitle"
 			title={detail?.name ?? props.person ?? ""}
-			headerActions={adminActions ?? undefined}
+			headerActions={writerActions ?? undefined}
 			onEscape={onEscape}
 			onCloseRequest={close}
 			body={
@@ -226,7 +232,7 @@ export function PersonModal(props: PersonModalProps) {
 							{!hasMeta && (
 								<p class="field-hint person-empty" id="personEmptyHint">
 									No details recorded for this person.
-									{props.authed ? " Use “Edit details” to add some." : ""}
+									{props.canManage ? " Use “Edit details” to add some." : ""}
 								</p>
 							)}
 

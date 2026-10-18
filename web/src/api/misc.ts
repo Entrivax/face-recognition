@@ -6,22 +6,24 @@ import type {
 	Health,
 	RecognizeResponse,
 } from "../types";
-import { expectJSON, parse } from "./core";
+import { expectJSON, parse, request, withRepoQuery } from "./core";
 
+// Liveness only: {"status":"ok"} — people counts and the threshold moved to
+// /api/config (any signed-in user may read it).
 export async function getHealth(): Promise<Health> {
-	const r = await fetch("/api/health");
+	const r = await request("/api/health");
 	if (!r.ok) throw new Error("bad status");
 	return parse<Health>(r);
 }
 
 export async function getConfig(): Promise<Config> {
-	const r = await fetch("/api/config");
+	const r = await request("/api/config");
 	return expectJSON(r, "could not read config");
 }
 
-// Persist the match threshold server-side (survives restarts).
+// Persist the match threshold server-side (global — admin only).
 export async function setThreshold(value: number): Promise<Config> {
-	const r = await fetch("/api/config", {
+	const r = await request("/api/config", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ threshold: value }),
@@ -29,21 +31,24 @@ export async function setThreshold(value: number): Promise<Config> {
 	return expectJSON(r, "could not set the threshold");
 }
 
-export async function recognize(file: File): Promise<RecognizeResponse> {
+// Recognize every face of an uploaded photo against this repository's
+// people. Allowed for any signed-in user and for share visitors (the token
+// rides the header injected in core).
+export async function recognize(file: File, repoId: string): Promise<RecognizeResponse> {
 	const fd = new FormData();
 	fd.append("image", file, file.name);
-	const r = await fetch("/api/recognize", { method: "POST", body: fd });
+	const r = await request(withRepoQuery("/api/recognize", repoId), { method: "POST", body: fd });
 	return expectJSON(r, "recognition failed");
 }
 
-// Face-to-face comparison of two arbitrary photos (admin): the server embeds
-// the largest face of each and returns their cosine similarity. No identity
-// database involved. 422 (no face in a photo) is thrown like any other error;
-// the message names the offending photo.
+// Face-to-face comparison of two arbitrary photos (any signed-in user): the
+// server embeds the largest face of each and returns their cosine
+// similarity. No identity database involved. 422 (no face in a photo) is
+// thrown like any other error; the message names the offending photo.
 export async function compareFaces(a: File, b: File): Promise<CompareResponse> {
 	const fd = new FormData();
 	fd.append("image1", a, a.name || "photo-a.jpg");
 	fd.append("image2", b, b.name || "photo-b.jpg");
-	const r = await fetch("/api/compare", { method: "POST", body: fd });
+	const r = await request("/api/compare", { method: "POST", body: fd });
 	return expectJSON(r, "comparison failed");
 }

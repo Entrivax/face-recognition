@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         recogn — hover capture
 // @namespace    recogn.hover-capture
-// @version      1.4.0
+// @version      1.5.0
 // @description  Press Alt+R for full-screen capture mode: click any image or video to send its current frame to your local recogn server; recognised faces are drawn over the element until you clear them.
 // @author       recogn
 // @license      MIT
@@ -27,13 +27,13 @@
  * Use: press Alt+R to toggle full-screen capture mode. The shield blocks all
  * clicks to the page; clicking it scans whatever image/video is under the
  * click: the current frame is drawn to a canvas and POSTed to your local
- * recogn server (POST /api/recognize, JPEG body), and every recognised face
- * is drawn over that element with the web UI's corner-bracket style. The
- * hit-test descends into open shadow roots, so media rendered by web
- * components is scanned like any other (closed roots are hidden from script
- * and stay out of reach). The shield stays up for scanning several media in
- * a row; clicking an already-annotated one re-scans it in place (e.g. a
- * fresh video frame).
+ * recogn server (POST /api/recognize?repo=<repoID>, JPEG body), and every
+ * recognised face is drawn over that element with the web UI's
+ * corner-bracket style. The hit-test descends into open shadow roots, so
+ * media rendered by web components is scanned like any other (closed roots
+ * are hidden from script and stay out of reach). The shield stays up for
+ * scanning several media in a row; clicking an already-annotated one
+ * re-scans it in place (e.g. a fresh video frame).
  * While a scan is in flight a pixel shimmer (ported from the repo's
  * shimmer-animation.html demo) blooms over the media being scanned and
  * shrinks away when the pill resolves; prefers-reduced-motion skips it.
@@ -42,13 +42,28 @@
  *   • hover a status pill to expand the detected-people list beneath it
  *   • ✕ on a status pill removes that overlay
  *   • Escape removes all overlays and exits capture mode
- *   • userscript menu: "recogn: set server URL…", "recogn: clear all
- *     overlays", "recogn: toggle capture mode (Alt+R)"
+ *   • userscript menu: server URL, repository ID, API key, share URL, check
+ *     access, clear all overlays, toggle capture mode (Alt+R)
  *
- * The recogn API sets no CORS headers, so pages on other origins need the GM
- * transport (GM_xmlhttpRequest); same-origin pages (e.g. the recogn UI itself
- * at http://127.0.0.1:8080) fall back to plain fetch. Pointing CONFIG.server
- * at a non-local host requires adding an @connect line for it above.
+ * Recognition is per-repository now: every capture POSTs to
+ * /api/recognize?repo=<repoID> (the repository ID is required — captures
+ * stay disabled until it is set) and carries exactly one credential header.
+ * Two modes, mutually exclusive; an API key wins when both are configured:
+ *   • API key (acts as its own user): header "Authorization: Bearer <rk_…>".
+ *     Probed with GET /api/repos, which must list the configured repo ID.
+ *   • Share link (read-only; an admin mints <server>/share/<repoID>/<token>):
+ *     header "X-Share-Token: <repoID>/<token>" and NO Authorization header.
+ *     Captures go to the share's own repo even when another repo ID is set.
+ *     Probed with GET /api/people?repo=<repoID>.
+ * "recogn: check access…" runs the probe on demand (200 = valid, 401 =
+ * credential rejected, 403 = no access to that repo, network errors are
+ * reported too); the first capture of a session runs it once in the
+ * background and caches the result until the settings change. The recogn
+ * API sets no CORS headers, so pages on other origins need the GM transport
+ * (GM_xmlhttpRequest) — plain fetch cannot carry the credential headers
+ * cross-origin; same-origin pages (e.g. the recogn UI itself at
+ * http://127.0.0.1:8080) fall back to fetch. Pointing CONFIG.server at a
+ * non-local host requires adding an @connect line for it above.
  *
  * While capture mode is up the page receives no clicks (native video
  * controls, links, … are blocked) — press Alt+R again to interact with the
@@ -78,15 +93,31 @@
  *      the inner element, and object-fit/crop handling carries over.
  *  11. Typing in a shadow-DOM input: Escape there must not clear overlays
  *      and Alt+R must not toggle capture mode while the field keeps the keys.
+ *  12. Credentials: menu → "recogn: set repository ID…" (a repo UUID —
+ *      required before captures work), then "recogn: set API key…" (rk_…,
+ *      empty clears it) or "recogn: set share URL…" (full
+ *      <server>/share/<repoID>/<token> link or bare <repoID>/<token>; the
+ *      toast shows what was parsed, token masked to its first 8 chars).
+ *  13. "recogn: check access…" toasts the repo name (API-key mode warns when
+ *      the configured repo is not in the key's list) / HTTP 401 credential
+ *      rejected / 403 no access to that repo / network error; the first
+ *      capture of a session auto-runs the probe once and caches it; with no
+ *      usable credential captures fail with a toast pointing at the menu.
  */
 
 (function () {
 	"use strict";
 
-	// Editable defaults. The server URL can also be changed at runtime via the
-	// userscript menu command (persisted with GM.setValue per manager install).
+	// Editable defaults. The server URL and the credentials below can also be
+	// changed at runtime via the userscript menu commands (persisted with
+	// GM.setValue per manager install). repoId "" must be set via the menu
+	// before API-key captures work; share captures use the share's own repo.
 	const CONFIG = {
 		server: "http://127.0.0.1:8080",
+		repoId: "", // repository UUID captures are sent to (required; menu-set)
+		apiKey: "", // "rk_…" API key → Authorization: Bearer (wins over share)
+		shareRepoId: "", // share link's repo UUID (parsed from the pasted URL)
+		shareToken: "", // share link's token → X-Share-Token: <repoId>/<token>
 		hotkey: { key: "r", alt: true, ctrl: false, shift: false, meta: false },
 		maxEdge: 1600, // cap the capture's long edge before upload (the engine letterboxes to 640 anyway)
 		jpegQuality: 0.92,
@@ -180,8 +211,15 @@
 	`;
 
 	let server = CONFIG.server;
+	let repoId = CONFIG.repoId;
+	let apiKey = CONFIG.apiKey;
+	let shareRepoId = CONFIG.shareRepoId;
+	let shareToken = CONFIG.shareToken;
 	let shield = null; // full-screen capture-mode layer, when active
 	const overlays = new Map(); // captured element → HUD state
+	let probeState = null; // session-cached access-probe result (null = not run)
+	let probeInFlight = false;
+	let notedShareMismatch = false; // repo-vs-shareRepoId note fires once per session
 
 	// ---- GM plumbing (each helper degrades gracefully without the API) ----
 
@@ -425,34 +463,162 @@
 	function readRecognResponse(status, text) {
 		let j = null;
 		try { j = JSON.parse(text); } catch (_) { /* non-JSON error body */ }
+		if (status === 401 || status === 403) {
+			// 401 = bad credential, 403 = valid credential without access to
+			// this repository — both are userscript menu settings problems.
+			throw new Error("credential rejected / no access to this repository (HTTP " + status + ")"
+				+ ((j && j.error) ? ": " + j.error : "") + " — check the userscript menu settings");
+		}
 		if (status !== 200) throw new Error((j && j.error) || "recogn returned HTTP " + status);
 		if (!j || !Array.isArray(j.faces)) throw new Error("recogn returned an unexpected response");
 		return j;
 	}
 
+	// True when the recogn server is the page's own origin — the only case
+	// where plain fetch can carry the credential headers (the API sets no
+	// CORS headers, so cross-origin pages always need the GM transport).
+	function sameOrigin(url) {
+		try { return new URL(url).origin === location.origin; } catch (_) { return false; }
+	}
+
+	// Active-credential resolution per the multi-user contract: an API key
+	// wins when configured (it acts as its own user; share fields are
+	// ignored); otherwise a share link authorizes read-only access to
+	// exactly the repo it was minted for. Nothing is sent without one.
+	function resolveCredential() {
+		if (apiKey) {
+			if (!repoId) return null; // ?repo= is required
+			return { mode: "apikey", repoId, headers: { "Authorization": "Bearer " + apiKey } };
+		}
+		if (shareToken && shareRepoId) {
+			if (repoId && repoId !== shareRepoId && !notedShareMismatch) {
+				notedShareMismatch = true;
+				toast("Share link takes precedence: captures go to repo " + shareRepoId
+					+ ", not the configured " + repoId, "info");
+			}
+			return { mode: "share", repoId: shareRepoId, headers: { "X-Share-Token": shareRepoId + "/" + shareToken } };
+		}
+		return null;
+	}
+
+	// Why resolveCredential() came up empty — shown by failed captures and
+	// the "check access" command so the fix is obvious.
+	function credentialHint() {
+		if (apiKey && !repoId) return "an API key is set but no repository ID — use “recogn: set repository ID…” in the userscript menu";
+		if (!apiKey && shareToken && !shareRepoId) return "the share link is incomplete — paste it again via “recogn: set share URL…” in the userscript menu";
+		return "no credential is configured — set an API key or a share URL via the userscript menu";
+	}
+
 	// POST the JPEG bytes directly (the server treats any non-multipart body
 	// as the raw image) — more robust across managers than FormData over GM.
+	// The repository is a required ?repo= query parameter and the credential
+	// rides in its mode's header. The GM transport is preferred (the API sets
+	// no CORS headers, so cross-origin pages cannot use fetch for the
+	// credential headers anyway); fetch only ever runs same-origin.
 	async function recognize(blob) {
-		const url = String(server).replace(/\/+$/, "") + "/api/recognize";
+		const cred = resolveCredential();
+		if (!cred) {
+			const msg = "recogn captures are not authorized: " + credentialHint();
+			toast(msg, "error");
+			throw new Error(msg);
+		}
+		const url = String(server).replace(/\/+$/, "") + "/api/recognize?repo=" + encodeURIComponent(cred.repoId);
 		if (gmHttp()) {
 			try {
 				const res = await gmSend({
 					method: "POST",
 					url,
-					headers: { "Content-Type": "image/jpeg" },
+					headers: Object.assign({ "Content-Type": "image/jpeg" }, cred.headers),
 					data: blob,
 					timeout: CONFIG.requestTimeoutMs,
 				});
 				return readRecognResponse(res.status, res.responseText);
 			} catch (err) { /* network-level failure: fall through to fetch */ }
 		}
+		if (!sameOrigin(url)) {
+			// fetch cannot send the credential header cross-origin — without
+			// the GM transport there is nothing left to try.
+			throw new Error("cannot reach recogn at " + url + " — is the server running (make serve)?"
+				+ " On cross-origin pages the manager must grant GM_xmlhttpRequest (see @connect).");
+		}
 		try {
-			const r = await fetch(url, { method: "POST", headers: { "Content-Type": "image/jpeg" }, body: blob });
+			const r = await fetch(url, { method: "POST", headers: Object.assign({ "Content-Type": "image/jpeg" }, cred.headers), body: blob });
 			return readRecognResponse(r.status, await r.text());
 		} catch (err) {
 			throw new Error("cannot reach recogn at " + url + " — is the server running (make serve)?"
 				+ " On cross-origin pages the manager must grant GM_xmlhttpRequest (see @connect).");
 		}
+	}
+
+	// ---- access probe (credential self-check) ----
+
+	// GET a probe endpoint with the active credential's headers. Same
+	// transport rules as recognize(): GM anywhere, fetch only same-origin.
+	async function probeRequest(url, headers) {
+		const gm = gmHttp();
+		if (gm) {
+			try {
+				const res = await gmSend({ method: "GET", url, headers, timeout: CONFIG.requestTimeoutMs });
+				return { status: res.status, text: res.responseText || "" };
+			} catch (err) {
+				if (!sameOrigin(url)) throw err; // fetch would fail out there too
+			}
+		} else if (!sameOrigin(url)) {
+			throw new Error("cross-origin pages need GM_xmlhttpRequest (see @connect)");
+		}
+		const r = await fetch(url, { method: "GET", headers });
+		return { status: r.status, text: await r.text() };
+	}
+
+	// One credential probe. API keys list their repos (GET /api/repos — the
+	// configured repo ID must appear there) and share links read the repo's
+	// people (GET /api/people?repo=…). 401 = rejected credential, 403 = no
+	// access to that repo, 200 = valid.
+	async function runAccessProbe() {
+		const cred = resolveCredential();
+		if (!cred) return { ok: false, message: credentialHint() };
+		const base = String(server).replace(/\/+$/, "");
+		const url = cred.mode === "apikey"
+			? base + "/api/repos"
+			: base + "/api/people?repo=" + encodeURIComponent(cred.repoId);
+		try {
+			const { status, text } = await probeRequest(url, cred.headers);
+			if (status === 401) return { ok: false, message: "recogn rejected the credential (HTTP 401) — check the userscript menu settings" };
+			if (status === 403) return { ok: false, message: "no access to repository " + cred.repoId + " (HTTP 403) — check the userscript menu settings" };
+			let j = null;
+			try { j = JSON.parse(text); } catch (_) { /* non-JSON body */ }
+			if (status !== 200) return { ok: false, message: (j && j.error) || "recogn returned HTTP " + status };
+			if (cred.mode === "apikey") {
+				const repos = j && Array.isArray(j.repos) ? j.repos : [];
+				const hit = repos.find((r) => r && r.id === cred.repoId);
+				if (!hit) return { ok: false, message: "repository " + cred.repoId + " is not among the " + repos.length + " repo(s) this API key can access" };
+				return { ok: true, message: "API key ok — repository “" + (hit.name || hit.id) + "” is accessible" };
+			}
+			const count = j && typeof j.count === "number" ? j.count : (j && Array.isArray(j.people) ? j.people.length : 0);
+			return { ok: true, message: "share link ok — repository " + cred.repoId + " is accessible (" + count + " people)" };
+		} catch (err) {
+			return { ok: false, message: "network error reaching " + server + " — " + (err && err.message ? err.message : "request failed") };
+		}
+	}
+
+	// Before the first capture of a session, probe once in the background and
+	// cache the result (settings changes reset it) — captures never re-probe.
+	function ensureAccessProbed() {
+		if (probeState || probeInFlight || !resolveCredential()) return;
+		probeInFlight = true;
+		(async () => {
+			try {
+				probeState = await runAccessProbe();
+				toast(probeState.message, probeState.ok ? "info" : "error");
+			} finally { probeInFlight = false; }
+		})();
+	}
+
+	// Menu command: re-run the probe on demand (and refresh the cache).
+	async function checkAccess() {
+		const res = await runAccessProbe();
+		probeState = res;
+		toast(res.message, res.ok ? "info" : "error");
 	}
 
 	// ---- geometry: where does the media actually paint? ----
@@ -960,6 +1126,7 @@
 	// ---- orchestration ----
 
 	async function captureAt(x, y) {
+		ensureAccessProbed(); // first capture of a session: credential self-check (cached)
 		const target = findTarget(x, y);
 		if (!target) {
 			toast("No image or video under the cursor", "info");
@@ -1023,11 +1190,89 @@
 		toast("recogn server set to " + v, "info");
 	}
 
+	// ---- credential menu commands ----
+
+	function setRepoId() {
+		const next = window.prompt("recogn repository ID (UUID) captures are sent to", repoId);
+		if (next == null) return;
+		const v = next.trim();
+		if (!v) {
+			toast("Repository ID must not be empty — captures need it (?repo=)", "error");
+			return;
+		}
+		repoId = v;
+		notedShareMismatch = false;
+		probeState = null; // re-probe under the new setting
+		gmSet("repoId", v);
+		toast("recogn repository set to " + v, "info");
+	}
+
+	function setApiKey() {
+		const next = window.prompt("recogn API key (rk_…; empty clears it — a configured share link takes over)", apiKey);
+		if (next == null) return;
+		const v = next.trim().replace(/^bearer\s+/i, ""); // tolerate a pasted "Bearer " prefix
+		apiKey = v;
+		probeState = null; // re-probe under the new setting
+		gmSet("apiKey", v);
+		if (!v) toast("API key cleared" + (shareToken ? " — the share link takes over" : ""), "info");
+		else if (!/^rk_/.test(v)) toast("API key set (note: recogn API keys start with rk_)", "info");
+		else toast("API key set — it wins over a configured share link", "info");
+	}
+
+	// "…/share/<repoID>/<token>" → { repoId, token }; a bare
+	// "<repoID>/<token>" pair is accepted too.
+	function parseShareRef(v) {
+		const s = String(v || "").trim().split("#")[0].split("?")[0];
+		const inUrl = /\/share\/([^/?#]+)\/([^/?#]+)\/?$/.exec(s);
+		if (inUrl) return { repoId: inUrl[1], token: inUrl[2] };
+		const bare = /^([^/?#]+)\/([^/?#]+)\/?$/.exec(s);
+		if (bare) return { repoId: bare[1], token: bare[2] };
+		return null;
+	}
+
+	function maskToken(token) {
+		return token.length > 8 ? token.slice(0, 8) + "…" : token;
+	}
+
+	function setShareURL() {
+		const current = shareRepoId && shareToken ? shareRepoId + "/" + shareToken : "";
+		const next = window.prompt("recogn share link (<server>/share/<repoID>/<token>) or bare <repoID>/<token>; empty clears it", current);
+		if (next == null) return;
+		const v = next.trim();
+		if (!v) {
+			shareRepoId = "";
+			shareToken = "";
+			notedShareMismatch = false;
+			probeState = null; // re-probe under the new setting
+			gmSet("shareRepoId", "");
+			gmSet("shareToken", "");
+			toast("Share link cleared" + (apiKey ? "" : " — no credential is configured now"), "info");
+			return;
+		}
+		const parsed = parseShareRef(v);
+		if (!parsed) {
+			toast("Could not parse <repoID>/<token> out of that — paste the full share URL", "error");
+			return;
+		}
+		shareRepoId = parsed.repoId;
+		shareToken = parsed.token;
+		notedShareMismatch = false;
+		probeState = null; // re-probe under the new setting
+		gmSet("shareRepoId", parsed.repoId);
+		gmSet("shareToken", parsed.token);
+		toast("Share link set — repo " + parsed.repoId + ", token " + maskToken(parsed.token)
+			+ (apiKey ? " (ignored while an API key is set)" : ""), "info");
+	}
+
 	function registerMenu() {
 		const fn = (typeof GM_registerMenuCommand === "function" && GM_registerMenuCommand)
 			|| (typeof GM !== "undefined" && GM && typeof GM.registerMenuCommand === "function" && GM.registerMenuCommand.bind(GM));
 		if (!fn) return;
 		fn("recogn: set server URL…", setServerURL);
+		fn("recogn: set repository ID…", setRepoId);
+		fn("recogn: set API key…", setApiKey);
+		fn("recogn: set share URL…", setShareURL);
+		fn("recogn: check access…", checkAccess);
 		fn("recogn: clear all overlays", clearAllOverlays);
 		fn("recogn: toggle capture mode (Alt+R)", toggleShield);
 	}
@@ -1049,9 +1294,15 @@
 		host.__recognHoverCaptureLoaded = true;
 
 		try {
-			const saved = await gmGet("server");
-			if (saved) server = String(saved);
-		} catch (_) { /* keep default */ }
+			const [savedServer, savedRepo, savedKey, savedShareRepo, savedShareToken] = await Promise.all([
+				gmGet("server"), gmGet("repoId"), gmGet("apiKey"), gmGet("shareRepoId"), gmGet("shareToken"),
+			]);
+			if (savedServer) server = String(savedServer);
+			if (savedRepo) repoId = String(savedRepo);
+			if (savedKey) apiKey = String(savedKey);
+			if (savedShareRepo) shareRepoId = String(savedShareRepo);
+			if (savedShareToken) shareToken = String(savedShareToken);
+		} catch (_) { /* keep defaults */ }
 
 		injectStyles();
 		window.addEventListener("keydown", onKeyDown, true);

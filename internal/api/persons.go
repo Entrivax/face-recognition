@@ -14,19 +14,29 @@ import (
 	"recogn/internal/enroll"
 )
 
-func (s *Server) handleDeletePerson(w http.ResponseWriter, r *http.Request, name string) {
+// handleDeletePerson removes one person of the repository: the DB record
+// (repo-scoped, so the same name in another repo survives) and their
+// thumbnail sidecar, then deletes the person's dataset folder
+// people/<repoID>/<Name> best-effort — otherwise the next rescan would
+// silently re-enroll the deleted person ("resurrection"). The response
+// reports "folder_removed" (false when the folder couldn't be removed).
+func (s *Server) handleDeletePerson(w http.ResponseWriter, r *http.Request, name, repoID string) {
+	if r.Method != http.MethodDelete {
+		writeErr(w, http.StatusMethodNotAllowed, "DELETE required")
+		return
+	}
 	if err := enroll.CheckName(name); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	p := s.db.Get(name)
+	p := s.db.GetInRepo(repoID, name)
 	if p == nil {
 		writeErr(w, http.StatusNotFound, "person not found")
 		return
 	}
 	// Capture the canonical name before the record is gone.
-	dir := filepath.Join(s.cfg.PeopleDir, p.Name)
-	removed, err := s.db.RemovePerson(name)
+	dir := personFolder(s.cfg.PeopleDir, p)
+	removed, err := s.db.RemovePersonInRepo(repoID, name)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -50,11 +60,12 @@ func (s *Server) handleDeletePerson(w http.ResponseWriter, r *http.Request, name
 	})
 }
 
-// handleRenamePerson renames a person end-to-end: the people/<Name> dataset
-// folder, the derived person ID, the thumbnail sidecar file, and the DB
-// record. Body: {"name": "<new name>"}. The folder is moved first; a DB
-// failure rolls it back so the dataset never drifts from the database.
-func (s *Server) handleRenamePerson(w http.ResponseWriter, r *http.Request, oldName string) {
+// handleRenamePerson renames a person of the repository end-to-end: the
+// people/<repoID>/<Name> dataset folder, the derived person ID, the
+// thumbnail sidecar file, and the DB record. Body: {"name": "<new name>"}.
+// The folder is moved first; a DB failure rolls it back so the dataset
+// never drifts from the database.
+func (s *Server) handleRenamePerson(w http.ResponseWriter, r *http.Request, oldName, repoID string) {
 	if r.Method != http.MethodPost {
 		writeErr(w, http.StatusMethodNotAllowed, "POST required")
 		return
@@ -76,17 +87,17 @@ func (s *Server) handleRenamePerson(w http.ResponseWriter, r *http.Request, oldN
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	p := s.db.Get(oldName)
+	p := s.db.GetInRepo(repoID, oldName)
 	if p == nil {
 		writeErr(w, http.StatusNotFound, "person not found")
 		return
 	}
-	oldCanonical := p.Name // db.Get returns a copy; use the canonical name for the folder
+	oldCanonical := p.Name // the repo lookup returns a copy; use the canonical name for the folder
 	if newName == oldCanonical {
 		writeErr(w, http.StatusBadRequest, "new name is unchanged")
 		return
 	}
-	if other := s.db.Get(newName); other != nil && other.ID != p.ID {
+	if other := s.db.GetInRepo(repoID, newName); other != nil && other.ID != p.ID {
 		writeErr(w, http.StatusConflict, fmt.Sprintf("a person named %q is already enrolled", newName))
 		return
 	}
@@ -95,8 +106,8 @@ func (s *Server) handleRenamePerson(w http.ResponseWriter, r *http.Request, oldN
 	// filesystems), while os.SameFile keeps case-only renames working on
 	// case-insensitive ones. A missing old folder (person without a dataset
 	// folder) is fine — only the DB changes then.
-	oldDir := filepath.Join(s.cfg.PeopleDir, oldCanonical)
-	newDir := filepath.Join(s.cfg.PeopleDir, newName)
+	oldDir := personFolder(s.cfg.PeopleDir, p)
+	newDir := filepath.Join(s.cfg.PeopleDir, repoID, newName)
 	folderMoved := false
 	if oldFi, err := os.Stat(oldDir); err == nil {
 		if newFi, err2 := os.Stat(newDir); err2 == nil && !os.SameFile(oldFi, newFi) {
@@ -109,7 +120,7 @@ func (s *Server) handleRenamePerson(w http.ResponseWriter, r *http.Request, oldN
 		}
 		folderMoved = true
 	}
-	upd, err := s.db.RenamePerson(oldCanonical, newName)
+	upd, err := s.db.RenamePersonInRepo(repoID, oldCanonical, newName)
 	if err != nil {
 		if folderMoved { // keep dataset and DB consistent
 			_ = os.Rename(newDir, oldDir)

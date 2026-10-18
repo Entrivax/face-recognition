@@ -156,9 +156,9 @@ func (b *birthReq) normalize() (*db.BirthDate, error) {
 // handleSetMeta replaces a person's metadata (full-replace semantics): body
 // {"aliases": [...], "birthdate": {"year","month","day"}, "urls": [...],
 // "description": "..."} — omitted or empty fields clear the stored value.
-// The reply is the refreshed public details document. Metadata does not
-// affect recognition, so no engine reload happens.
-func (s *Server) handleSetMeta(w http.ResponseWriter, r *http.Request, name string) {
+// The reply is the refreshed reader-visible details document. Metadata does
+// not affect recognition, so no engine reload happens.
+func (s *Server) handleSetMeta(w http.ResponseWriter, r *http.Request, name, repoID string) {
 	if r.Method != http.MethodPost {
 		writeErr(w, http.StatusMethodNotAllowed, "POST required")
 		return
@@ -178,12 +178,12 @@ func (s *Server) handleSetMeta(w http.ResponseWriter, r *http.Request, name stri
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	p := s.db.Get(name)
+	p := s.db.GetInRepo(repoID, name)
 	if p == nil {
 		writeErr(w, http.StatusNotFound, "person not found")
 		return
 	}
-	upd, err := s.db.SetMeta(p.Name, meta)
+	upd, err := s.db.SetMetaInRepo(repoID, p.Name, meta)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

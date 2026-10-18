@@ -1,33 +1,43 @@
-// API data-transfer types, mirroring the JSON shapes internal/api/api.go emits.
+// API data-transfer types, mirroring the JSON shapes the server emits.
+//
+// The app is multi-user: a session names a user (with an admin flag), the
+// face data lives in repositories (per-repo datasets of people), and the
+// admin surface manages users, per-repo grants and personal API keys. Auth
+// is a password login via the HttpOnly recogn_session cookie; a share link
+// (repoID + token) grants read-only access without any session.
 
+// ---- auth / boot ----
+
+/** GET /api/health — liveness only ({"status":"ok"}). */
 export interface Health {
 	status: string;
-	people: number;
-	threshold: number;
-	/** which admin-login methods the server has configured (absent = open mode) */
-	auth?: AuthMethods;
 }
 
-/** Which admin-login methods the server has configured. */
-export interface AuthMethods {
-	password: boolean;
-	passkey: boolean;
+/** The signed-in user (GET /api/auth/session, POST /api/login). */
+export interface SessionUser {
+	name: string;
+	admin: boolean;
 }
 
-/** GET /api/auth/session — session state of this browser. */
+/** GET /api/auth/session — this browser's session state. */
 export interface SessionInfo {
 	authenticated: boolean;
-	methods: AuthMethods;
+	user: SessionUser | null;
+	/** true on a fresh deployment: the administrator account still has to be created */
+	setup_required: boolean;
 }
 
-/** One passkey credential registered on the server (GET /api/auth/passkeys). */
-export interface PasskeyInfo {
-	id: string; // base64url credential ID
-	added_at: string; // RFC3339
+/** POST /api/setup body — first-run administrator creation. */
+export interface SetupBody {
+	key: string;
+	username: string;
+	password: string;
 }
 
-export interface PasskeysResponse {
-	passkeys: PasskeyInfo[];
+/** POST /api/login reply. */
+export interface LoginResponse {
+	ok: boolean;
+	user: SessionUser;
 }
 
 /** {"ok":true} replies from the auth endpoints. */
@@ -35,9 +45,109 @@ export interface OkResponse {
 	ok: boolean;
 }
 
+// ---- repositories ----
+
+/** A viewer's role within one repository. */
+export type RepoRole = "reader" | "writer" | "admin";
+
+/** One repository in GET /api/repos (admin sees every repo; users see their grants). */
+export interface RepoInfo {
+	id: string;
+	name: string;
+	people: number;
+	/** the admin's share link is enabled (visible on admin listings only) */
+	shared: boolean;
+	/** this viewer's role in the repository */
+	role: RepoRole;
+}
+
+export interface ReposResponse {
+	repos: RepoInfo[];
+}
+
+/** POST /api/repos reply. */
+export interface CreateRepoResponse {
+	id: string;
+	name: string;
+	people: number;
+}
+
+/** POST /api/repos/{id}/rename reply. */
+export interface RenameRepoResponse {
+	id: string;
+	name: string;
+}
+
+/** DELETE /api/repos/{id} reply — destructive (removes the dataset folder + people). */
+export interface DeleteRepoResponse {
+	ok: boolean;
+	removed: string;
+	people_removed: number;
+	folder_removed: boolean;
+}
+
+/** GET/POST /api/repos/{id}/share reply — share_url of the current link (null while unshared; POST-enable always mints a fresh one). */
+export interface ShareRepoResponse {
+	id: string;
+	shared: boolean;
+	share_url: string | null;
+}
+
+// ---- users (admin) ----
+
+/** A grant role for repo access ("admin" is never grantable). */
+export type GrantRole = "reader" | "writer";
+
+/** One repo grant of a user. */
+export interface UserGrant {
+	repo_id: string;
+	role: RepoRole;
+}
+
+/** One user in GET /api/users. */
+export interface UserInfo {
+	username: string;
+	admin: boolean;
+	grants: UserGrant[];
+	created_at: string;
+}
+
+export interface UsersResponse {
+	users: UserInfo[];
+}
+
+/** POST /api/users/{u}/repos body — FULL-REPLACE of that user's grants. */
+export interface GrantBody {
+	repo: string; // repo id
+	role: GrantRole;
+}
+
+// ---- API keys (any signed-in user, own keys only) ----
+
+/** One API key in GET /api/auth/keys — the full token is never listed again. */
+export interface ApiKeyInfo {
+	id: string;
+	name: string;
+	prefix: string;
+	created_at: string;
+}
+
+export interface KeysResponse {
+	keys: ApiKeyInfo[];
+}
+
+/** POST /api/auth/keys reply — carries the full rk_… token exactly once. */
+export interface ApiKeyResponse extends ApiKeyInfo {
+	token: string;
+}
+
+// ---- config ----
+
 export interface Config {
 	threshold: number;
 }
+
+// ---- people (repo-scoped) ----
 
 export interface PersonSummary {
 	id: string;
@@ -52,6 +162,7 @@ export interface PersonSummary {
 export interface PeopleResponse {
 	people: PersonSummary[];
 	count: number;
+	repo: string;
 }
 
 export interface PersonPhoto {
@@ -74,18 +185,21 @@ export interface PersonMeta {
 	description?: string;
 }
 
-/** GET /api/people/{name} — public details view (no enrolled photo paths). */
+/** GET /api/people/{name}?repo= — details view (no enrolled photo paths). */
 export interface PersonDetail {
 	id: string;
 	name: string;
 	photos: number;
+	/** the repository the person lives in */
+	repo: string;
+	repo_name: string;
 	aliases?: string[];
 	birthdate?: BirthDate;
 	urls?: string[];
 	description?: string;
 }
 
-/** GET /api/people/{name}/photos — admin photos-manager payload. */
+/** GET /api/people/{name}/photos?repo= — writer-only photos-manager payload. */
 export interface PersonPhotosResponse {
 	id: string;
 	name: string;
@@ -100,6 +214,8 @@ export interface MetaUpdate {
 	urls?: string[];
 	description?: string;
 }
+
+// ---- recognition ----
 
 export interface Match {
 	person_id: string;
@@ -200,70 +316,4 @@ export interface CheckView {
 	src: string;
 	title: string;
 	faces: Face[] | null;
-}
-
-// ---- WebAuthn wire types ----
-// The passkey endpoints speak JSON with base64url-encoded buffers, so the
-// server's PublicKeyCredential{Creation,Request}Options can't be fed to
-// navigator.credentials directly — webauthnClient.ts decodes them into the
-// DOM types (preferred wherever the DOM lib suffices). These mirror the
-// serialized options and credentials exchanged with the server.
-
-/** Wrapper the begin endpoints return: { "publicKey": {...} }. */
-export interface CredentialRequestOptionsJSON {
-	publicKey: PublicKeyCredentialRequestOptionsJSON;
-}
-
-export interface CredentialCreationOptionsJSON {
-	publicKey: PublicKeyCredentialCreationOptionsJSON;
-}
-
-export interface PublicKeyCredentialRequestOptionsJSON {
-	challenge: string; // base64url
-	rpId?: string;
-	timeout?: number;
-	userVerification?: string;
-	allowCredentials?: PublicKeyCredentialDescriptorJSON[];
-}
-
-export interface PublicKeyCredentialCreationOptionsJSON {
-	challenge: string; // base64url
-	rp: { id?: string; name: string };
-	user: { id: string; name: string; displayName: string }; // id base64url
-	pubKeyCredParams: { type: string; alg: number }[];
-	timeout?: number;
-	excludeCredentials?: PublicKeyCredentialDescriptorJSON[];
-	authenticatorSelection?: {
-		authenticatorAttachment?: string;
-		requireResidentKey?: boolean;
-		residentKey?: string;
-		userVerification?: string;
-	};
-	attestation?: string;
-}
-
-export interface PublicKeyCredentialDescriptorJSON {
-	type: string;
-	id: string; // base64url
-	transports?: string[];
-}
-
-/** A PublicKeyCredential assertion/attestation serialized to JSON. */
-export interface PublicKeyCredentialJSON {
-	id: string;
-	rawId: string; // base64url
-	type: string;
-	response: {
-		clientDataJSON: string; // base64url
-		// assertion fields
-		authenticatorData?: string; // base64url
-		signature?: string; // base64url
-		userHandle?: string; // base64url
-		// attestation fields
-		attestationObject?: string; // base64url
-		authData?: string; // base64url
-		transports?: string[];
-		publicKeyAlgorithm?: number;
-		publicKey?: string; // base64url SubjectPublicKeyInfo
-	};
 }

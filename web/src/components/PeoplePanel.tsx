@@ -1,9 +1,10 @@
 // Right panel: the enrolled-people list (with search filter), the match
-// threshold slider, the enroll entry point, and the people-folder rescan.
-// The gallery itself is public (the list endpoint is): clicking a person —
-// logged in or not — opens the person details modal. The threshold, rescan,
-// enroll, remove and open-photos controls are admin-only and only render
-// while logged in. The filter matches names and aliases; when only an alias
+// threshold, and the role-gated actions. Every viewer (including a share
+// visitor) may browse the list and open a person's details; what else is
+// offered follows the viewer's role in the selected repository — writers and
+// admins get enroll/rescan/remove, admins get the threshold slider (readers
+// see the current value as read-only text), compare is open to any
+// signed-in user. The filter matches names and aliases; when only an alias
 // matched, the row shows that alias ("aka") so the hit explains itself.
 
 import { useEffect, useState } from "preact/hooks";
@@ -12,13 +13,22 @@ import type { PersonSummary } from "../types";
 import { Avatar } from "./Avatar";
 import { foldText } from "../util";
 
+/** What the viewer (signed-in user or share visitor) may do in this repo. */
+export interface Perms {
+	/** a signed-in user (false for share visitors) */
+	user: boolean;
+	/** may enroll/modify people in the selected repo (writer or admin) */
+	writer: boolean;
+	/** server administrator */
+	admin: boolean;
+}
+
 interface PeoplePanelProps {
-	/** logged in? gates the admin-only controls (list itself is public) */
-	authed: boolean;
+	perms: Perms;
 	people: PersonSummary[];
 	peopleErr: boolean;
-	/** server-persisted threshold (mirrored by the slider) */
-	threshold: number;
+	/** server-persisted threshold; null = unknown (share mode) → row hidden */
+	threshold: number | null;
 	onThresholdCommit: (v: number) => void;
 	onRescan: () => Promise<void>;
 	onOpenPerson: (name: string) => void;
@@ -29,23 +39,26 @@ interface PeoplePanelProps {
 
 export function PeoplePanel(props: PeoplePanelProps) {
 	const {
-		authed,
-		people, peopleErr, threshold, onRescan,
+		perms,
+		people, peopleErr, threshold,
+		onThresholdCommit, onRescan,
 		onOpenPerson, onRemove,
 	} = props;
 
 	const [query, setQuery] = useState("");
-	const [slider, setSlider] = useState(() => Number(threshold).toFixed(2));
+	const [slider, setSlider] = useState(() => threshold === null ? "0.45" : Number(threshold).toFixed(2));
 	const [rescanning, setRescanning] = useState(false);
 
 	// Mirror the server's persisted threshold into the slider.
-	useEffect(() => setSlider(Number(threshold).toFixed(2)), [threshold]);
+	useEffect(() => {
+		if (threshold !== null) setSlider(Number(threshold).toFixed(2));
+	}, [threshold]);
 
 	const count = people.length;
 	const countText = peopleErr
 		? "Could not load people."
 		: count
-			? `${count} ${count === 1 ? "person" : "people"} in the database`
+			? `${count} ${count === 1 ? "person" : "people"} in this repository`
 			: "No one enrolled yet.";
 
 	// Case- and diacritics-insensitive substring filter across names and
@@ -80,7 +93,7 @@ export function PeoplePanel(props: PeoplePanelProps) {
 				<p class="lede" id="peopleCount">{countText}</p>
 			</div>
 
-			{authed && (
+			{perms.admin && threshold !== null && (
 				<div class="threshold-row">
 					<label
 						class="threshold-label"
@@ -98,20 +111,33 @@ export function PeoplePanel(props: PeoplePanelProps) {
 						value={slider}
 						aria-label="Match threshold"
 						onInput={slideInput}
-						onChange={() => props.onThresholdCommit(Number(slider))}
+						onChange={() => onThresholdCommit(Number(slider))}
 					/>
 					<span class="threshold-value" id="thresholdValue">{Number(slider).toFixed(2)}</span>
 				</div>
 			)}
+			{!perms.admin && threshold !== null && (
+				<div
+					class="threshold-row"
+					title={perms.user ? "Only administrators can change the match threshold" : undefined}
+				>
+					<span class="threshold-label">Threshold</span>
+					<span class="threshold-static">{Number(threshold).toFixed(2)}</span>
+				</div>
+			)}
 
-			{authed && (
+			{(perms.writer || perms.user) && (
 				<div class="people-actions">
-					<button id="enrollBtn" class="btn btn-accent" aria-haspopup="dialog" onClick={props.onEnrollClick}>
-						Enroll new person
-					</button>
-					<button id="compareBtn" class="btn" aria-haspopup="dialog" onClick={props.onCompareClick}>
-						Compare two photos
-					</button>
+					{perms.writer && (
+						<button id="enrollBtn" class="btn btn-accent" aria-haspopup="dialog" onClick={props.onEnrollClick}>
+							Enroll new person
+						</button>
+					)}
+					{perms.user && (
+						<button id="compareBtn" class="btn" aria-haspopup="dialog" onClick={props.onCompareClick}>
+							Compare two photos
+						</button>
+					)}
 				</div>
 			)}
 
@@ -130,17 +156,24 @@ export function PeoplePanel(props: PeoplePanelProps) {
 
 			<ul id="peopleList" class="people-list">
 				{filtered.map(({ p, aka }) => (
-					<PersonRow key={p.id} person={p} aka={aka} authed={authed} onOpen={onOpenPerson} onRemove={onRemove} />
+					<PersonRow
+						key={p.id}
+						person={p}
+						aka={aka}
+						canRemove={perms.writer}
+						onOpen={onOpenPerson}
+						onRemove={onRemove}
+					/>
 				))}
 				{noMatch && <li class="people-nomatch">No people match “{query.trim()}”.</li>}
 			</ul>
 
-			{authed && (
+			{perms.writer && (
 				<div class="people-footer">
 					<button
 						id="rescanBtn"
 						class="btn btn-ghost"
-						title="Re-scan the people/ folder on the server"
+						title="Re-scan this repository's dataset folder on the server"
 						disabled={rescanning}
 						onClick={doRescan}
 					>
@@ -170,13 +203,14 @@ function PersonRow(props: {
 	person: PersonSummary;
 	/** matching alias, when the query hit an alias but not the name */
 	aka: string | null;
-	authed: boolean;
+	/** may remove people from this repo (writer or admin) */
+	canRemove: boolean;
 	onOpen: (name: string) => void;
 	onRemove: (name: string) => void;
 }) {
 	const p = props.person;
-	// Every row opens the (public) person details modal; the remove button
-	// stays admin-only.
+	// Every row opens the person details modal; the remove button stays
+	// writer/admin-only.
 	return (
 		<li class="person-row">
 			<button
@@ -199,7 +233,7 @@ function PersonRow(props: {
 				<span class="person-count">{p.photos} photo(s)</span>
 				{props.aka && <span class="person-aka">aka {props.aka}</span>}
 			</button>
-			{props.authed && (
+			{props.canRemove && (
 				<button
 					class="person-del"
 					title={`Remove ${p.name}`}

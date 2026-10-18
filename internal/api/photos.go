@@ -12,10 +12,23 @@ import (
 	"recogn/internal/enroll"
 )
 
+// personFolder is a person's dataset folder under the people root:
+// people/<RepoID>/<Name> for a repo person, people/<Name> for a legacy one
+// (RepoID "" — only reachable through the admin thumb route, never through
+// the repo-scoped person routes).
+func personFolder(peopleDir string, p *db.Person) string {
+	if p.RepoID == "" {
+		return filepath.Join(peopleDir, p.Name)
+	}
+	return filepath.Join(peopleDir, p.RepoID, p.Name)
+}
+
 // handlePersonPhoto serves one of a person's enrolled photo files from the
-// people folder, for the thumbnail chooser modal. The requested path must be
-// one of the person's enrolled photos and resolve inside their folder.
-func (s *Server) handlePersonPhoto(w http.ResponseWriter, r *http.Request, name, photoPath string) {
+// repository's dataset folder (writer-only: full-resolution enrolled
+// photos are the writers' tooling; readers get the thumbnail and the
+// detect view). The requested path must be one of the person's enrolled
+// photos and resolve inside their folder.
+func (s *Server) handlePersonPhoto(w http.ResponseWriter, r *http.Request, name, repoID, photoPath string) {
 	if r.Method != http.MethodGet {
 		writeErr(w, http.StatusMethodNotAllowed, "GET required")
 		return
@@ -24,7 +37,7 @@ func (s *Server) handlePersonPhoto(w http.ResponseWriter, r *http.Request, name,
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	p := s.db.Get(name)
+	p := s.db.GetInRepo(repoID, name)
 	if p == nil {
 		writeErr(w, http.StatusNotFound, "person not found")
 		return
@@ -38,9 +51,10 @@ func (s *Server) handlePersonPhoto(w http.ResponseWriter, r *http.Request, name,
 }
 
 // handlePersonPhotoDetect runs recognition on one of a person's enrolled
-// photos and returns the detected faces (with identity matches), so the UI
-// can draw them over the image and the user can judge the photo's quality.
-func (s *Server) handlePersonPhotoDetect(w http.ResponseWriter, r *http.Request, name, photoPath string) {
+// photos and returns the detected faces (with identity matches, scoped to
+// the person's repository), so the UI can draw them over the image and the
+// user can judge the photo's quality. Reader+ (share tokens included).
+func (s *Server) handlePersonPhotoDetect(w http.ResponseWriter, r *http.Request, name, repoID, photoPath string) {
 	if r.Method != http.MethodGet {
 		writeErr(w, http.StatusMethodNotAllowed, "GET required")
 		return
@@ -49,7 +63,7 @@ func (s *Server) handlePersonPhotoDetect(w http.ResponseWriter, r *http.Request,
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	p := s.db.Get(name)
+	p := s.db.GetInRepo(repoID, name)
 	if p == nil {
 		writeErr(w, http.StatusNotFound, "person not found")
 		return
@@ -64,7 +78,8 @@ func (s *Server) handlePersonPhotoDetect(w http.ResponseWriter, r *http.Request,
 		writeErr(w, http.StatusNotFound, "photo file is missing from the people folder")
 		return
 	}
-	faces, err := s.eng.Recognize(b)
+	allowed := s.repoAllowedSet(repoID)
+	faces, err := s.eng.RecognizeScoped(b, allowed)
 	if err != nil {
 		writeErr(w, engineErrStatus(err), "recognition failed: "+err.Error())
 		return
@@ -79,11 +94,12 @@ func (s *Server) handlePersonPhotoDetect(w http.ResponseWriter, r *http.Request,
 	})
 }
 
-// handleDeletePhoto removes one photo from a person: the DB entry and, when
-// present, the image file in the people folder. If the deleted photo was the
-// thumbnail source, the avatar is regenerated from another photo (or cleared
-// when none remain). Body-less; photo path comes from the URL.
-func (s *Server) handleDeletePhoto(w http.ResponseWriter, r *http.Request, name, photoPath string) {
+// handleDeletePhoto removes one photo from a person of the repository: the
+// DB entry (repo-scoped mutator) and, when present, the image file in the
+// person's folder. If the deleted photo was the thumbnail source, the
+// avatar is regenerated from another photo (or cleared when none remain).
+// Body-less; photo path comes from the URL.
+func (s *Server) handleDeletePhoto(w http.ResponseWriter, r *http.Request, name, repoID, photoPath string) {
 	if r.Method != http.MethodDelete {
 		writeErr(w, http.StatusMethodNotAllowed, "DELETE required")
 		return
@@ -92,7 +108,7 @@ func (s *Server) handleDeletePhoto(w http.ResponseWriter, r *http.Request, name,
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	p := s.db.Get(name)
+	p := s.db.GetInRepo(repoID, name)
 	if p == nil {
 		writeErr(w, http.StatusNotFound, "person not found")
 		return
@@ -102,7 +118,7 @@ func (s *Server) handleDeletePhoto(w http.ResponseWriter, r *http.Request, name,
 		writeErr(w, http.StatusNotFound, "photo not found")
 		return
 	}
-	removed, err := s.db.RemovePhoto(name, photoPath)
+	removed, err := s.db.RemovePhotoInRepo(repoID, name, photoPath)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -115,7 +131,7 @@ func (s *Server) handleDeletePhoto(w http.ResponseWriter, r *http.Request, name,
 	_ = os.Remove(full)
 	s.regenerateThumbAfterDelete(p, photoPath)
 	s.reload()
-	remaining := s.db.Get(name)
+	remaining := s.db.GetInRepo(repoID, name)
 	count := 0
 	if remaining != nil {
 		count = len(remaining.Photos)
@@ -129,7 +145,10 @@ func (s *Server) handleDeletePhoto(w http.ResponseWriter, r *http.Request, name,
 // regenerateThumbAfterDelete repairs the thumbnail sidecar when the deleted
 // photo was its source: the next remaining photo that still detects a face
 // becomes the new source; when none does (or no photos remain), the
-// thumbnail is cleared. Best-effort throughout — never fails the delete.
+// thumbnail is cleared. Repo-aware: the person (from GetInRepo) carries
+// RepoID, so personPhotoPath resolves inside the right dataset folder and
+// the sidecar write stays ID-keyed. Best-effort throughout — never fails
+// the delete.
 func (s *Server) regenerateThumbAfterDelete(p *db.Person, deletedPhoto string) {
 	if p.ThumbSrc != deletedPhoto {
 		return // thumbnail not based on the removed photo
@@ -161,7 +180,7 @@ func (s *Server) regenerateThumbAfterDelete(p *db.Person, deletedPhoto string) {
 
 // handleSelectThumb regenerates a person's face thumbnail from one of their
 // enrolled photos, chosen via the UI's thumbnail modal. Body: {"photo": path}.
-func (s *Server) handleSelectThumb(w http.ResponseWriter, r *http.Request, name string) {
+func (s *Server) handleSelectThumb(w http.ResponseWriter, r *http.Request, name, repoID string) {
 	if r.Method != http.MethodPost {
 		writeErr(w, http.StatusMethodNotAllowed, "POST required")
 		return
@@ -178,7 +197,7 @@ func (s *Server) handleSelectThumb(w http.ResponseWriter, r *http.Request, name 
 		writeErr(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	p := s.db.Get(name)
+	p := s.db.GetInRepo(repoID, name)
 	if p == nil {
 		writeErr(w, http.StatusNotFound, "person not found")
 		return
@@ -234,12 +253,13 @@ func enrolledPhoto(p *db.Person, photoPath string) bool {
 }
 
 // personPhotoPath resolves an enrolled photo path to a file under the
-// person's folder in the people dir, or "" when the path is unsafe.
+// person's folder (people/<RepoID>/<Name> for a repo person, people/<Name>
+// for a legacy one), or "" when the path is unsafe.
 func personPhotoPath(peopleDir string, p *db.Person, photoPath string) string {
 	if !enrolledPhoto(p, photoPath) {
 		return ""
 	}
-	dir := filepath.Join(peopleDir, p.Name)
+	dir := personFolder(peopleDir, p)
 	full := filepath.Join(dir, filepath.FromSlash(photoPath))
 	if !strings.HasPrefix(full, dir+string(os.PathSeparator)) {
 		return ""

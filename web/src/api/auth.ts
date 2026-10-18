@@ -1,33 +1,55 @@
-// Auth and passkey (WebAuthn) API wrappers.
-// Public endpoints (session, login, logout, passkey login) never fire the
-// onUnauthorized hook: a 401 from a login attempt is an ordinary failure,
-// not an expired session.
+// Auth API wrappers: session probe, first-run setup, login/logout, password
+// change, and personal API keys.
+//
+// setup/login rejections (401/403/429) are ordinary form failures — they
+// never fire the onUnauthorized hook. Everything else (logout, password
+// change, keys) goes through expectJSON: a 401 there means the session
+// expired, and the hook flips the app back to the login screen.
 
 import type {
-	CredentialCreationOptionsJSON,
-	CredentialRequestOptionsJSON,
+	ApiKeyResponse,
+	KeysResponse,
+	LoginResponse,
 	OkResponse,
-	PasskeysResponse,
-	PublicKeyCredentialJSON,
 	SessionInfo,
+	SetupBody,
 } from "../types";
-import { expectJSON, parse } from "./core";
+import { expectJSON, parse, request } from "./core";
 
 export async function getSession(): Promise<SessionInfo> {
-	const r = await fetch("/api/auth/session");
+	const r = await request("/api/auth/session");
 	if (!r.ok) throw new Error("could not read the session");
 	return parse<SessionInfo>(r);
 }
 
-// Password login. 401 = wrong password, 429 = too many attempts; the server's
-// error message is preferred, with graceful fallbacks when it omits one.
-export async function login(password: string): Promise<OkResponse> {
-	const r = await fetch("/api/login", {
+// First-run setup: creates the administrator account with the one-time
+// setup key the server printed to its console. A 403 (wrong key, or setup
+// already completed) is an ordinary error the form displays.
+export async function setup(body: SetupBody): Promise<OkResponse> {
+	const r = await request("/api/setup", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ password }),
+		body: JSON.stringify(body),
 	});
 	const j = await parse<OkResponse & { error?: string }>(r);
+	if (!r.ok) {
+		const fallback = r.status === 403
+			? "Setup refused — check the setup key."
+			: "Setup failed.";
+		throw new Error(j.error || fallback);
+	}
+	return j;
+}
+
+// Password login. 401 = unknown user or wrong password, 429 = rate limited
+// (the server sends Retry-After); the server's message wins when it has one.
+export async function login(username: string, password: string): Promise<LoginResponse> {
+	const r = await request("/api/login", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ username, password }),
+	});
+	const j = await parse<LoginResponse & { error?: string }>(r);
 	if (!r.ok) {
 		const fallback = r.status === 429
 			? "Too many attempts — wait a moment and try again."
@@ -38,53 +60,40 @@ export async function login(password: string): Promise<OkResponse> {
 }
 
 export async function logout(): Promise<OkResponse> {
-	const r = await fetch("/api/logout", { method: "POST" });
+	const r = await request("/api/logout", { method: "POST" });
 	return expectJSON(r, "logout failed");
 }
 
-// ---- passkeys (WebAuthn JSON, base64url buffers) ----
-
-// Step 1 of passkey sign-in: the server's CredentialRequestOptions JSON.
-export async function passkeyLoginBegin(): Promise<CredentialRequestOptionsJSON> {
-	const r = await fetch("/api/auth/passkey/login/begin", { method: "POST" });
-	return expectJSON(r, "could not start the passkey sign-in");
-}
-
-// The finished assertion is the browser's PublicKeyCredential as JSON; a 401
-// here means the signature was rejected, not that the session expired.
-export async function passkeyLoginFinish(assertion: PublicKeyCredentialJSON): Promise<OkResponse> {
-	const r = await fetch("/api/auth/passkey/login/finish", {
+// Change the signed-in user's own password. 403 = wrong current password
+// (an ordinary form error), 401 = the session expired.
+export async function changePassword(current: string, newPassword: string): Promise<OkResponse> {
+	const r = await request("/api/auth/password", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify(assertion),
+		body: JSON.stringify({ current, new: newPassword }),
 	});
-	const j = await parse<OkResponse & { error?: string }>(r);
-	if (!r.ok) throw new Error(j.error || "Passkey sign-in failed.");
-	return j;
+	return expectJSON(r, "could not change the password");
 }
 
-// Step 1 of registering a new passkey (admin).
-export async function passkeyRegisterBegin(): Promise<CredentialCreationOptionsJSON> {
-	const r = await fetch("/api/auth/passkey/register/begin", { method: "POST" });
-	return expectJSON(r, "could not start the passkey registration");
+// ---- personal API keys (any signed-in user, own keys only) ----
+
+export async function listApiKeys(): Promise<KeysResponse> {
+	const r = await request("/api/auth/keys");
+	return expectJSON(r, "could not load the API keys");
 }
 
-// Step 2 (admin): hand the browser's attestation back for verification.
-export async function passkeyRegisterFinish(attestation: PublicKeyCredentialJSON): Promise<OkResponse> {
-	const r = await fetch("/api/auth/passkey/register/finish", {
+// The full token (rk_…) comes back exactly once, with this reply — the
+// caller shows it immediately with a store-it-now note.
+export async function createApiKey(name: string): Promise<ApiKeyResponse> {
+	const r = await request("/api/auth/keys", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify(attestation),
+		body: JSON.stringify({ name }),
 	});
-	return expectJSON(r, "passkey registration failed");
+	return expectJSON(r, "could not create the API key");
 }
 
-export async function listPasskeys(): Promise<PasskeysResponse> {
-	const r = await fetch("/api/auth/passkeys");
-	return expectJSON(r, "could not load the passkeys");
-}
-
-export async function deletePasskey(id: string): Promise<OkResponse> {
-	const r = await fetch(`/api/auth/passkeys/${encodeURIComponent(id)}`, { method: "DELETE" });
-	return expectJSON(r, "could not remove the passkey");
+export async function deleteApiKey(id: string): Promise<OkResponse> {
+	const r = await request(`/api/auth/keys/${encodeURIComponent(id)}`, { method: "DELETE" });
+	return expectJSON(r, "could not revoke the API key");
 }

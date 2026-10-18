@@ -1,24 +1,23 @@
 # recogn — basic compose setup.
 #
-#   1. docker compose run --rm recogn hash-password   # prompts for an admin password
-#   2. paste the printed $argon2id$... hash over the CHANGE-ME placeholder below
-#   3. docker compose up --build                      # build and start
-#   4. open http://localhost:8080 and log in
+# First run (the server ALWAYS requires login — there is no open mode):
+#   1. docker compose up --build
+#   2. docker compose logs recogn    # look for: setup key: XXXX-XXXX-XXXX-XXXX
+#   3. open http://localhost:8080, enter the setup key and pick the admin
+#      username + password (the key is in-memory only and regenerated on every
+#      start until an admin exists)
+#   4. create repositories and users from the admin UI; users get per-repo
+#      reader/writer roles, and can mint personal API keys (rk_...)
 #
-# The password hash below is REQUIRED: while the placeholder is unchanged the
-# server refuses to start (the container exits with
-# "invalid RECOGN_ADMIN_PASSWORD_HASH: …" — visible in `docker compose logs`).
-# A deployment without admin auth would expose enrollment, person deletion and
-# configuration to anyone who can reach the port (SECURITY-REVIEW.md H3).
+# There is no default repository. To wrap an existing legacy dataset (flat
+# people/<Person>/ folders) into one repository:
+#   docker compose run --rm recogn repo import --name "My people"
+# then enroll it: docker compose run --rm recogn enroll --repo "My people"
 #
-# On first start, if the face DB is empty and a people/ dataset is mounted,
-# the server enrolls everyone automatically before serving.
-#
-# To add someone new: drop people/<Name>/*.jpg into ./people and either
-# restart, hit POST /api/enroll (admin-authenticated), or use the "Rescan
-# people folder" button. Photos enrolled through the API/UI are saved back
-# into ./people (as <Name>/<sha1>.<ext>), so the mount below must stay
-# writable.
+# To add someone new: drop people/<repo>/<Person>/*.jpg into the repository's
+# folder and hit POST /api/enroll?repo=... (writer) or the UI's rescan. Photos
+# enrolled through the API/UI are saved back into the repository's folder (as
+# <Person>/<sha1>.<ext>), so the mount below must stay writable.
 #
 # The ONNX models are not baked into the image: on first start the app
 # downloads the insightface buffalo_l pack (~289 MB) into ./models and keeps
@@ -33,8 +32,10 @@ services:
     ports:
       # Loopback-only by default: the UI/API stay reachable from this machine
       # (and through an SSH tunnel or reverse proxy). To serve your LAN or the
-      # public internet, switch to "8080:8080" — only after admin auth is
-      # configured (below) and ideally behind a TLS reverse proxy.
+      # public internet, switch to "8080:8080" — login is always required now
+      # (only /api/setup, /api/login, /api/health and enabled share links are
+      # reachable unauthenticated), but still put a TLS reverse proxy in
+      # front for anything remote.
       - "127.0.0.1:8080:8080"
       # - "8080:8080"
     environment:
@@ -42,17 +43,10 @@ services:
       RECOGN_THRESHOLD: "0.45"
       # RECOGN_ADDR: ":8080"        # listen address inside the container
       #
-      # REQUIRED — replace the placeholder with a real argon2id hash
-      # (see the 3-step first run in the header comment):
-      RECOGN_ADMIN_PASSWORD_HASH: "CHANGE-ME-paste-argon2id-hash"
-      #
-      # Passkey (WebAuthn) login is the second method: register passkeys in
-      # the UI's Passkeys modal while logged in (open mode refuses passkey
-      # registration — SECURITY-REVIEW.md H2). Passkeys need HTTPS or
-      # localhost; behind a TLS reverse proxy point RPID/ORIGIN at its
-      # public URL:
-      # RECOGN_WEBAUTHN_RPID: "recogn.example.com"
-      # RECOGN_WEBAUTHN_ORIGIN: "https://recogn.example.com"
+      # Sessions are in-memory (restarts log everyone out; users log in with
+      # username + password — the admin is created via the first-run setup
+      # key, see the header comment):
+      # RECOGN_SESSION_TTL: "24h"   # sliding session lifetime (Go duration)
       #
       # Model source knobs (see the ./models mount below):
       # RECOGN_MODELS_URL: "https://your-mirror/buffalo_l.zip"   # own pack mirror
@@ -67,12 +61,17 @@ services:
       # pre-populated ./models may even be mounted read-only. Point
       # RECOGN_MODELS_URL at your own pack for mirrors / air-gapped hosts.
       - ./models:/data/models
-      # Your dataset: ./people/<Person Name>/*.jpg — mounted writable so
-      # API/UI enrollments can save uploaded photos into it. The container
-      # runs as uid 10001; make sure the host folder allows writes for that
-      # uid (e.g. `sudo chown -R 10001 ./people`).
+      # The datasets: ./people is the REPOS ROOT — one folder per repository
+      # (./people/<repo-uuid>/<Person Name>/*.jpg; the display name is
+      # managed in the admin UI). Repositories are created there from the
+      # admin UI; legacy flat people/<Person>/ folders can be wrapped into a
+      # repository with `recogn repo import`. Mounted writable so API/UI
+      # enrollments can save uploaded photos into it. The container runs as
+      # uid 10001; make sure the host folder allows writes for that uid
+      # (e.g. `sudo chown -R 10001 ./people`).
       - ./people:/data/people
-      # Persist the generated face DB across rebuilds/restarts.
+      # Persist the face DB (data/faces.db), the user DB (data/users.db) and
+      # the thumbnails across rebuilds/restarts.
       - ./data:/data/db
     restart: unless-stopped
     # Liveness: the app exposes /api/health. (curl is in the runtime image.)

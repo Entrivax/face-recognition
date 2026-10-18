@@ -37,3 +37,25 @@ func ServeUI(w http.ResponseWriter, r *http.Request) {
 	}
 	http.FileServer(http.FS(sub)).ServeHTTP(w, r)
 }
+
+// ServeUIIndex serves the embedded index.html document (the SPA shell) for
+// any request path, with index.html's no-cache policy. The share route uses
+// it to serve the single-page app at /share/<repoID>/<token> without
+// pretending the asset tree lives there (asset URLs in the document are
+// root-relative, so they resolve against "/" as usual).
+//
+// It mirrors ServeUI's fresh-clone behaviour: without a built bundle the
+// response is the same 503 hint instead of a confusing 404.
+func ServeUIIndex(w http.ResponseWriter, r *http.Request) {
+	sub, err := fs.Sub(distFS, "dist")
+	if err != nil {
+		http.Error(w, "ui unavailable", http.StatusInternalServerError)
+		return
+	}
+	if _, err := sub.Open("index.html"); err != nil {
+		http.Error(w, "web UI not built — run: make ui", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-cache")
+	http.ServeFileFS(w, r, sub, "index.html")
+}
