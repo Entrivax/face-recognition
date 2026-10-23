@@ -8,7 +8,7 @@ import type { Health, RepoInfo, SessionUser } from "../types";
 interface TopbarProps {
 	health: Health | null;
 	err: boolean;
-	user: SessionUser;
+	user: SessionUser | null;
 	repos: RepoInfo[];
 	repoId: string | null;
 	onRepoChange: (id: string) => void;
@@ -55,10 +55,10 @@ export function Topbar({
 					<span id="statusText">{text}</span>
 				</div>
 				<span class="user-chip" id="userChip">
-					<span class="user-name">{user.name}</span>
-					{user.admin && <span class="badge admin">admin</span>}
+					<span class="user-name">{user?.name}</span>
+					{user?.admin && <span class="badge admin">admin</span>}
 				</span>
-				{user.admin && (
+				{user?.admin && (
 					<>
 						<button id="reposBtn" class="btn btn-sm" onClick={onRepos}>
 							Repositories

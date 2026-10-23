@@ -1,0 +1,9 @@
+{
+	"recommendations": [
+		"editorconfig.editorconfig",
+		"owenrumney.boltdb-explorer",
+		"dbaeumer.vscode-eslint",
+		"golang.go",
+		"eamodio.gitlens"
+	]
+}

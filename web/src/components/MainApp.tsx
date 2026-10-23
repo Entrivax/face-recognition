@@ -27,11 +27,12 @@ import { ReposModal } from "./ReposModal";
 import { UsersModal } from "./UsersModal";
 import { ApiKeysModal } from "./ApiKeysModal";
 import { ChangePasswordModal } from "./ChangePasswordModal";
+import type { ReadonlySignal } from "@preact/signals"
 
 const REPO_KEY = "recogn.repo";
 
 interface MainAppProps {
-	user: SessionUser;
+	user: ReadonlySignal<SessionUser | null>;
 	/** the session ended (logout) — App flips to the login view */
 	onSessionEnd: () => void;
 }
@@ -78,7 +79,7 @@ export function MainApp({ user, onSessionEnd }: MainAppProps) {
 	const perms: Perms = {
 		user: true,
 		writer: repo ? repo.role === "writer" || repo.role === "admin" : false,
-		admin: user.admin,
+		admin: !!user.value?.admin,
 	};
 
 	// Clipboard routing targets registered by the children.
@@ -326,7 +327,7 @@ export function MainApp({ user, onSessionEnd }: MainAppProps) {
 			<Topbar
 				health={health}
 				err={healthErr}
-				user={user}
+				user={user.value}
 				repos={repos}
 				repoId={repoId}
 				onRepoChange={setRepoId}
@@ -348,7 +349,7 @@ export function MainApp({ user, onSessionEnd }: MainAppProps) {
 			) : repos.length === 0 ? (
 				<main class="layout">
 					<div class="empty-state">
-						{user.admin ? (
+						{user.value?.admin ? (
 							<>
 								<h2>No repositories yet</h2>
 								<p class="lede">A repository is a dataset of people. Create the first one, then enroll people into it.</p>
@@ -436,14 +437,14 @@ export function MainApp({ user, onSessionEnd }: MainAppProps) {
 			<FaceCheckModal view={checkView} onCloseRequest={() => setCheckView(null)} />
 
 			<ReposModal
-				open={reposOpen && user.admin}
+				open={reposOpen && !!user.value?.admin}
 				onCloseRequest={() => setReposOpen(false)}
 				onChanged={refreshAll}
 			/>
 
 			<UsersModal
-				open={usersOpen && user.admin}
-				currentUser={user.name}
+				open={usersOpen && !!user.value?.admin}
+				currentUser={user.value?.name || ""}
 				onCloseRequest={() => setUsersOpen(false)}
 			/>
 

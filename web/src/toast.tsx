@@ -3,8 +3,9 @@
 // style.css; the message auto-hides after 3.6 s.
 
 import { createContext } from "preact";
-import { useContext, useRef, useState } from "preact/hooks";
+import { useContext, useRef } from "preact/hooks";
 import type { ComponentChildren } from "preact";
+import { batch, useSignal } from "@preact/signals"
 
 export type ToastKind = "" | "ok" | "err";
 
@@ -19,15 +20,17 @@ export function useToast(): ToastApi {
 }
 
 export function ToastProvider({ children }: { children: ComponentChildren }) {
-	const [cls, setCls] = useState("toast");
-	const [msg, setMsg] = useState("");
+	const cls = useSignal("toast")
+	const msg = useSignal("")
 	const timer = useRef<number | undefined>(undefined);
 
 	const show = (m: string, kind: ToastKind = "") => {
-		setMsg(m);
-		setCls("toast show" + (kind ? " " + kind : ""));
+		batch(() => {
+			msg.value = m
+			cls.value = "toast show" + (kind ? " " + kind : "")
+		})
 		clearTimeout(timer.current);
-		timer.current = window.setTimeout(() => setCls("toast"), 3600);
+		timer.current = window.setTimeout(() => cls.value = "toast", 3600);
 	};
 
 	return (
