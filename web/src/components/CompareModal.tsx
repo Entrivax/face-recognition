@@ -2,11 +2,12 @@
 // Face-to-face comparison of two arbitrary photos: the server embeds the
 // largest face of each and reports their cosine similarity. Nothing is
 // matched against the enrolled-people database. Photos can be added by
-// browse, drag & drop, or paste; the result shows the similarity, a meter,
-// and a "same person?" verdict against the recognizer's threshold.
+// browse, drag & drop, or paste (routed here by the modal service while the
+// modal is open); the result shows the similarity, a meter, and a "same
+// person?" verdict against the recognizer's threshold.
 // The tool is also opened seeded from the enroll and photos modals: both
 // photos are picked there (pending thumbs / enrolled grid) and handed over
-// as a { a, b } seed — the comparison auto-runs when the modal opens.
+// as a { a, b } seed arg — the comparison auto-runs when the instance opens.
 
 import { useEffect, useRef, useState } from "preact/hooks";
 import * as api from "../api";
@@ -14,30 +15,26 @@ import type { CompareResponse, Face } from "../types";
 import { drawWhenReady } from "../overlay";
 import { fmtSize } from "../util";
 import { useToast } from "../toast";
+import { usePasteFiles } from "../paste";
 import { Modal } from "./Modal";
-
-// Imperative surface App uses for clipboard routing while the modal is open.
-export interface ComparePasteTarget {
-	addFiles: (files: FileList | File[]) => void;
-	isBusy: () => boolean;
-}
 
 // Both photos of a comparison launched from another modal (enroll pending
 // thumbs / photos-manager grid). Compare builds its own preview URLs from
-// these and revokes them when the modal closes.
+// these and revokes them when the instance unmounts.
 export interface CompareSeed {
 	a: File;
 	b: File;
 }
 
 interface CompareModalProps {
+	/** injected by the modal service (instances render open) */
 	open: boolean;
+	/** injected by the modal service: true while no other instance sits above */
+	isTopmost: boolean;
+	/** injected by the modal service; closing unmounts the instance */
 	onCloseRequest: () => void;
-	registerPasteTarget: (t: ComparePasteTarget | null) => void;
-	/** photos picked in the opening modal; consumed once on open */
+	/** photos picked in the launching modal; consumed once on mount */
 	seed?: CompareSeed | null;
-	/** clears App's seed state after it has been applied */
-	onSeedConsumed?: () => void;
 }
 
 interface Slot {
@@ -76,18 +73,11 @@ export function CompareModal(props: CompareModalProps) {
 		setBusy(b);
 	};
 
-	// Fresh tool each time the modal opens; revoke the previews when it closes.
 	// A seeded open (both photos picked in the launching modal) fills both
-	// slots immediately and auto-runs the comparison.
+	// slots immediately and auto-runs the comparison. Consumed once: the seed
+	// lives in the instance's args, and a later open() replaces them — a new
+	// instance (after a close) gets a fresh seed anyway.
 	useEffect(() => {
-		if (!props.open) {
-			revoke(slotsRef.current.a);
-			revoke(slotsRef.current.b);
-			setSlotsBoth({ a: null, b: null });
-			setResult(null);
-			setBusyBoth(false);
-			return;
-		}
 		const seed = props.seed;
 		if (!seed || !seed.a || !seed.b) return;
 		setSlotsBoth({
@@ -95,9 +85,16 @@ export function CompareModal(props: CompareModalProps) {
 			b: { file: seed.b, url: URL.createObjectURL(seed.b) },
 		});
 		setResult(null);
-		props.onSeedConsumed?.();
 		compare(); // slotsRef was set synchronously above
-	}, [props.open]);
+	}, []);
+
+	// The instance unmounts on close: revoke the previews and drop the pulse
+	// timer (the previews die with the instance).
+	useEffect(() => () => {
+		clearTimeout(pulseTimer.current);
+		revoke(slotsRef.current.a);
+		revoke(slotsRef.current.b);
+	}, []);
 
 	// Replace one slot's contents (null removes). Any change invalidates the
 	// previous result.
@@ -113,14 +110,12 @@ export function CompareModal(props: CompareModalProps) {
 		setSlot("b", null);
 	};
 
-	// ---- paste/drop routing surface (registered with App) ----
-	useEffect(() => {
-		props.registerPasteTarget({
-			addFiles,
-			isBusy: () => busyRef.current,
-		});
-		return () => props.registerPasteTarget(null);
-	}, []);
+	// ---- paste routing (via the injected isTopmost flag) ----
+	// While this modal is topmost, pasted images fill the empty slots.
+	usePasteFiles(props.isTopmost, (files) => {
+		if (busyRef.current) return; // busy swallows the paste silently
+		addFiles(files);
+	});
 
 	const compare = async () => {
 		const a = slotsRef.current.a;

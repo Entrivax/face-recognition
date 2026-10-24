@@ -127,5 +127,5 @@ export function App() {
 		case 'login':
 			return <LoginView onAuthed={onAuthed} />;
 	}
-	return <MainApp user={user} onSessionEnd={() => batch(() => { user.value = null; boot.value = 'login' })} />;
+	return <MainApp user={user.value} onSessionEnd={() => batch(() => { user.value = null; boot.value = 'login' })} />;
 }

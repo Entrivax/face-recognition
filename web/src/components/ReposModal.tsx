@@ -3,7 +3,7 @@
 // the public read-only share link. Enabling mints a FRESH token and answers
 // with the full share URL; the current link can always be re-read again
 // ("Show link" button → GET) without rotating it. Disabling nulls it.
-// After any change the list reloads and the parent refreshes its own
+// After any change the list reloads and the app store refreshes its own
 // repo state.
 
 import { useEffect, useRef, useState } from "preact/hooks";
@@ -12,17 +12,19 @@ import * as api from "../api";
 import type { RepoInfo } from "../types";
 import { copyText } from "../util";
 import { useToast } from "../toast";
+import { useApp } from "../appStore";
 import { Modal } from "./Modal";
 
 interface ReposModalProps {
+	/** injected by the modal service (instances render open) */
 	open: boolean;
+	/** injected by the modal service; closing unmounts the instance */
 	onCloseRequest: () => void;
-	/** any change → the parent refreshes its repos list + people counts */
-	onChanged: () => void;
 }
 
 export function ReposModal(props: ReposModalProps) {
 	const toast = useToast();
+	const app = useApp();
 
 	const [repos, setRepos] = useState<RepoInfo[] | null>(null);
 	const [hint, setHint] = useState("Loading repositories…");
@@ -81,7 +83,7 @@ export function ReposModal(props: ReposModalProps) {
 			toast.show(`Created repository ${n}.`, "ok");
 			setName("");
 			await loadList();
-			props.onChanged();
+			app.refreshAll();
 		} catch (err) {
 			toast.show((err as Error).message || "Could not create the repository.", "err");
 		} finally {
@@ -110,7 +112,7 @@ export function ReposModal(props: ReposModalProps) {
 			toast.show("Repository renamed.", "ok");
 			setRenamingId(null);
 			await loadList();
-			props.onChanged();
+			app.refreshAll();
 		} catch (err) {
 			toast.show((err as Error).message || "Could not rename the repository.", "err");
 		} finally {
@@ -134,7 +136,7 @@ export function ReposModal(props: ReposModalProps) {
 				toast.show("Share link disabled.", "ok");
 			}
 			await loadList();
-			props.onChanged();
+			app.refreshAll();
 		} catch (err) {
 			toast.show((err as Error).message || "Could not update the share link.", "err");
 		} finally {
@@ -180,7 +182,7 @@ export function ReposModal(props: ReposModalProps) {
 			const j = await api.deleteRepo(r.id);
 			toast.show(`Removed ${r.name} (${j.people_removed} people, folder ${j.folder_removed ? "deleted" : "kept"}).`, "ok");
 			await loadList();
-			props.onChanged();
+			app.refreshAll();
 		} catch (err) {
 			toast.show((err as Error).message || "Could not delete the repository.", "err");
 		} finally {

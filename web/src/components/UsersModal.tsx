@@ -11,12 +11,13 @@ import * as api from "../api";
 import type { GrantRole, RepoInfo, UserInfo } from "../types";
 import { USERNAME_RE } from "../util";
 import { useToast } from "../toast";
+import { useApp } from "../appStore";
 import { Modal } from "./Modal";
 
 interface UsersModalProps {
+	/** injected by the modal service (instances render open) */
 	open: boolean;
-	/** the signed-in admin's own username, to mark "(you)" */
-	currentUser: string;
+	/** injected by the modal service; closing unmounts the instance */
 	onCloseRequest: () => void;
 }
 
@@ -26,6 +27,9 @@ type GrantChoice = "none" | GrantRole;
 
 export function UsersModal(props: UsersModalProps) {
 	const toast = useToast();
+	const app = useApp();
+	// The signed-in admin's own username, to mark "(you)".
+	const currentUser = app.user?.name ?? "";
 
 	const [users, setUsers] = useState<UserInfo[] | null>(null);
 	const [repos, setRepos] = useState<RepoInfo[] | null>(null);
@@ -263,7 +267,7 @@ export function UsersModal(props: UsersModalProps) {
 							<li key={u.username} class="admin-row user-row">
 								<div class="admin-row-main">
 									<span class="admin-row-name">{u.username}</span>
-									{u.username === props.currentUser && <span class="badge you">you</span>}
+									{u.username === currentUser && <span class="badge you">you</span>}
 									{u.admin && <span class="badge admin">admin</span>}
 									<span class="admin-row-sub" title="Repository access">{grantsText(u)}</span>
 								</div>
@@ -280,7 +284,7 @@ export function UsersModal(props: UsersModalProps) {
 									<button type="button" class="btn btn-ghost btn-sm" disabled={busy} onClick={() => (pwUser === u.username ? setPwUser(null) : openReset(u))}>
 										{pwUser === u.username ? "Close" : "Reset password"}
 									</button>
-									{u.username !== props.currentUser && (
+									{u.username !== currentUser && (
 										<button type="button" class="btn btn-ghost btn-sm admin-danger" disabled={busy} onClick={() => remove(u)}>
 											Delete
 										</button>

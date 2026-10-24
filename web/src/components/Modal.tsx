@@ -1,7 +1,8 @@
 // Shared modal shell: backdrop, card, header (eyebrow + title + optional
 // actions), close button, focus trap, focus save/restore, and Escape-stack
-// registration. Shells stay mounted and toggle the `hidden` attribute — the
-// stylesheet keys modal visibility off `.modal[hidden]`.
+// registration. Whether a shell is mounted is decided by the modal service
+// that rendered it: open == mounted, close == unmounted, and an instance
+// with another modal on top stays mounted (paused, state intact).
 //
 // Clicking the backdrop, the × button, or any [data-close] element inside
 // invokes onCloseRequest (callers decide to refuse while busy). A mouse

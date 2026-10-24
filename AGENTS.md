@@ -99,20 +99,36 @@ web/                     the front-end: Preact + TypeScript, built by Vite
                          (UTC, Feb 29 → Mar 1 on non-leap years)
     util.ts              fmtSize, initials, clipboard helpers
     modalStack.ts        Escape-stack registry (topmost modal closes first)
+    modalService.tsx     modal pool provider: open/close/patch instances,
+                         isTopmost prop, Escape keydown, body scroll lock
+    modalRegistry.tsx    modal keys + arg types + component defs; typed
+                         useModals() facade over the pool service
+    paste.ts             clipboard routing: usePasteFiles(enabled, handler)
+                         — the topmost interested component wins, else the
+                         "*" fallback (the stage)
+    appStore.tsx         AppContext + useApp(): session, repos, people,
+                         threshold, perms + shared server actions
     toast.tsx            ToastProvider + useToast context
     components/
-      App.tsx            state owner: session, repos, people, threshold,
-                         modal open state, editor-open flag, paste routing,
-                         Escape keydown
-      Topbar.tsx         brand + status pill
+      App.tsx            boot router: session probe → setup/login/share/
+                         main app; 401 hook flips to the login view
+      MainApp.tsx        server-data owner (repos/people/threshold) +
+                         providers (AppContext, ModalProvider); no modal
+                         open-state — components open dialogs themselves
+      Topbar.tsx         brand, status pill, repo selector, account
+                         controls (opens its dialogs via useModals)
       Stage.tsx          main stage: dropzone, preview, overlay, Edit /
-                         Cancel-edits buttons (open the photo editor / revert
-                         to the pristine original), face rows (matches +
-                         "name this face" enroll form)
+                         Cancel-edits buttons (open the photo editor /
+                         revert to the pristine original), face rows
+                         (matches + "name this face" enroll form); owns
+                         the editor's per-file session vault and the
+                         paste fallback (clipboard → stage)
       EditModal.tsx      stage photo editor: rotate / crop / pad with
                          multi-step undo–redo; always re-derives from the
-                         stage's pristine original and restores the last
-                         session per file (reset on any new upload)
+                         stage's pristine original; the committed session
+                         is saved at close (unmount) into the stage's
+                         vault and restored on reopen (per-file, reset on
+                         any new upload)
       PeoplePanel.tsx    enrolled-people list, search (names + aliases, with
                          aka hints), threshold slider, rescan
       Modal.tsx          shared modal shell: backdrop, focus trap, focus
@@ -343,16 +359,34 @@ command hits a permission error.
   `npm --prefix web run dev` for the Vite dev server on :5173 — it proxies
   `/api` to the Go server on :8080, so no rebuild is needed for API-side
   checks. Architecture notes:
-  - **State lives in `App`** (session, repos, people, threshold, which modal
-    is open); children refresh each other via `refreshAll()` callbacks — the
-    old `on*Change` callback modules are gone.
-  - **Modals stay mounted** and toggle `hidden` (the stylesheet keys off
-    `.modal[hidden]`); the shared `Modal` shell owns the focus trap, focus
-    save/restore, busy lock, and Escape-stack membership.
-  - **Escape closes the topmost modal** via `modalStack.ts` (photos modal
-    cancels its rename edit first); paste routing (`App`) routes clipboard
-    images enroll → photos → stage, and never hijacks text pasted into
-    inputs.
+  - **Server data lives in `MainApp`** (repos, selected repo, people,
+    threshold, health) and reaches the components through the app-store
+    context (`appStore.tsx`, `useApp()`); mutations refresh via the shared
+    `refreshAll()` action. ShareView provides its own read-only store
+    instance. Dialog state is nowhere in the shells — components open
+    dialogs themselves.
+  - **Modals are a pool service** (`modalService.tsx` + `modalRegistry.tsx`):
+    `ModalProvider` renders one instance per open key in pool order (later
+    paints on top); `open(key, args)` mounts or replaces the args, `close()`
+    UNMOUNTS the instance, `patch()` updates its args (live face-check
+    updates, rename propagation). An instance with another modal on top
+    stays mounted ("paused", state intact). The provider injects the
+    lifecycle props (`open`, `onCloseRequest`, and the positional
+    `isTopmost`) and owns the Escape keydown and the body scroll lock; the
+    registry maps keys → components and arg shapes, `useModals()` is the
+    typed facade.
+  - **Clipboard routing lives in `paste.ts`** — no paste code in the modal
+    service. Components opt in with `usePasteFiles(enabled, handler)`:
+    inside a modal instance `enabled` is the injected `isTopmost` prop (the
+    topmost open instance wins), the stage registers permanently under the
+    reserved `"*"` fallback. Text pastes into inputs are never hijacked.
+  - **The shared `Modal` shell** owns the focus trap, focus save/restore,
+    busy lock, and Escape-stack membership (`modalStack.ts` — the photos
+    modal cancels its rename edit first).
+  - **The stage photo editor's session survives close/reopen** per file:
+    EditModal hands its committed session to the opener at close time
+    (unmount) and the stage's vault restores it on reopen; uncommitted
+    tool state dies with the instance.
   - `class`/`id` names mirror the original DOM — keep them when editing
     components or `style.css` stops applying.
   - TestIndexServed extracts every local asset URL from the served

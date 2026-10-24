@@ -1,30 +1,18 @@
 // Topbar: brand mark, live server status pill, the repository selector, and
 // the account controls (username chip, API keys, change password, log out;
 // admin additionally gets the Users and Repositories managers).
+// Data comes from the app store; the dialogs open through the modal service.
 
 import type { TargetedEvent } from "preact";
-import type { Health, RepoInfo, SessionUser } from "../types";
+import { useApp } from "../appStore";
+import { useModals } from "../modalRegistry";
 
-interface TopbarProps {
-	health: Health | null;
-	err: boolean;
-	user: SessionUser | null;
-	repos: RepoInfo[];
-	repoId: string | null;
-	onRepoChange: (id: string) => void;
-	onLogout: () => void;
-	onRepos: () => void;
-	onUsers: () => void;
-	onKeys: () => void;
-	onPassword: () => void;
-}
-
-export function Topbar({
-	health, err, user, repos, repoId,
-	onRepoChange, onLogout, onRepos, onUsers, onKeys, onPassword,
-}: TopbarProps) {
-	const cls = err ? "status err" : health ? "status ok" : "status";
-	const text = err ? "server unreachable" : health ? health.status : "connecting…";
+export function Topbar() {
+	const app = useApp();
+	const modals = useModals();
+	const { health, healthErr, user, repos, repoId } = app;
+	const cls = healthErr ? "status err" : health ? "status ok" : "status";
+	const text = healthErr ? "server unreachable" : health ? health.status : "connecting…";
 	return (
 		<header class="topbar">
 			<div class="brand">
@@ -43,7 +31,7 @@ export function Topbar({
 						title={repos.length < 2 ? undefined : "Switch repository"}
 						disabled={repos.length < 2}
 						value={repoId ?? ""}
-						onChange={(e: TargetedEvent<HTMLSelectElement>) => onRepoChange(e.currentTarget.value)}
+						onChange={(e: TargetedEvent<HTMLSelectElement>) => app.setRepoId(e.currentTarget.value)}
 					>
 						{repos.map((r) => (
 							<option key={r.id} value={r.id}>{r.name} ({r.people})</option>
@@ -60,21 +48,21 @@ export function Topbar({
 				</span>
 				{user?.admin && (
 					<>
-						<button id="reposBtn" class="btn btn-sm" onClick={onRepos}>
+						<button id="reposBtn" class="btn btn-sm" onClick={() => modals.open("repos")}>
 							Repositories
 						</button>
-						<button id="usersBtn" class="btn btn-sm" onClick={onUsers}>
+						<button id="usersBtn" class="btn btn-sm" onClick={() => modals.open("users")}>
 							Users
 						</button>
 					</>
 				)}
-				<button id="keysBtn" class="btn btn-sm" aria-haspopup="dialog" onClick={onKeys}>
+				<button id="keysBtn" class="btn btn-sm" aria-haspopup="dialog" onClick={() => modals.open("keys")}>
 					API keys
 				</button>
-				<button id="passwordBtn" class="btn btn-sm" aria-haspopup="dialog" onClick={onPassword}>
+				<button id="passwordBtn" class="btn btn-sm" aria-haspopup="dialog" onClick={() => modals.open("password")}>
 					Change password
 				</button>
-				<button id="logoutBtn" class="btn btn-ghost btn-sm" onClick={onLogout}>
+				<button id="logoutBtn" class="btn btn-ghost btn-sm" onClick={() => void app.logout()}>
 					Log out
 				</button>
 			</div>

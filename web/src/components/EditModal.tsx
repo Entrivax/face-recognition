@@ -1,14 +1,20 @@
 // Stage photo editor.
 // Opt-in refinement pass before recognition: rotate (free angle −180…180°),
 // crop a region, and add a solid pad ("skirt") around the image, with
-// multi-step undo/redo. Opened from the stage's Edit button; "Use this
-// image" exports a JPEG and hands it back for a fresh recognition run.
+// multi-step undo/redo. Opened from the stage through the modal service;
+// "Use this image" exports a JPEG and hands it back for a fresh recognition
+// run.
 //
 // Sessions are iterative by design: the editor always works from the
 // ORIGINAL file — never a previous export — and its committed history
-// (ops + undo position + active tool) survives close/reopen, so clicking
-// Edit again restores the previous parameters. The session resets only when
-// a different file becomes the source (any fresh upload on the stage).
+// (ops + undo position + active tool) survives close/reopen. Closing
+// UNMOUNTS the instance (the modal service removes it), so the session is
+// handed to the opener at close time (onSaveSession — the stage keeps it in
+// a vault keyed by the source file) and restored at open (initialSession).
+// Uncommitted tool state and the decoded bitmap are dropped on unmount; the
+// bitmap is re-decoded on reopen and refolded identically. The session
+// resets only when a different file becomes the source (any fresh upload on
+// the stage).
 //
 // The image is shown WITHOUT EXIF auto-rotation (createImageBitmap's
 // imageOrientation: "none"), matching what the Go server sees: image.Decode
@@ -18,6 +24,7 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import type { TargetedPointerEvent } from "preact";
 import { useToast } from "../toast";
+import { usePasteFiles } from "../paste";
 import { Modal } from "./Modal";
 
 // Working-resolution cap. Recognition letterboxes to 640² and embeds at
@@ -50,12 +57,29 @@ interface Rect {
 	h: number;
 }
 
+/** The editor's per-file committed session — what survives close/reopen
+ *  (kept by the opener between the two, see onSaveSession/initialSession). */
+export interface EditSession {
+	hist: Hist;
+	tool: Tool;
+	padColor: PadColor;
+}
+
 interface EditModalProps {
-	/** the original file to edit (null = closed); identity change resets the session */
-	source: File | null;
+	/** injected by the modal service (instances render open) */
+	open: boolean;
+	/** injected by the modal service: true while no other instance sits above */
+	isTopmost: boolean;
+	/** injected by the modal service; closing unmounts the instance */
 	onCloseRequest: () => void;
+	/** the original file to edit */
+	source: File;
 	/** "Use this image": hand the exported file back to the stage */
 	onUse: (file: File) => void;
+	/** committed session of the SAME file to restore (null = fresh session) */
+	initialSession?: EditSession | null;
+	/** called at close time (unmount) with the committed session to keep */
+	onSaveSession?: (source: File, session: EditSession) => void;
 }
 
 const TOOL_HINTS: Record<Tool, string> = {
@@ -66,15 +90,17 @@ const TOOL_HINTS: Record<Tool, string> = {
 
 export function EditModal(props: EditModalProps) {
 	const toast = useToast();
-	const { source, onCloseRequest, onUse } = props;
-	const open = source !== null;
+	const { open, isTopmost, source, onUse, onCloseRequest, initialSession, onSaveSession } = props;
 
-	// ---- persistent session (survives close/reopen; reset per file) ----
-	const [hist, setHist] = useState<Hist>({ ops: [], idx: 0 });
-	const [tool, setTool] = useState<Tool>("rotate");
-	const [padColor, setPadColor] = useState<PadColor>("black");
+	// ---- per-file session (restored from the opener's vault when it holds
+	// one for this file; fresh otherwise). Committed history, active tool and
+	// pad color survive close/reopen through that vault; uncommitted tool
+	// state and the decoded bitmap die with the instance, as before.
+	const [hist, setHist] = useState<Hist>(() => initialSession?.hist ?? { ops: [], idx: 0 });
+	const [tool, setTool] = useState<Tool>(initialSession?.tool ?? "rotate");
+	const [padColor, setPadColor] = useState<PadColor>(initialSession?.padColor ?? "black");
 
-	// ---- transient state (dropped on close) ----
+	// ---- transient state (dropped at unmount) ----
 	const [pendingRot, setPendingRot] = useState(0); // slider angle, live preview
 	const [pendingPadPct, setPendingPadPct] = useState(0); // pad slider, live preview
 	const [crop, setCrop] = useState<Rect | null>(null);
@@ -88,9 +114,16 @@ export function EditModal(props: EditModalProps) {
 	histRef.current = hist;
 	const closeRef = useRef(onCloseRequest);
 	closeRef.current = onCloseRequest;
+	// The close-time session snapshot: the unmount cleanup runs with the
+	// values from the last render before the instance is removed.
+	const sourceRef = useRef(source);
+	sourceRef.current = source;
+	const sessionRef = useRef<EditSession>({ hist, tool, padColor });
+	sessionRef.current = { hist, tool, padColor };
+	const saveRef = useRef(onSaveSession);
+	saveRef.current = onSaveSession;
 
 	const decodedForRef = useRef<File | null>(null);
-	const lastSourceRef = useRef<File | null>(null);
 	const viewRef = useRef<HTMLCanvasElement | null>(null);
 	const overlayRef = useRef<HTMLCanvasElement | null>(null);
 	const dragRef = useRef<{ x: number; y: number } | null>(null);
@@ -106,14 +139,18 @@ export function EditModal(props: EditModalProps) {
 		return scratchRef.current;
 	};
 
-	// A different file resets the whole session (parameters are per-file);
-	// closing keeps everything so the next Edit restores it.
+	// The session is per file: a source swap on a still-mounted instance (an
+	// args replacement by the service) resets it and adopts the session the
+	// opener passed for the new file. The service normally opens a fresh
+	// instance per file — where this re-applies the values the lazy state
+	// init above already used (skipped when the source is unchanged).
+	const lastSourceRef = useRef<File | null>(null);
 	useEffect(() => {
-		if (!source || source === lastSourceRef.current) return;
+		if (source === lastSourceRef.current) return;
 		lastSourceRef.current = source;
-		setHist({ ops: [], idx: 0 });
-		setTool("rotate");
-		setPadColor("black");
+		setHist(initialSession?.hist ?? { ops: [], idx: 0 });
+		setTool(initialSession?.tool ?? "rotate");
+		setPadColor(initialSession?.padColor ?? "black");
 		setPendingRot(0);
 		setPendingPadPct(0);
 		setCrop(null);
@@ -121,20 +158,23 @@ export function EditModal(props: EditModalProps) {
 		setSrc(null);
 	}, [source]);
 
-	// Closing drops uncommitted tool state and the decoded bitmap (history
-	// is kept); the bitmap is re-decoded on reopen and refolded identically.
-	useEffect(() => {
-		if (open) return;
-		setPendingRot(0);
-		setPendingPadPct(0);
-		setCrop(null);
-		decodedForRef.current = null;
-		setSrc(null);
-	}, [open]);
+	// Close-time session save: the service unmounts the instance on close,
+	// so the unmount cleanup hands the committed session to the opener's
+	// vault. Uncommitted tool state (pending sliders, an in-progress crop)
+	// is deliberately not saved — it dies with the instance, as before.
+	useEffect(() => () => {
+		saveRef.current?.(sourceRef.current, sessionRef.current);
+	}, []);
+
+	// ---- clipboard routing (via the injected isTopmost flag) ----
+	// While the editor is open it sits over the stage: a pasted image must
+	// not swap the stage photo (and reset the edit session) under it.
+	usePasteFiles(isTopmost, () => {
+		toast.show("Close the editor to inspect a new photo.");
+	});
 
 	// Decode the source (once per open session) into the working canvas.
 	useEffect(() => {
-		if (!open || !source) return;
 		if (decodedForRef.current === source && srcRef.current) return;
 		let cancelled = false;
 		decodeToCanvas(source)
@@ -151,7 +191,7 @@ export function EditModal(props: EditModalProps) {
 		return () => {
 			cancelled = true;
 		};
-	}, [open, source, toast]);
+	}, [source, toast]);
 
 	// Ops currently shown: everything applied plus a live-preview tail for
 	// the tool being dragged (slider angle / pad size).
@@ -170,7 +210,7 @@ export function EditModal(props: EditModalProps) {
 
 	// Refold the display canvas whenever anything visual changes.
 	useEffect(() => {
-		if (!open || !src) return;
+		if (!src) return;
 		const view = viewRef.current;
 		if (!view) return;
 		const out = foldOps(src, previewOps() ?? [], getScratch());
@@ -183,7 +223,7 @@ export function EditModal(props: EditModalProps) {
 		}
 		const ctx = view.getContext("2d");
 		if (ctx) ctx.drawImage(out, 0, 0);
-	}, [open, src, hist, pendingRot, pendingPadPct, padColor]);
+	}, [src, hist, pendingRot, pendingPadPct, padColor]);
 
 	// Crop overlay: matched to the display size, redrawn on crop changes.
 	useEffect(() => {
@@ -195,7 +235,7 @@ export function EditModal(props: EditModalProps) {
 			ov.height = view.height;
 		}
 		drawCrop(ov, crop);
-	}, [crop, open, src, hist, pendingRot, pendingPadPct, padColor]);
+	}, [crop, src, hist, pendingRot, pendingPadPct, padColor]);
 
 	// ---- history ----
 	const commit = (op: EditOp) => {
@@ -215,8 +255,8 @@ export function EditModal(props: EditModalProps) {
 	};
 
 	// Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z, Ctrl+Y (not while a field has focus).
+	// Deliberately re-bound every render: undo/redo read the current state.
 	useEffect(() => {
-		if (!open) return;
 		const onKey = (e: KeyboardEvent) => {
 			const t = e.target as HTMLElement | null;
 			if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;

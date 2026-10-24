@@ -1,9 +1,9 @@
 // Person details modal.
-// Opens from a click on the people list — for any viewer (signed-in user or
-// share visitor). Shows the person's optional metadata — aliases, partial
-// birthdate, reference URLs and a markdown description — and hides every
-// field that was never filled; a person with no metadata shows name, photo
-// count and a "no details recorded" hint.
+// Opens from a click on the people list (via the modal service) — for any
+// viewer (signed-in user or share visitor). Shows the person's optional
+// metadata — aliases, partial birthdate, reference URLs and a markdown
+// description — and hides every field that was never filled; a person with
+// no metadata shows name, photo count and a "no details recorded" hint.
 //
 // Writer extras (rendered only for writer/admin of the person's repo):
 //  - "Edit details" turns the body into an inline form and saves through
@@ -11,6 +11,10 @@
 //  - "Manage photos" opens the photos-manager modal stacked on top of this
 //    one (the photos grid itself stays writer-only).
 // A share visitor gets none of these — the modal is purely read-only.
+//
+// The person's avatar comes from the live people list (useApp): when the
+// photos manager changes the avatar underneath, the (paused) details modal
+// re-renders with the new thumbnail.
 
 import { useEffect, useRef, useState } from "preact/hooks";
 import * as api from "../api";
@@ -25,30 +29,26 @@ import {
 	parseBirthText,
 } from "../birthdate";
 import { useToast } from "../toast";
+import { useApp } from "../appStore";
+import { useModals } from "../modalRegistry";
 import { Avatar } from "./Avatar";
 import { MetaRows } from "./MetaRows";
 import { Modal } from "./Modal";
 
 interface PersonModalProps {
-	/** name of the open person; null = closed */
-	person: string | null;
-	/** the repository the person lives in ("" while closed) */
-	repoId: string;
-	/** may edit meta / manage photos? (writer or admin of this repo) */
-	canManage: boolean;
-	/** avatar URL for the open person (from the people-list summary) */
-	thumb: string | null;
+	/** injected by the modal service (instances render open) */
+	open: boolean;
+	/** injected by the modal service; closing unmounts the instance */
 	onCloseRequest: () => void;
-	/** open the photos manager for this person (stacked on top) */
-	onManagePhotos: (name: string) => void;
-	/** meta saved → refresh people + health (aliases feed the list search) */
-	onChange: () => void;
-	/** details document arrived (share mode learns repo_name from it) */
-	onDetailLoaded?: (d: PersonDetail) => void;
+	/** the person whose details are shown */
+	name: string;
 }
 
 export function PersonModal(props: PersonModalProps) {
 	const toast = useToast();
+	const app = useApp();
+	const modals = useModals();
+	const { name: person, open, onCloseRequest } = props;
 
 	const [detail, setDetail] = useState<PersonDetail | null>(null);
 	const [loadHint, setLoadHint] = useState("Loading details…");
@@ -63,27 +63,26 @@ export function PersonModal(props: PersonModalProps) {
 	const [birthField, setBirthField] = useState("");
 	const [description, setDescription] = useState("");
 
-	const personRef = useRef<string | null>(props.person);
+	const personRef = useRef(person);
 	const busyRef = useRef(false);
 	const formRef = useRef<HTMLFormElement | null>(null);
+	const repoIdRef = useRef(app.repoId ?? "");
+	repoIdRef.current = app.repoId ?? "";
 
-	useEffect(() => {
-		personRef.current = props.person;
-	}, [props.person]);
+	personRef.current = person;
 
 	const setBusy = (b: boolean) => {
 		busyRef.current = b;
 		setBusyState(b);
 	};
 
-	// Open / person switch: drop any edit session and (re)load the details.
+	// Open: load the details.
 	useEffect(() => {
-		if (!props.person) return;
 		setDetail(null);
 		setLoadHint("Loading details…");
 		setEditing(false);
-		loadDetail(props.person);
-	}, [props.person, props.repoId]);
+		loadDetail(person);
+	}, [person]);
 
 	// Editing: focus the form's first input.
 	useEffect(() => {
@@ -93,10 +92,12 @@ export function PersonModal(props: PersonModalProps) {
 	// Drop responses for a person the user already left behind.
 	async function loadDetail(name: string) {
 		try {
-			const j = await api.getPerson(name, props.repoId);
+			const j = await api.getPerson(name, repoIdRef.current);
 			if (personRef.current !== name) return;
 			setDetail(j);
-			props.onDetailLoaded?.(j);
+			// Share mode learns the repository's human name from the details
+			// document (the app store hooks it; MainApp leaves it unset).
+			app.onPersonDetail?.(j);
 		} catch (e) {
 			if (personRef.current === name) {
 				setLoadHint((e as Error).message || "Could not load the details.");
@@ -104,11 +105,9 @@ export function PersonModal(props: PersonModalProps) {
 		}
 	}
 
-	const open = props.person !== null;
-
 	const close = () => {
 		if (busyRef.current) return; // locked while a request is in flight
-		props.onCloseRequest();
+		onCloseRequest();
 	};
 
 	// Escape cancels the edit session first, then closes.
@@ -169,7 +168,7 @@ export function PersonModal(props: PersonModalProps) {
 			: { year: parts.year ?? null, month: parts.month ?? null, day: parts.day ?? null };
 		setBusy(true);
 		try {
-			const j = await api.setPersonMeta(name, props.repoId, {
+			const j = await api.setPersonMeta(name, repoIdRef.current, {
 				aliases: aliases.map((a) => a.trim()).filter(Boolean),
 				birthdate,
 				urls: urls.map((u) => u.trim()).filter(Boolean),
@@ -178,7 +177,7 @@ export function PersonModal(props: PersonModalProps) {
 			setDetail(j);
 			setEditing(false);
 			toast.show("Details saved.", "ok");
-			props.onChange(); // the people list summary carries aliases
+			app.refreshAll(); // the people list summary carries aliases
 		} catch (err) {
 			toast.show((err as Error).message || "Could not save the details.", "err");
 		} finally {
@@ -188,13 +187,17 @@ export function PersonModal(props: PersonModalProps) {
 
 	function managePhotos() {
 		if (busyRef.current || !personRef.current) return;
-		props.onManagePhotos(personRef.current);
+		// Stacked on top: this modal stays mounted (paused, state intact).
+		modals.open("photos", { person: personRef.current });
 	}
 
 	// The list row editors themselves are the shared MetaRows component.
+	// The avatar follows the live people list (alias/photo changes re-render
+	// this modal with the new thumbnail URL).
+	const thumb = app.people.find((p) => p.name === person)?.thumb ?? null;
 
 	// ---- writer-only header actions ----
-	const writerActions = props.canManage && (
+	const writerActions = app.perms.writer && (
 		<>
 			<button type="button" class="btn btn-ghost btn-sm" id="personEditBtn" hidden={editing} onClick={startEdit}>
 				Edit details
@@ -214,7 +217,7 @@ export function PersonModal(props: PersonModalProps) {
 			backdropClickDisabled={editing}
 			eyebrow="person"
 			titleId="personTitle"
-			title={detail?.name ?? props.person ?? ""}
+			title={detail?.name ?? person}
 			headerActions={writerActions ?? undefined}
 			onEscape={onEscape}
 			onCloseRequest={close}
@@ -225,14 +228,14 @@ export function PersonModal(props: PersonModalProps) {
 					{detail && !editing && (
 						<div id="personDetail">
 							<div class="person-detail-head">
-								<Avatar src={props.thumb ?? ""} name={detail.name} />
+								<Avatar src={thumb ?? ""} name={detail.name} />
 								<p class="field-hint">{plural(detail.photos)} enrolled</p>
 							</div>
 
 							{!hasMeta && (
 								<p class="field-hint person-empty" id="personEmptyHint">
 									No details recorded for this person.
-									{props.canManage ? " Use “Edit details” to add some." : ""}
+									{app.perms.writer ? " Use “Edit details” to add some." : ""}
 								</p>
 							)}
 

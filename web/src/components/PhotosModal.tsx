@@ -1,15 +1,18 @@
 // Photos manager modal.
-// Opens from the person details modal (admins only): the grid lists their
+// Opens from the person details modal (writers, via the modal service — the
+// details modal stays mounted underneath, paused): the grid lists their
 // enrolled photos (remove per tile, add via drop/paste/browse); clicking a
 // tile opens the detail view, which runs detection on the stored photo and
 // draws the faces over it so the user can judge the photo's quality. The
 // header carries an inline rename editor; saving renames everything
-// server-side.
+// server-side and patches both open modals' person (the photos manager
+// reloads under the new name, the details modal follows).
 //
 // Any two enrolled photos of this person can be compared face-to-face: each
 // grid tile has a compare button (the detail view has a "Compare faces…"
 // button) — the first pick marks the photo (A), the second pick loads both
-// photos and launches the compare modal, auto-running the similarity check.
+// photos and opens the compare modal seeded, auto-running the similarity
+// check.
 
 import { useEffect, useRef, useState } from "preact/hooks";
 import type { TargetedEvent } from "preact";
@@ -17,28 +20,30 @@ import * as api from "../api";
 import type { Face, PersonPhoto } from "../types";
 import { drawFaces } from "../overlay";
 import { useToast } from "../toast";
+import { useApp } from "../appStore";
+import { useModals } from "../modalRegistry";
+import { usePasteFiles } from "../paste";
 import { Modal } from "./Modal";
 
 interface PhotosModalProps {
-	/** name of the person being managed; null = closed */
-	person: string | null;
-	/** the repository the person lives in ("" while closed) */
-	repoId: string;
+	/** injected by the modal service (instances render open) */
+	open: boolean;
+	/** injected by the modal service: true while no other instance sits above */
+	isTopmost: boolean;
+	/** injected by the modal service; closing unmounts the instance */
 	onCloseRequest: () => void;
-	/** the person was renamed server-side; App updates the open person */
-	onRenamed: (name: string) => void;
-	/** photos added/removed or avatar changed → refresh people + health */
-	onChange: () => void;
-	/** compare two enrolled photos face-to-face (opens the compare modal) */
-	onComparePhotos: (a: File, b: File) => void;
-	registerAddFiles: (fn: ((files: FileList | File[]) => void) | null) => void;
+	/** the person being managed */
+	person: string;
 }
 
 export function PhotosModal(props: PhotosModalProps) {
 	const toast = useToast();
+	const app = useApp();
+	const modals = useModals();
+	const { open, isTopmost, onCloseRequest } = props;
 	// The repo the open person belongs to, stable for imperative closures.
-	const repoRef = useRef(props.repoId);
-	repoRef.current = props.repoId;
+	const repoIdRef = useRef(app.repoId ?? "");
+	repoIdRef.current = app.repoId ?? "";
 
 	const [photos, setPhotos] = useState<PersonPhoto[] | null>(null);
 	const [hint, setHint] = useState("Loading photos…");
@@ -52,7 +57,7 @@ export function PhotosModal(props: PhotosModalProps) {
 	// Enrolled photo currently marked as photo A of a comparison (path).
 	const [cmpPath, setCmpPath] = useState<string | null>(null);
 
-	const personRef = useRef<string | null>(props.person);
+	const personRef = useRef(props.person);
 	const detailRef = useRef<string | null>(null);
 	const busyRef = useRef(false);
 	const detailImgRef = useRef<HTMLImageElement | null>(null);
@@ -62,18 +67,15 @@ export function PhotosModal(props: PhotosModalProps) {
 
 	// Keep the ref in sync for imperative closures (click handlers, async
 	// continuations that must observe "which person/detail is current now").
-	useEffect(() => {
-		personRef.current = props.person;
-	}, [props.person]);
+	personRef.current = props.person;
 
 	const setBusy = (b: boolean) => {
 		busyRef.current = b;
 		setBusyState(b);
 	};
 
-	// Open / person switch: drop any detail view and load the grid.
+	// Open: drop any detail view and load the grid.
 	useEffect(() => {
-		if (!props.person) return;
 		detailRef.current = null;
 		setDetailPath(null);
 		setRenaming(false);
@@ -83,20 +85,18 @@ export function PhotosModal(props: PhotosModalProps) {
 		loadGrid(props.person);
 	}, [props.person]);
 
-	// Paste routing surface (registered with App).
-	useEffect(() => {
-		props.registerAddFiles((files) => {
-			if (busyRef.current || !personRef.current || detailRef.current !== null) return;
-			addPhotos(files);
-		});
-		return () => props.registerAddFiles(null);
-	}, []);
-
-	const open = props.person !== null;
+	// ---- paste routing (via the injected isTopmost flag) ----
+	// While this modal is topmost, pasted images upload straight into that
+	// person's profile — but not while the detail view is showing (the add
+	// grid is gone).
+	usePasteFiles(isTopmost, (files) => {
+		if (busyRef.current || !personRef.current || detailRef.current !== null) return;
+		addPhotos(files);
+	});
 
 	const close = () => {
 		if (busyRef.current) return; // locked while a request is in flight
-		props.onCloseRequest();
+		onCloseRequest();
 	};
 
 	// Escape cancels the inline rename edit, then a pending compare pick,
@@ -111,7 +111,7 @@ export function PhotosModal(props: PhotosModalProps) {
 	async function loadGrid(name: string) {
 		setHint("Loading photos…");
 		try {
-			const j = await api.getPersonPhotos(name, repoRef.current);
+			const j = await api.getPersonPhotos(name, repoIdRef.current);
 			const list = j.photos || [];
 			setPhotos(list);
 			setHint(list.length
@@ -157,16 +157,18 @@ export function PhotosModal(props: PhotosModalProps) {
 
 		setBusy(true);
 		try {
-			const j = await api.renamePerson(oldName, repoRef.current, newName);
+			const j = await api.renamePerson(oldName, repoIdRef.current, newName);
 			const canonical = j.name || newName; // DB-canonical name
 			// Photo URLs embed the person's name: drop any open detail view and
-			// reload the grid under the new name (the person-prop effect does it).
+			// reload the grid under the new name (the person-args effect does
+			// it), and let the details modal underneath follow the person too.
 			detailRef.current = null;
 			setDetailPath(null);
 			cancelRename();
-			props.onRenamed(canonical);
+			modals.patch("photos", { person: canonical });
+			modals.patch("person", { name: canonical }, (cur) => cur?.name === oldName);
 			toast.show(`Renamed to ${canonical}.`, "ok");
-			props.onChange(); // refresh people list + health
+			app.refreshAll(); // refresh people list + health
 		} catch (err) {
 			toast.show((err as Error).message || "Could not rename.", "err");
 		} finally {
@@ -188,7 +190,7 @@ export function PhotosModal(props: PhotosModalProps) {
 		const c = detailCanvasRef.current;
 		c?.getContext("2d")?.clearRect(0, 0, c.width, c.height);
 		try {
-			const j = await api.detectPhoto(person, repoRef.current, photoPath);
+			const j = await api.detectPhoto(person, repoIdRef.current, photoPath);
 			if (detailRef.current !== photoPath) return; // view moved on
 			renderVerdict(j.faces || [], photoPath);
 		} catch (e) {
@@ -260,11 +262,12 @@ export function PhotosModal(props: PhotosModalProps) {
 		setBusy(true);
 		try {
 			const [a, b] = await Promise.all([
-				api.fetchPhotoFile(person, repoRef.current, aPath),
-				api.fetchPhotoFile(person, repoRef.current, bPath),
+				api.fetchPhotoFile(person, repoIdRef.current, aPath),
+				api.fetchPhotoFile(person, repoIdRef.current, bPath),
 			]);
 			setCmpPath(null);
-			props.onComparePhotos(a, b);
+			// Stacked on top of this modal (which stays open underneath).
+			modals.open("compare", { seed: { a, b } });
 		} catch (e) {
 			setCmpPath(null);
 			toast.show((e as Error).message || "Could not load the photos for comparison.", "err");
@@ -297,7 +300,7 @@ export function PhotosModal(props: PhotosModalProps) {
 		if (!confirm(`Remove ${photoPath} from ${person}? The file is deleted from the people folder too.`)) return;
 		setBusy(true);
 		try {
-			await api.deletePhoto(person, repoRef.current, photoPath);
+			await api.deletePhoto(person, repoIdRef.current, photoPath);
 			toast.show(`Removed ${photoPath}.`, "ok");
 			if (detailRef.current === photoPath) {
 				detailRef.current = null;
@@ -305,7 +308,7 @@ export function PhotosModal(props: PhotosModalProps) {
 			}
 			if (cmpPath === photoPath) setCmpPath(null); // was marked for comparison
 			loadGrid(person);
-			props.onChange();
+			app.refreshAll();
 		} catch (e) {
 			toast.show((e as Error).message || "Could not remove the photo.", "err");
 		} finally {
@@ -318,9 +321,9 @@ export function PhotosModal(props: PhotosModalProps) {
 		if (busyRef.current || !person || !detailRef.current) return;
 		setBusy(true);
 		try {
-			await api.setThumbnail(person, repoRef.current, detailRef.current);
+			await api.setThumbnail(person, repoIdRef.current, detailRef.current);
 			toast.show("Avatar updated.", "ok");
-			props.onChange();
+			app.refreshAll();
 		} catch (e) {
 			toast.show((e as Error).message || "Could not update the avatar.", "err");
 		} finally {
@@ -339,12 +342,12 @@ export function PhotosModal(props: PhotosModalProps) {
 		setBusy(true);
 		setHint(`Uploading ${files.length} photo${files.length === 1 ? "" : "s"}…`);
 		try {
-			const j = await api.enrollPhotos(person, repoRef.current, files);
+			const j = await api.enrollPhotos(person, repoIdRef.current, files);
 			if (j.added > 0) toast.show(`Added ${j.added} photo${j.added === 1 ? "" : "s"}.`, "ok");
 			if (j.failures && j.failures.length) {
 				toast.show(`${j.failures.length} photo(s) rejected: ${j.failures[0]}`, "err");
 			}
-			props.onChange();
+			app.refreshAll();
 		} catch (e) {
 			toast.show((e as Error).message || "Upload failed.", "err");
 		} finally {
@@ -368,7 +371,7 @@ export function PhotosModal(props: PhotosModalProps) {
 			locked={busy}
 			eyebrow="photos"
 			titleId="photoTitle"
-			title={props.person ?? ""}
+			title={props.person}
 			headerExtras={
 				<form
 					id="photoRenameForm"
@@ -428,8 +431,8 @@ export function PhotosModal(props: PhotosModalProps) {
 								{(photos ?? []).map((ph) => (
 									<PhotoTile
 										key={ph.path}
-										person={props.person ?? ""}
-										repoId={props.repoId}
+										person={props.person}
+										repoId={app.repoId ?? ""}
 										ph={ph}
 										cmpMark={cmpPath === ph.path}
 										onOpen={() => openDetail(ph.path)}
@@ -479,7 +482,7 @@ export function PhotosModal(props: PhotosModalProps) {
 									ref={detailImgRef}
 									id="photoDetailImg"
 									alt="Enrolled photo"
-									src={api.withRepoQuery(api.photoURL(props.person ?? "", detailPath), props.repoId)}
+									src={api.withRepoQuery(api.photoURL(props.person, detailPath), app.repoId ?? "")}
 								/>
 								<canvas ref={detailCanvasRef} id="photoOverlay" />
 							</div>

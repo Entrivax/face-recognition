@@ -2,6 +2,12 @@
 // each face's identity with its ranked matches. Unknown faces can be named
 // and enrolled right from their row (re-sending the same file with the
 // row's 1-based face index).
+//
+// Clipboard images with no modal to take them land here (the modal
+// service's fallback route). The photo editor is opened through the modal
+// service and keeps its per-file session in this component's vault between
+// the close (which unmounts the editor and hands the session back) and the
+// next Edit on the same file.
 
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import type { TargetedDragEvent, TargetedKeyboardEvent } from "preact";
@@ -9,33 +15,38 @@ import * as api from "../api";
 import type { Face } from "../types";
 import { drawWhenReady } from "../overlay";
 import { useToast } from "../toast";
-import { EditModal } from "./EditModal";
+import { useApp } from "../appStore";
+import { useModals } from "../modalRegistry";
+import { usePasteFiles, PASTE_FALLBACK } from "../paste";
+import type { EditSession } from "./EditModal";
 
 interface StageProps {
 	/** may enroll people in this repo (writer or admin)? gates the Edit
 	 *  buttons and the per-face "name this person" enroll form — readers and
 	 *  share visitors get a pure inspection stage */
 	canEnroll: boolean;
-	/** the repository recognition runs against */
-	repoId: string;
-	/** refresh people + health after a face was enrolled from a row */
-	onEnrolled: () => void;
-	/** register the paste-routing entry point (inspect a file on the stage) */
-	registerInspect: (fn: ((file: File) => void) | null) => void;
-	/** report editor visibility to App (body scroll lock + paste routing) */
-	onEditOpenChange: (open: boolean) => void;
 }
 
-export function Stage({ canEnroll, repoId, onEnrolled, registerInspect, onEditOpenChange }: StageProps) {
+/** The editor's session vault: the committed session of the file it belongs
+ *  to (null source = no session kept). File identity is the key — any other
+ *  file invalidates it. */
+interface EditVault {
+	source: File | null;
+	session: EditSession | null;
+}
+
+export function Stage({ canEnroll }: StageProps) {
 	const toast = useToast();
+	const app = useApp();
+	const modals = useModals();
+	const repoId = app.repoId;
+	const refreshAll = app.refreshAll;
 
 	const [previewURL, setPreviewURL] = useState<string | null>(null);
 	const [meta, setMeta] = useState("");
 	const [faces, setFaces] = useState<Face[] | null>(null);
 	const [enrolled, setEnrolled] = useState<Record<number, string>>({});
 	const [drag, setDrag] = useState(false);
-	// Source file while the photo editor is open (null = closed).
-	const [editSource, setEditSource] = useState<File | null>(null);
 
 	const fileInputRef = useRef<HTMLInputElement | null>(null);
 	const imgRef = useRef<HTMLImageElement | null>(null);
@@ -54,6 +65,16 @@ export function Stage({ canEnroll, repoId, onEnrolled, registerInspect, onEditOp
 	// cleared — otherwise every inspected photo would stay pinned in memory.
 	const stageURLRef = useRef<string | null>(null);
 	const reqSeq = useRef(0);
+	// The editor's per-file session vault (see EditVault).
+	const editVaultRef = useRef<EditVault>({ source: null, session: null });
+
+	// repoId changes must not invalidate the mount-stable callbacks (an open
+	// editor's onUse arg must keep working across a repo switch) — they read
+	// the current value through this ref.
+	const repoIdRef = useRef(repoId);
+	repoIdRef.current = repoId;
+	const refreshRef = useRef(refreshAll);
+	refreshRef.current = refreshAll;
 
 	const openPicker = () => fileInputRef.current?.click();
 
@@ -90,7 +111,7 @@ export function Stage({ canEnroll, repoId, onEnrolled, registerInspect, onEditOp
 		setEnrolled({});
 		setMeta("analyzing…");
 		try {
-			const j = await api.recognize(file, repoId);
+			const j = await api.recognize(file, repoIdRef.current ?? "");
 			if (seq !== reqSeq.current) return; // another file took over
 			setFaces(j.faces || []);
 			setMeta(`${file.name} · ${(file.size / 1024).toFixed(0)} KB`);
@@ -99,20 +120,15 @@ export function Stage({ canEnroll, repoId, onEnrolled, registerInspect, onEditOp
 			setMeta("");
 			toast.show((e as Error).message || "Recognition failed.", "err");
 		}
-	}, [repoId, toast]);
+	}, [toast]);
 
-	// Paste routing entry point.
-	useEffect(() => {
-		registerInspect(handleFile);
-		return () => registerInspect(null);
-	}, [handleFile, registerInspect]);
-
-	// Editor visibility goes up to App: it owns the body scroll lock and the
-	// paste routing that must not swap the stage photo under an open editor.
-	useEffect(() => {
-		onEditOpenChange(editSource !== null);
-		return () => onEditOpenChange(false);
-	}, [editSource, onEditOpenChange]);
+	// Clipboard routing entry point: when no modal is interested (registered
+	// under a modal key), the paste lands here (the reserved "*" fallback).
+	// More than one image: the first is inspected, the rest reported.
+	usePasteFiles(true, (files) => {
+		void handleFile(files[0]);
+		if (files.length > 1) toast.show("Clipboard had several images — inspecting the first.");
+	}, PASTE_FALLBACK);
 
 	// Draw the overlay once both the image and the faces are ready.
 	useEffect(() => {
@@ -121,15 +137,41 @@ export function Stage({ canEnroll, repoId, onEnrolled, registerInspect, onEditOp
 		}
 	}, [previewURL, faces]);
 
+	// The editor hands its committed session back at close time; keep it for
+	// this file only (a different file invalidates the vault entry).
+	const saveEditorSession = useCallback((source: File, session: EditSession) => {
+		const vault = editVaultRef.current;
+		if (vault.source === source) vault.session = session;
+		else editVaultRef.current = { source, session };
+	}, []);
+
 	// "Use this image": re-inspect the exported file like any fresh upload
 	// (preview + recognition re-run, same reqSeq guard), while remembering
 	// which pristine original it came from — the next Edit round reopens the
-	// editor over that original with the committed history restored.
+	// editor over that original with the committed history restored. The
+	// editor instance closes (= unmounts) and saved its session into the
+	// vault on the way out.
 	const applyEdited = useCallback((exported: File) => {
 		const original = editOriginalRef.current ?? currentFileRef.current;
-		setEditSource(null);
+		modals.close("edit");
 		if (original) void handleFile(exported, original);
-	}, [handleFile]);
+	}, [modals, handleFile]);
+
+	// Open the editor over the pristine original (or the fresh upload) —
+	// never the previously exported bytes. The session vault rides along:
+	// when it holds a session for this file it is restored (initialSession),
+	// and the editor saves back into it at close time (onSaveSession).
+	const openEditor = useCallback(() => {
+		const source = editOriginalRef.current ?? currentFileRef.current;
+		if (!source) return;
+		const vault = editVaultRef.current;
+		modals.open("edit", {
+			source,
+			initialSession: vault.source === source ? vault.session : null,
+			onUse: applyEdited,
+			onSaveSession: saveEditorSession,
+		});
+	}, [modals, applyEdited, saveEditorSession]);
 
 	const onDropzoneClick = () => {
 		if (previewURL === null) openPicker();
@@ -152,18 +194,18 @@ export function Stage({ canEnroll, repoId, onEnrolled, registerInspect, onEditOp
 	const handleRowEnroll = useCallback((faceNo: number, person: string, done: (ok: boolean) => void) => {
 		const file = currentFileRef.current;
 		if (!file) { done(false); return; }
-		api.enrollFace(person, repoId, file, faceNo)
+		api.enrollFace(person, repoIdRef.current ?? "", file, faceNo)
 			.then((j) => {
 				toast.show(`Enrolled ${person} (${j.saved}).`, "ok");
 				setEnrolled((m) => ({ ...m, [faceNo - 1]: person }));
-				onEnrolled();
+				refreshRef.current();
 				done(true);
 			})
 			.catch((err: Error) => {
 				toast.show(err.message || "Enrollment failed.", "err");
 				done(false);
 			});
-	}, [repoId, onEnrolled, toast]);
+	}, [toast]);
 
 	const cursor = previewURL ? "default" : "pointer";
 
@@ -229,9 +271,7 @@ export function Stage({ canEnroll, repoId, onEnrolled, registerInspect, onEditOp
 							hidden={previewURL === null}
 							onClick={(e) => {
 								e.stopPropagation();
-								// Edit the pristine original (or the fresh upload) — never
-								// the previously exported bytes.
-								setEditSource(editOriginalRef.current ?? currentFileRef.current);
+								openEditor();
 							}}
 						>
 							Edit
@@ -282,12 +322,6 @@ export function Stage({ canEnroll, repoId, onEnrolled, registerInspect, onEditOp
 					</ul>
 				</div>
 			)}
-
-			<EditModal
-				source={editSource}
-				onCloseRequest={() => setEditSource(null)}
-				onUse={applyEdited}
-			/>
 		</section>
 	);
 }

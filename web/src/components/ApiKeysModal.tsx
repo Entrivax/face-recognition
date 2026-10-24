@@ -11,7 +11,9 @@ import { useToast } from "../toast";
 import { Modal } from "./Modal";
 
 interface ApiKeysModalProps {
+	/** injected by the modal service (instances render open) */
 	open: boolean;
+	/** injected by the modal service; closing unmounts the instance */
 	onCloseRequest: () => void;
 }
 

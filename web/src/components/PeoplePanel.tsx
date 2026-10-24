@@ -6,44 +6,26 @@
 // see the current value as read-only text), compare is open to any
 // signed-in user. The filter matches names and aliases; when only an alias
 // matched, the row shows that alias ("aka") so the hit explains itself.
+// Data comes from the app store; the dialogs open through the modal service.
 
 import { useEffect, useState } from "preact/hooks";
 import type { TargetedEvent } from "preact";
 import type { PersonSummary } from "../types";
+import { useApp, type Perms } from "../appStore";
+import { useModals } from "../modalRegistry";
 import { Avatar } from "./Avatar";
 import { foldText } from "../util";
 
-/** What the viewer (signed-in user or share visitor) may do in this repo. */
-export interface Perms {
-	/** a signed-in user (false for share visitors) */
-	user: boolean;
-	/** may enroll/modify people in the selected repo (writer or admin) */
-	writer: boolean;
-	/** server administrator */
-	admin: boolean;
-}
+export type { Perms } from "../appStore";
 
 interface PeoplePanelProps {
 	perms: Perms;
-	people: PersonSummary[];
-	peopleErr: boolean;
-	/** server-persisted threshold; null = unknown (share mode) → row hidden */
-	threshold: number | null;
-	onThresholdCommit: (v: number) => void;
-	onRescan: () => Promise<void>;
-	onOpenPerson: (name: string) => void;
-	onRemove: (name: string) => void;
-	onEnrollClick: () => void;
-	onCompareClick: () => void;
 }
 
-export function PeoplePanel(props: PeoplePanelProps) {
-	const {
-		perms,
-		people, peopleErr, threshold,
-		onThresholdCommit, onRescan,
-		onOpenPerson, onRemove,
-	} = props;
+export function PeoplePanel({ perms }: PeoplePanelProps) {
+	const app = useApp();
+	const modals = useModals();
+	const { people, peopleErr, threshold } = app;
 
 	const [query, setQuery] = useState("");
 	const [slider, setSlider] = useState(() => threshold === null ? "0.45" : Number(threshold).toFixed(2));
@@ -77,7 +59,7 @@ export function PeoplePanel(props: PeoplePanelProps) {
 	const doRescan = async () => {
 		setRescanning(true);
 		try {
-			await onRescan();
+			await app.rescan();
 		} finally {
 			setRescanning(false);
 		}
@@ -85,6 +67,7 @@ export function PeoplePanel(props: PeoplePanelProps) {
 
 	const searchInput = (e: TargetedEvent<HTMLInputElement>) => setQuery(e.currentTarget.value);
 	const slideInput = (e: TargetedEvent<HTMLInputElement>) => setSlider(e.currentTarget.value);
+	const commitThreshold = () => void app.commitThreshold(Number(slider));
 
 	return (
 		<aside class="panel people" aria-labelledby="peopleTitle">
@@ -111,7 +94,7 @@ export function PeoplePanel(props: PeoplePanelProps) {
 						value={slider}
 						aria-label="Match threshold"
 						onInput={slideInput}
-						onChange={() => onThresholdCommit(Number(slider))}
+						onChange={commitThreshold}
 					/>
 					<span class="threshold-value" id="thresholdValue">{Number(slider).toFixed(2)}</span>
 				</div>
@@ -129,12 +112,12 @@ export function PeoplePanel(props: PeoplePanelProps) {
 			{(perms.writer || perms.user) && (
 				<div class="people-actions">
 					{perms.writer && (
-						<button id="enrollBtn" class="btn btn-accent" aria-haspopup="dialog" onClick={props.onEnrollClick}>
+						<button id="enrollBtn" class="btn btn-accent" aria-haspopup="dialog" onClick={() => modals.open("enroll")}>
 							Enroll new person
 						</button>
 					)}
 					{perms.user && (
-						<button id="compareBtn" class="btn" aria-haspopup="dialog" onClick={props.onCompareClick}>
+						<button id="compareBtn" class="btn" aria-haspopup="dialog" onClick={() => modals.open("compare")}>
 							Compare two photos
 						</button>
 					)}
@@ -161,8 +144,8 @@ export function PeoplePanel(props: PeoplePanelProps) {
 						person={p}
 						aka={aka}
 						canRemove={perms.writer}
-						onOpen={onOpenPerson}
-						onRemove={onRemove}
+						onOpen={(name) => modals.open("person", { name })}
+						onRemove={(name) => void app.removePerson(name)}
 					/>
 				))}
 				{noMatch && <li class="people-nomatch">No people match “{query.trim()}”.</li>}

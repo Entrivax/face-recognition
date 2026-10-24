@@ -9,7 +9,9 @@ import { useToast } from "../toast";
 import { Modal } from "./Modal";
 
 interface ChangePasswordModalProps {
+	/** injected by the modal service (instances render open) */
 	open: boolean;
+	/** injected by the modal service; closing unmounts the instance */
 	onCloseRequest: () => void;
 }
 
