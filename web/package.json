@@ -9,7 +9,7 @@
 		"preview": "vite preview"
 	},
 	"dependencies": {
-		"@preact/signals": "^2.11.3",
+		"@preact/signals": "^2.11.4",
 		"dompurify": "^3.4.17",
 		"marked": "^18.1.1",
 		"preact": "^11.0.1"

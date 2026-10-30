@@ -108,6 +108,8 @@ export function EditModal(props: EditModalProps) {
 	const crop = useSignal<Rect | null>(null);
 	const busy = useSignal(false);
 	const src = useSignal<HTMLCanvasElement | null>(null); // decoded original
+	const view = useSignal<HTMLCanvasElement | null>(null);
+	const overlay = useSignal<HTMLCanvasElement | null>(null);
 
 	// Props mirrors for stable reads in the unmount cleanup and the async
 	// decode flow (props are not signals).
@@ -119,10 +121,10 @@ export function EditModal(props: EditModalProps) {
 	saveRef.current = onSaveSession;
 
 	const decodedForRef = useRef<File | null>(null);
-	const viewRef = useRef<HTMLCanvasElement | null>(null);
-	const overlayRef = useRef<HTMLCanvasElement | null>(null);
 	const dragRef = useRef<{ x: number; y: number } | null>(null);
 	const scratchRef = useRef<[HTMLCanvasElement, HTMLCanvasElement] | null>(null);
+	const setView = useCallback((canvas: HTMLCanvasElement | null) => { view.value = canvas; }, []);
+	const setOverlay = useCallback((canvas: HTMLCanvasElement | null) => { overlay.value = canvas; }, []);
 
 	const getScratch = (): [HTMLCanvasElement, HTMLCanvasElement] => {
 		if (!scratchRef.current) {
@@ -210,17 +212,17 @@ export function EditModal(props: EditModalProps) {
 	useSignalEffect(() => {
 		const s = src.value;
 		const ops = previewOps.value;
-		const view = viewRef.current;
-		if (!s || !view) return;
+		const canvas = view.value;
+		if (!s || !canvas) return;
 		const out = foldOps(s, ops ?? [], getScratch());
 		if (out === s) {
-			view.width = s.width;
-			view.height = s.height;
+			canvas.width = s.width;
+			canvas.height = s.height;
 		} else {
-			view.width = out.width;
-			view.height = out.height;
+			canvas.width = out.width;
+			canvas.height = out.height;
 		}
-		const ctx = view.getContext("2d");
+		const ctx = canvas.getContext("2d");
 		if (ctx) ctx.drawImage(out, 0, 0);
 	});
 
@@ -230,12 +232,12 @@ export function EditModal(props: EditModalProps) {
 	useSignalEffect(() => {
 		previewOps.value;
 		const c = crop.value;
-		const view = viewRef.current;
-		const ov = overlayRef.current;
-		if (!view || !ov) return;
-		if (ov.width !== view.width || ov.height !== view.height) {
-			ov.width = view.width;
-			ov.height = view.height;
+		const canvas = view.value;
+		const ov = overlay.value;
+		if (!canvas || !ov) return;
+		if (ov.width !== canvas.width || ov.height !== canvas.height) {
+			ov.width = canvas.width;
+			ov.height = canvas.height;
 		}
 		drawCrop(ov, c);
 	});
@@ -313,13 +315,13 @@ export function EditModal(props: EditModalProps) {
 		})
 	};
 	const applyCrop = () => {
-		const view = viewRef.current;
+		const canvas = view.peek();
 		const c = crop.value;
-		if (!view || !c || c.w < MIN_CROP || c.h < MIN_CROP) return;
-		const x = clamp(c.x, 0, view.width - MIN_CROP);
-		const y = clamp(c.y, 0, view.height - MIN_CROP);
-		const w = clamp(c.w, MIN_CROP, view.width - x);
-		const h = clamp(c.h, MIN_CROP, view.height - y);
+		if (!canvas || !c || c.w < MIN_CROP || c.h < MIN_CROP) return;
+		const x = clamp(c.x, 0, canvas.width - MIN_CROP);
+		const y = clamp(c.y, 0, canvas.height - MIN_CROP);
+		const w = clamp(c.w, MIN_CROP, canvas.width - x);
+		const h = clamp(c.h, MIN_CROP, canvas.height - y);
 		batch(() => {
 			commit({ kind: "crop", x, y, w, h });
 			crop.value = null;
@@ -418,9 +420,9 @@ export function EditModal(props: EditModalProps) {
 						<Show when={src} fallback={<p class="edit-loading">Loading image…</p>}>
 							{() => (
 								<div class="edit-canvas-wrap" data-cropping={tool.value === "crop" ? "true" : undefined}>
-									<canvas ref={viewRef} class="edit-canvas" aria-label="Photo being edited" />
+									<canvas ref={setView} class="edit-canvas" aria-label="Photo being edited" />
 									<canvas
-										ref={overlayRef}
+										ref={setOverlay}
 										class="edit-overlay"
 										aria-hidden="true"
 										onPointerDown={onCropDown}

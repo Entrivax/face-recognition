@@ -26,13 +26,14 @@ export function MetaRows(props: {
 	const entries = props.entries.value;
 
 	function rowInput(i: number, v: string) {
-		const next = [...entries];
+		const cur = props.entries.value;
+		const next = [...cur];
 		next[i] = v;
-		if (i === entries.length - 1 && v.trim() !== "") next.push("");
+		if (i === cur.length - 1 && v.trim() !== "") next.push("");
 		props.onChange(next);
 	}
 	function rowRemove(i: number) {
-		const next = entries.filter((_, j) => j !== i);
+		const next = props.entries.value.filter((_, j) => j !== i);
 		if (next.length === 0 || next[next.length - 1].trim() !== "") next.push("");
 		props.onChange(next);
 	}

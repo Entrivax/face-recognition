@@ -6,6 +6,7 @@ import type { TargetedEvent } from "preact";
 import * as api from "../api";
 import { batch, computed, createModel, Signal, signal, useModel, type ReadonlySignal } from "@preact/signals";
 import { Show, useLiveSignal } from "@preact/signals/utils";
+import { useEffect } from "preact/hooks"
 
 interface LoginViewProps {
 	/** credentials accepted — App re-probes the session */
@@ -67,6 +68,10 @@ export function LoginView({ onAuthed }: LoginViewProps) {
 	const onAuthedSignal = useLiveSignal(onAuthed);
 	const model = useModel(() => new LoginViewModel(onAuthedSignal));
 
+	useEffect(() => {
+		model.usernameInputRef.peek()?.focus();
+	}, []);
+
 	return (
 		<div class="auth-page">
 			<div class="auth-card" id="loginCard">
@@ -107,7 +112,7 @@ export function LoginView({ onAuthed }: LoginViewProps) {
 					/>
 
 					<Show when={model.error}>
-						<p class="auth-error" id="loginError" role="alert">{model.error}</p>
+						{(msg) => <p class="auth-error" id="loginError" role="alert">{msg}</p>}
 					</Show>
 
 					<button type="submit" id="loginSubmit" class="btn btn-accent" disabled={model.submitDisabled}>

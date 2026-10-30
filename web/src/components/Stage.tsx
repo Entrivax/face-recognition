@@ -14,7 +14,7 @@
 // editor session vault).
 
 import { useCallback, useRef } from "preact/hooks";
-import { useComputed, useSignal, useSignalEffect } from "@preact/signals";
+import { batch, useComputed, useSignal, useSignalEffect } from "@preact/signals";
 import type { Signal } from "@preact/signals";
 import { For, Show } from "@preact/signals/utils";
 import type { TargetedDragEvent, TargetedKeyboardEvent } from "preact";
@@ -58,7 +58,7 @@ export function Stage() {
 	// editor over the original with the committed history restored, and
 	// backs the "Cancel edits" button (re-inspect the original); any new
 	// upload resets it, so the edit session resets with the photo.
-	const editOriginalRef = useRef<File | null>(null);
+	const editOriginal = useSignal<File | null>(null);
 	// Object URL of the current stage preview; revoked when replaced or
 	// cleared — otherwise every inspected photo would stay pinned in memory.
 	const stageURLRef = useRef<string | null>(null);
@@ -75,12 +75,14 @@ export function Stage() {
 	const resetStage = useCallback(() => {
 		if (stageURLRef.current) URL.revokeObjectURL(stageURLRef.current);
 		stageURLRef.current = null;
-		previewURL.value = null;
-		faces.value = null;
-		meta.value = "";
-		enrolled.value = {};
+		batch(() => {
+			previewURL.value = null;
+			faces.value = null;
+			meta.value = "";
+			enrolled.value = {};
+			editOriginal.value = null;
+		})
 		currentFileRef.current = null;
-		editOriginalRef.current = null;
 	}, []);
 
 	// Inspect one image file: show the preview immediately, then run
@@ -94,16 +96,16 @@ export function Stage() {
 			return;
 		}
 		currentFileRef.current = file;
-		editOriginalRef.current = editedFrom ?? null;
+		editOriginal.value = editedFrom ?? null;
 		const seq = ++reqSeq.current;
 		// Show the preview immediately (revoking the previous object URL).
 		const url = URL.createObjectURL(file);
-		if (stageURLRef.current) URL.revokeObjectURL(stageURLRef.current);
-		stageURLRef.current = url;
-		previewURL.value = url;
-		faces.value = null;
-		enrolled.value = {};
-		meta.value = "analyzing…";
+		resetStage()
+		batch(() => {
+			stageURLRef.current = url;
+			previewURL.value = url;
+			meta.value = "analyzing…";
+		})
 		try {
 			const j = await api.recognize(file, app.repoId.value ?? "");
 			if (seq !== reqSeq.current) return; // another file took over
@@ -114,7 +116,7 @@ export function Stage() {
 			meta.value = "";
 			toast.show((e as Error).message || "Recognition failed.", "err");
 		}
-	}, [toast]);
+	}, [toast, resetStage]);
 
 	// Clipboard routing entry point: when no modal is interested (registered
 	// under a modal key), the paste lands here (the reserved "*" fallback).
@@ -148,7 +150,7 @@ export function Stage() {
 	// editor instance closes (= unmounts) and saved its session into the
 	// vault on the way out.
 	const applyEdited = useCallback((exported: File) => {
-		const original = editOriginalRef.current ?? currentFileRef.current;
+		const original = editOriginal.peek() ?? currentFileRef.current;
 		modals.close("edit");
 		if (original) void handleFile(exported, original);
 	}, [modals, handleFile]);
@@ -158,7 +160,7 @@ export function Stage() {
 	// when it holds a session for this file it is restored (initialSession),
 	// and the editor saves back into it at close time (onSaveSession).
 	const openEditor = useCallback(() => {
-		const source = editOriginalRef.current ?? currentFileRef.current;
+		const source = editOriginal.peek() ?? currentFileRef.current;
 		if (!source) return;
 		const vault = editVaultRef.current;
 		modals.open("edit", {
@@ -280,13 +282,13 @@ export function Stage() {
 						<button
 							id="cancelEditsBtn"
 							class="btn btn-ghost"
-							hidden={editOriginalRef.current === null}
+							hidden={editOriginal.value === null}
 							onClick={(e) => {
 								e.stopPropagation();
 								// Back to the pristine original: re-inspecting it without
 								// the edit lineage resets the editor session and re-runs
 								// recognition on the untouched bytes.
-								const original = editOriginalRef.current;
+								const original = editOriginal.value;
 								if (original) void handleFile(original);
 							}}
 						>

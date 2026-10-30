@@ -201,6 +201,8 @@ export function ReposModal(props: ReposModalProps) {
 		}
 	};
 
+	const createDisabled = useComputed(() => busy.value || !name.value.trim());
+
 	return (
 		<Modal
 			open={props.open}
@@ -227,7 +229,7 @@ export function ReposModal(props: ReposModalProps) {
 							value={name}
 							onInput={(e) => { name.value = e.currentTarget.value; }}
 						/>
-						<button type="submit" class="btn btn-accent btn-sm" disabled={busy.value || !name.value.trim()}>
+						<button type="submit" class="btn btn-accent btn-sm" disabled={createDisabled}>
 							Create repository
 						</button>
 					</form>

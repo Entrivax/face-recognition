@@ -77,16 +77,18 @@ export function ModalProvider({ defs, children }: ModalProviderProps) {
 	const pool = useSignal<ModalInstance[]>([]);
 
 	const open = useCallback((key: string, args: Record<string, unknown> = {}) => {
-		const i = pool.value.findIndex((m) => m.key === key);
+		const current = pool.peek();
+		const i = current.findIndex((m) => m.key === key);
 		pool.value = i < 0
-			? [...pool.value, { key, args }]
-			: pool.value.map((m, j) => (j === i ? { key, args } : m));
+			? [...current, { key, args }]
+			: current.map((m, j) => (j === i ? { key, args } : m));
 	}, [pool]);
 
 	const close = useCallback((...keys: string[]) => {
 		if (!keys.length) return;
 		const gone = new Set(keys);
-		pool.value = pool.value.filter((m) => !gone.has(m.key));
+		const current = pool.peek();
+		pool.value = current.filter((m) => !gone.has(m.key));
 	}, [pool]);
 
 	const patch = useCallback((
@@ -94,11 +96,12 @@ export function ModalProvider({ defs, children }: ModalProviderProps) {
 		partial: Record<string, unknown>,
 		when?: (current: Record<string, unknown> | null) => boolean,
 	) => {
-		const i = pool.value.findIndex((m) => m.key === key);
+		const current = pool.peek();
+		const i = current.findIndex((m) => m.key === key);
 		if (i < 0) return;
-		const inst = pool.value[i];
+		const inst = current[i];
 		if (when && !when(inst.args)) return;
-		pool.value = pool.value.map((m, j) =>
+		pool.value = current.map((m, j) =>
 			j === i ? { key, args: { ...inst.args, ...partial } } : m,
 		);
 	}, [pool]);

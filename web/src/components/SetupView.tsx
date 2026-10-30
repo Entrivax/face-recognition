@@ -8,9 +8,10 @@
 
 import type { TargetedEvent } from "preact";
 import * as api from "../api";
-import { batch, createModel, Signal, signal, useModel, useSignalEffect, type ReadonlySignal } from "@preact/signals";
+import { batch, createModel, Signal, signal, useModel, type ReadonlySignal } from "@preact/signals";
 import { Show, useLiveSignal } from "@preact/signals/utils";
 import { USERNAME_RE } from "../util";
+import { useEffect } from "preact/hooks"
 
 interface SetupViewProps {
 	/** setup + login accepted — App re-probes the session */
@@ -96,9 +97,9 @@ export function SetupView({ onAuthed }: SetupViewProps) {
 
 	// Focus the setup key on mount (the input ref lives on the model as a
 	// signal, so the tracked read drives the effect).
-	useSignalEffect(() => {
-		model.keyInputRef.value?.focus();
-	});
+	useEffect(() => {
+		model.keyInputRef.peek()?.focus();
+	}, []);
 
 	return (
 		<div class="auth-page">
