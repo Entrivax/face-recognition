@@ -107,6 +107,10 @@ func (s *Server) routes() {
 	m.Handle("/api/login", s.auth.LoginHandler()) // rate-limited per client IP
 	m.Handle("/api/logout", s.auth.LogoutHandler())
 	m.Handle("/api/auth/session", s.auth.SessionHandler())
+	// Thumbnails are public: the random repository UUID inside the person ID
+	// is the capability, and a plain <img> URL must work for share visitors
+	// (no header available there).
+	m.Handle("/api/thumbs/", http.HandlerFunc(s.handleThumb))
 	// The owner's API keys and password change; both handlers gate
 	// themselves with RequireAuth (the extra wrapper keeps the mount self-
 	// documenting and costs nothing).
@@ -148,7 +152,6 @@ func (s *Server) routes() {
 	// handlePersonSubroutes with per-subroute roles (writer for
 	// mutations and the photos manager, reader for the detect probe).
 	m.Handle("/api/people/", scoped(http.HandlerFunc(s.handlePersonSubroutes)))
-	m.Handle("/api/thumbs/", scoped(http.HandlerFunc(s.handleThumb)))
 	s.mux = m
 }
 

@@ -102,14 +102,3 @@ export async function setThumbnail(name: string, repoId: string, photoPath: stri
 	});
 	return expectJSON(r, "could not update the avatar");
 }
-
-// In share mode thumbnails cannot be plain <img> URLs: the share token
-// rides a request header, which an <img> element cannot carry — the bytes
-// are fetched through request() (header attached, no cookies) and handed to
-// the DOM as an object URL instead.
-export async function fetchThumbObjectURL(src: string): Promise<string> {
-	const r = await request(src);
-	if (!r.ok) throw new Error("could not load the thumbnail");
-	const blob = await r.blob();
-	return URL.createObjectURL(blob);
-}

@@ -104,11 +104,13 @@ func runMatrix(t *testing.T, rows []matrixRow) {
 // TestAccessMatrixPinsRoles is the route table. Route notes:
 //
 //   - readers (incl. share tokens): people list, person details, recognize,
-//     photo detect, thumbs.
+//     photo detect.
 //   - writers (not share tokens): rescan, person mutations, photos manager,
 //     full-res photos.
 //   - 401 (not 403) for anonymous-without-share everywhere; 403 for
 //     authenticated-but-insufficient.
+//   - thumbs is PUBLIC (no role check; pinned in TestThumbAccess): the
+//     random repo UUID inside the person ID is the capability.
 func TestAccessMatrixPinsRoles(t *testing.T) {
 	rows := []matrixRow{
 		{
@@ -145,7 +147,7 @@ func TestAccessMatrixPinsRoles(t *testing.T) {
 				p := m.e.db.GetInRepo(m.e.repoID, "Alice")
 				return do(t, m.e.s, http.MethodGet, "/api/thumbs/"+p.ID+".jpg", nil, "", c, h)
 			},
-			anonWant: 401, shareWant: 200, otherShare: 401, readerWant: 200, writerWant: 200, outsiderWant: 403, adminWant: 200,
+			anonWant: 200, shareWant: 200, otherShare: 200, readerWant: 200, writerWant: 200, outsiderWant: 200, adminWant: 200,
 		},
 		{
 			name: "rescan",

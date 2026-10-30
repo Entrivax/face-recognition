@@ -517,8 +517,11 @@ command hits a permission error.
 - **Auth is always on** (`internal/auth` + `internal/users`): `api.New`
   returns `(*Server, error)` and builds the auth service. Public routes:
   `/api/setup` (first run only), `/api/login`, `/api/logout`,
-  `/api/auth/session`, `/api/health` and enabled share links — **everything
-  else requires a principal**. Principals: the HttpOnly `recogn_session`
+  `/api/auth/session`, `/api/health`, `/api/thumbs/` (deliberately
+  unauthenticated so plain `<img>` URLs work everywhere — the random repo
+  UUID inside the person ID is the capability) and enabled share links —
+  **everything else requires a principal**. Principals: the HttpOnly
+  `recogn_session`
   cookie (sessions are in-memory — a restart logs everyone out;
   `RECOGN_SESSION_TTL`, default 24h, sliding, bounds them), a personal API
   key (`Authorization: Bearer rk_...`, stored **hashed** in `data/users.db`,

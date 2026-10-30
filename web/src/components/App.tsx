@@ -91,9 +91,9 @@ export function App() {
 	}, [probe]);
 
 	if (sharePath.value.kind === "share") {
-		// Attach before the first child render: Avatar reads the share
-		// context during its own render to decide whether thumbnails need
-		// the header (ShareView re-asserts it and clears it on unmount).
+		// Attach before ShareView mounts: every API request under it then
+		// carries the share header (ShareView re-asserts it and clears it
+		// on unmount).
 		setShareContext({ repoId: sharePath.value.repoId, token: sharePath.value.token });
 		return <ShareView repoId={sharePath.value.repoId} token={sharePath.value.token} />;
 	}

@@ -41,11 +41,6 @@ export function setShareContext(ctx: ShareContext | null): void {
 	shareContext = ctx;
 }
 
-/** Current share context, or null in app mode (Avatar reads this once). */
-export function getShareContext(): ShareContext | null {
-	return shareContext;
-}
-
 let onUnauthorized: (() => void) | null = null;
 
 /** App registers a callback that fires (once per 401) on session expiry. */

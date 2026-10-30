@@ -80,8 +80,9 @@ docker compose logs recogn   # 2. look for: setup key: XXXX-XXXX-XXXX-XXXX
 ```
 
 The compose sample ships **secure by default**: login is always required —
-there is no open mode (only the setup view, `/api/login`, `/api/health` and
-any enabled share link are reachable unauthenticated) — and it publishes the
+there is no open mode (only the setup view, `/api/login`, `/api/health`,
+face thumbnails and any enabled share link are reachable unauthenticated) —
+and it publishes the
 port on `127.0.0.1` only. To serve other machines, point a TLS reverse proxy
 at it (or switch the commented `8080:8080` binding).
 
@@ -312,7 +313,7 @@ to one repository via `X-Share-Token: <repoID>/<token>`.
 | `POST` | `/api/people/{name}/thumbnail` | writer+ | regenerate the face thumbnail from a chosen enrolled photo — JSON `{"photo": "<path>"}` |
 | `POST` | `/api/people/{name}/rename` | writer+ | rename a person — JSON `{"name": "<new name>"}`; moves the person's folder, updates the DB record and the thumbnail sidecar in one step |
 | `DELETE` | `/api/people/{name}` | writer+ | remove a person |
-| `GET`  | `/api/thumbs/{id}.jpg` | reader+ | a person's face thumbnail (square face crop; `?v=` cache-buster follows the chosen photo) |
+| `GET`  | `/api/thumbs/{id}.jpg` | public | a person's face thumbnail (square face crop; `?v=` cache-buster follows the chosen photo) — deliberately unauthenticated so plain `<img>` URLs work everywhere; the random repository UUID inside the id is the capability |
 | `POST` | `/api/recognize?repo=` | reader+ | multipart `image` → `{count, faces:[{bbox,name,person_id,confidence,score,landmarks,matches}]}` — `matches` ranks every identity above the threshold (best per person); near-tied top scores hint at duplicate people. `?draw=1` responds with the annotated JPEG (numbered boxes + labels) instead of JSON; **400 when `repo` is missing** |
 | `POST` | `/api/enroll?repo=` | writer+ | re-scan the repository's folder (incremental unless `force`); `?prune=true` also drops DB photo entries whose files are missing (CLI: `recogn enroll --repo … --prune`) |
 
@@ -330,8 +331,8 @@ curl -s -b cookies.txt -F "image1=@a.jpg" -F "image2=@b.jpg" \
 ```
 
 Every route requires a logged-in user (session cookie or API key) except
-`/api/setup`, `/api/login`, `/api/logout`, `/api/auth/session`, `/api/health`
-and any enabled share link — see
+`/api/setup`, `/api/login`, `/api/logout`, `/api/auth/session`, `/api/health`,
+face thumbnails (`/api/thumbs/`) and any enabled share link — see
 [Users and access control](#users-and-access-control). The per-repo reader /
 writer role is checked against the repository the route acts on.
 
@@ -339,7 +340,9 @@ writer role is checked against the repository the route acts on.
 
 The server **always requires login** — there is no open mode. The only
 unauthenticated routes are the first-run setup view, `/api/login`,
-`/api/logout`, `/api/auth/session`, `/api/health` and any enabled share link
+`/api/logout`, `/api/auth/session`, `/api/health`, the face thumbnails
+(`/api/thumbs/` — the random repository UUID inside the person id is the
+capability) and any enabled share link
 (below).
 
 **First run — setup key**: `recogn serve` with zero users prints a one-time
@@ -354,7 +357,7 @@ per-repository role:
 
 | Role | Access |
 |------|--------|
-| reader | browse a repository's people, details and thumbnails; recognize against it |
+| reader | browse a repository's people and details; recognize against it (thumbnails are public) |
 | writer | reader + enroll / photo management / full-resolution photos |
 | admin | implicitly full access everywhere, plus user/repo/share management |
 

@@ -971,9 +971,9 @@ func TestRecognizeRejectsOversizedImage(t *testing.T) {
 	}
 }
 
-// TestThumbAccess covers the thumbnail route's repo-derived access: repo
-// persons serve to readers (and share tokens) of that repo; legacy persons
-// (RepoID "") serve to the admin only.
+// TestThumbAccess covers the thumbnail route's public contract: any caller
+// (anonymous included) reads an existing sidecar; unknown ids answer 404
+// and non-GET methods are refused.
 func TestThumbAccess(t *testing.T) {
 	eng := &stubEngine{faces: []engine.Face{{BBox: [4]float64{10, 10, 40, 40}}}}
 	e := newEnv(t, eng, "Team", true, true)
@@ -986,14 +986,16 @@ func TestThumbAccess(t *testing.T) {
 		t.Fatalf("expected a thumbnail sidecar, got %+v", p)
 	}
 
-	// Reader + share: 200 with cache headers.
+	// Public: anonymous, a reader and a share token all get the image with
+	// cache headers.
 	for _, actor := range []struct {
+		name   string
 		cookie *http.Cookie
 		hdr    map[string]string
-	}{{e.reader, nil}, {nil, shareHdr(e.repoID, e.shareToken)}} {
+	}{{"anon", nil, nil}, {"reader", e.reader, nil}, {"share", nil, shareHdr(e.repoID, e.shareToken)}} {
 		rec := do(t, e.s, http.MethodGet, "/api/thumbs/"+p.ID+".jpg", nil, "", actor.cookie, actor.hdr)
 		if rec.Code != http.StatusOK {
-			t.Fatalf("thumb: got %d (%s)", rec.Code, rec.Body.String())
+			t.Fatalf("thumb (%s): got %d (%s)", actor.name, rec.Code, rec.Body.String())
 		}
 		if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "image/jpeg") {
 			t.Errorf("content type %q, want image/jpeg", ct)
@@ -1003,12 +1005,7 @@ func TestThumbAccess(t *testing.T) {
 		}
 	}
 
-	// Anonymous → 401 (guard).
-	if rec := get(t, e.s, nil, "/api/thumbs/"+p.ID+".jpg"); rec.Code != http.StatusUnauthorized {
-		t.Errorf("anon thumb: got %d, want 401", rec.Code)
-	}
-
-	// A legacy person's thumbnail is admin-only.
+	// A legacy person's thumbnail is public too.
 	if err := e.db.AddPhoto("Legacy", "l.png", img, []float32{1}); err != nil {
 		t.Fatal(err)
 	}
@@ -1019,20 +1016,12 @@ func TestThumbAccess(t *testing.T) {
 	if err := e.db.SetThumbnail(legacy.ID, pngBytes(t, 32, 32, 9), "l.png"); err != nil {
 		t.Fatal(err)
 	}
-	if rec := get(t, e.s, e.admin, "/api/thumbs/"+legacy.ID+".jpg"); rec.Code != http.StatusOK {
-		t.Errorf("admin legacy thumb: got %d (%s)", rec.Code, rec.Body.String())
-	}
-	if rec := get(t, e.s, e.reader, "/api/thumbs/"+legacy.ID+".jpg"); rec.Code != http.StatusForbidden {
-		t.Errorf("reader legacy thumb: got %d, want 403", rec.Code)
-	}
-	// A share token does not authenticate a principal, so the legacy
-	// (admin-only) thumb answers the same 401 RequireAdmin would.
-	if rec := do(t, e.s, http.MethodGet, "/api/thumbs/"+legacy.ID+".jpg", nil, "", nil, shareHdr(e.repoID, e.shareToken)); rec.Code != http.StatusUnauthorized {
-		t.Errorf("share legacy thumb: got %d, want 401", rec.Code)
+	if rec := get(t, e.s, nil, "/api/thumbs/"+legacy.ID+".jpg"); rec.Code != http.StatusOK {
+		t.Errorf("anon legacy thumb: got %d (%s)", rec.Code, rec.Body.String())
 	}
 
 	// Unknown id → 404; POST → 405.
-	if rec := get(t, e.s, e.admin, "/api/thumbs/nosuch.jpg"); rec.Code != http.StatusNotFound {
+	if rec := get(t, e.s, nil, "/api/thumbs/nosuch.jpg"); rec.Code != http.StatusNotFound {
 		t.Errorf("unknown id: got %d, want 404", rec.Code)
 	}
 	if rec := do(t, e.s, http.MethodPost, "/api/thumbs/"+p.ID+".jpg", nil, "", e.admin, nil); rec.Code != http.StatusMethodNotAllowed {
