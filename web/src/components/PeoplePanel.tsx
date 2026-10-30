@@ -6,68 +6,73 @@
 // see the current value as read-only text), compare is open to any
 // signed-in user. The filter matches names and aliases; when only an alias
 // matched, the row shows that alias ("aka") so the hit explains itself.
-// Data comes from the app store; the dialogs open through the modal service.
+// Data comes from the app store as signals (perms included); the dialogs
+// open through the modal service.
 
-import { useEffect, useState } from "preact/hooks";
 import type { TargetedEvent } from "preact";
-import type { PersonSummary } from "../types";
-import { useApp, type Perms } from "../appStore";
+import { useComputed, useSignal, useSignalEffect } from "@preact/signals";
+import { For, Show } from "@preact/signals/utils";
+import { useApp } from "../appStore";
 import { useModals } from "../modalRegistry";
 import { Avatar } from "./Avatar";
 import { foldText } from "../util";
 
-export type { Perms } from "../appStore";
-
-interface PeoplePanelProps {
-	perms: Perms;
-}
-
-export function PeoplePanel({ perms }: PeoplePanelProps) {
+export function PeoplePanel() {
 	const app = useApp();
 	const modals = useModals();
-	const { people, peopleErr, threshold } = app;
 
-	const [query, setQuery] = useState("");
-	const [slider, setSlider] = useState(() => threshold === null ? "0.45" : Number(threshold).toFixed(2));
-	const [rescanning, setRescanning] = useState(false);
+	// Component-local state as signals: the search text, the slider's
+	// display value and the rescan flag. Everything derived is a computed.
+	const query = useSignal("");
+	const slider = useSignal("0.45");
+	const rescanning = useSignal(false);
 
-	// Mirror the server's persisted threshold into the slider.
-	useEffect(() => {
-		if (threshold !== null) setSlider(Number(threshold).toFixed(2));
-	}, [threshold]);
+	// Mirror the server's persisted threshold into the slider (signal reads
+	// have stable identity — the effect is driven by the value change).
+	useSignalEffect(() => {
+		const threshold = app.threshold.value;
+		if (threshold !== null) slider.value = Number(threshold).toFixed(2);
+	});
 
-	const count = people.length;
-	const countText = peopleErr
-		? "Could not load people."
-		: count
-			? `${count} ${count === 1 ? "person" : "people"} in this repository`
-			: "No one enrolled yet.";
+	const countText = useComputed(() => {
+		const people = app.people.value;
+		const count = people.length;
+		return app.peopleErr.value
+			? "Could not load people."
+			: count
+				? `${count} ${count === 1 ? "person" : "people"} in this repository`
+				: "No one enrolled yet.";
+	});
 
 	// Case- and diacritics-insensitive substring filter across names and
 	// aliases (foldText: "Émile" matches "emil"); when only an alias matched,
 	// the row displays it (aka) so the hit is explainable. An all-filtered-out
 	// list shows a hint row.
-	const q = foldText(query.trim());
-	const filtered = q
-		? people.flatMap((p) => {
-				const m = rowMatch(p, q);
-				return m ? [{ p, aka: m.aka }] : [];
-			})
-		: people.map((p) => ({ p, aka: null as string | null }));
-	const noMatch = q !== "" && count > 0 && filtered.length === 0;
+	const filtered = useComputed(() => {
+		const q = foldText(query.value.trim());
+		const people = app.people.value;
+		if (!q) return people.map((p) => ({ p, aka: null as string | null }));
+		return people.flatMap((p) => {
+			const m = rowMatch(p, q);
+			return m ? [{ p, aka: m.aka }] : [];
+		});
+	});
+	const noMatch = useComputed(() =>
+		query.value.trim() !== "" && app.people.value.length > 0 && filtered.value.length === 0,
+	);
 
 	const doRescan = async () => {
-		setRescanning(true);
+		rescanning.value = true;
 		try {
 			await app.rescan();
 		} finally {
-			setRescanning(false);
+			rescanning.value = false;
 		}
 	};
 
-	const searchInput = (e: TargetedEvent<HTMLInputElement>) => setQuery(e.currentTarget.value);
-	const slideInput = (e: TargetedEvent<HTMLInputElement>) => setSlider(e.currentTarget.value);
-	const commitThreshold = () => void app.commitThreshold(Number(slider));
+	const searchInput = (e: TargetedEvent<HTMLInputElement>) => { query.value = e.currentTarget.value; };
+	const slideInput = (e: TargetedEvent<HTMLInputElement>) => { slider.value = e.currentTarget.value; };
+	const commitThreshold = () => void app.commitThreshold(Number(slider.value));
 
 	return (
 		<aside class="panel people" aria-labelledby="peopleTitle">
@@ -76,53 +81,70 @@ export function PeoplePanel({ perms }: PeoplePanelProps) {
 				<p class="lede" id="peopleCount">{countText}</p>
 			</div>
 
-			{perms.admin && threshold !== null && (
-				<div class="threshold-row">
-					<label
-						class="threshold-label"
-						for="thresholdSlider"
-						title="Minimum cosine similarity for a positive match — higher means fewer false positives"
+			{/* threshold row: admin edits (slider), everyone else sees the
+			    current value — both variants exist only once the server told
+			    us the threshold */}
+			<Show when={app.threshold} fallback={null}>
+				{(threshold) => (
+					<Show
+						when={() => app.perms.value.admin}
+						fallback={
+							<div
+								class="threshold-row"
+								title={app.perms.value.user ? "Only administrators can change the match threshold" : undefined}
+							>
+								<span class="threshold-label">Threshold</span>
+								<span class="threshold-static">{Number(threshold).toFixed(2)}</span>
+							</div>
+						}
 					>
-						Threshold
-					</label>
-					<input
-						id="thresholdSlider"
-						type="range"
-						min="0.30"
-						max="0.70"
-						step="0.01"
-						value={slider}
-						aria-label="Match threshold"
-						onInput={slideInput}
-						onChange={commitThreshold}
-					/>
-					<span class="threshold-value" id="thresholdValue">{Number(slider).toFixed(2)}</span>
-				</div>
-			)}
-			{!perms.admin && threshold !== null && (
-				<div
-					class="threshold-row"
-					title={perms.user ? "Only administrators can change the match threshold" : undefined}
-				>
-					<span class="threshold-label">Threshold</span>
-					<span class="threshold-static">{Number(threshold).toFixed(2)}</span>
-				</div>
-			)}
+						{() => (
+							<div class="threshold-row">
+								<label
+									class="threshold-label"
+									for="thresholdSlider"
+									title="Minimum cosine similarity for a positive match — higher means fewer false positives"
+								>
+									Threshold
+								</label>
+								<input
+									id="thresholdSlider"
+									type="range"
+									min="0.30"
+									max="0.70"
+									step="0.01"
+									value={slider}
+									aria-label="Match threshold"
+									onInput={slideInput}
+									onChange={commitThreshold}
+								/>
+								<span class="threshold-value" id="thresholdValue">{Number(slider.value).toFixed(2)}</span>
+							</div>
+						)}
+					</Show>
+				)}
+			</Show>
 
-			{(perms.writer || perms.user) && (
-				<div class="people-actions">
-					{perms.writer && (
-						<button id="enrollBtn" class="btn btn-accent" aria-haspopup="dialog" onClick={() => modals.open("enroll")}>
-							Enroll new person
-						</button>
-					)}
-					{perms.user && (
-						<button id="compareBtn" class="btn" aria-haspopup="dialog" onClick={() => modals.open("compare")}>
-							Compare two photos
-						</button>
-					)}
-				</div>
-			)}
+			<Show when={() => app.perms.value.writer || app.perms.value.user} fallback={null}>
+				{() => (
+					<div class="people-actions">
+						<Show when={() => app.perms.value.writer} fallback={null}>
+							{() => (
+								<button id="enrollBtn" class="btn btn-accent" aria-haspopup="dialog" onClick={() => modals.open("enroll")}>
+									Enroll new person
+								</button>
+							)}
+						</Show>
+						<Show when={() => app.perms.value.user} fallback={null}>
+							{() => (
+								<button id="compareBtn" class="btn" aria-haspopup="dialog" onClick={() => modals.open("compare")}>
+									Compare two photos
+								</button>
+							)}
+						</Show>
+					</div>
+				)}
+			</Show>
 
 			<div class="people-search">
 				<input
@@ -138,32 +160,36 @@ export function PeoplePanel({ perms }: PeoplePanelProps) {
 			</div>
 
 			<ul id="peopleList" class="people-list">
-				{filtered.map(({ p, aka }) => (
-					<PersonRow
-						key={p.id}
-						person={p}
-						aka={aka}
-						canRemove={perms.writer}
-						onOpen={(name) => modals.open("person", { name })}
-						onRemove={(name) => void app.removePerson(name)}
-					/>
-				))}
-				{noMatch && <li class="people-nomatch">No people match “{query.trim()}”.</li>}
+				<For each={filtered} getKey={(row) => row.p.id}>
+					{({ p, aka }) => (
+						<PersonRow
+							person={p}
+							aka={aka}
+							onOpen={(name) => modals.open("person", { name })}
+							onRemove={(name) => void app.removePerson(name)}
+						/>
+					)}
+				</For>
+				<Show when={noMatch} fallback={null}>
+					{() => <li class="people-nomatch">No people match “{query.value.trim()}”.</li>}
+				</Show>
 			</ul>
 
-			{perms.writer && (
-				<div class="people-footer">
-					<button
-						id="rescanBtn"
-						class="btn btn-ghost"
-						title="Re-scan this repository's dataset folder on the server"
-						disabled={rescanning}
-						onClick={doRescan}
-					>
-						{rescanning ? "Rescanning…" : "Rescan people folder"}
-					</button>
-				</div>
-			)}
+			<Show when={() => app.perms.value.writer} fallback={null}>
+				{() => (
+					<div class="people-footer">
+						<button
+							id="rescanBtn"
+							class="btn btn-ghost"
+							title="Re-scan this repository's dataset folder on the server"
+							disabled={rescanning}
+							onClick={doRescan}
+						>
+							{rescanning.value ? "Rescanning…" : "Rescan people folder"}
+						</button>
+					</div>
+				)}
+			</Show>
 		</aside>
 	);
 }
@@ -176,21 +202,23 @@ export function PeoplePanel({ perms }: PeoplePanelProps) {
  * them into one null filtered out every name-matched row.) Both sides are
  * folded (foldText), so matching is case- and diacritics-insensitive.
  */
-function rowMatch(p: PersonSummary, q: string): { aka: string | null } | null {
+function rowMatch(p: PersonSummaryLike, q: string): { aka: string | null } | null {
 	if (foldText(p.name).includes(q)) return { aka: null };
 	const a = (p.aliases ?? []).find((al) => foldText(al).includes(q));
 	return a ? { aka: a } : null;
 }
 
+type PersonSummaryLike = import("../types").PersonSummary;
+
 function PersonRow(props: {
-	person: PersonSummary;
+	person: PersonSummaryLike;
 	/** matching alias, when the query hit an alias but not the name */
 	aka: string | null;
-	/** may remove people from this repo (writer or admin) */
-	canRemove: boolean;
 	onOpen: (name: string) => void;
 	onRemove: (name: string) => void;
 }) {
+	const app = useApp();
+	const canRemove = app.perms.value.writer;
 	const p = props.person;
 	// Every row opens the person details modal; the remove button stays
 	// writer/admin-only.
@@ -216,7 +244,7 @@ function PersonRow(props: {
 				<span class="person-count">{p.photos} photo(s)</span>
 				{props.aka && <span class="person-aka">aka {props.aka}</span>}
 			</button>
-			{props.canRemove && (
+			{canRemove && (
 				<button
 					class="person-del"
 					title={`Remove ${p.name}`}

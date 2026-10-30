@@ -1,9 +1,14 @@
 // Change-password modal (any signed-in user). Validates the new password
 // client-side (min length + confirmation) and lets the server re-check;
 // 403 = wrong current password, surfaced as an ordinary error.
+//
+// State as signals: the three fields and the busy flag; the disabled
+// attributes ride the signals (auto-unwrap). The instance unmounts on
+// close, so the fresh-form reset is a plain mount effect.
 
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useRef } from "preact/hooks";
 import type { TargetedEvent } from "preact";
+import { useComputed, useSignal } from "@preact/signals";
 import * as api from "../api";
 import { useToast } from "../toast";
 import { Modal } from "./Modal";
@@ -20,53 +25,48 @@ const PASSWORD_MIN = 8;
 export function ChangePasswordModal(props: ChangePasswordModalProps) {
 	const toast = useToast();
 
-	const [current, setCurrent] = useState("");
-	const [next, setNext] = useState("");
-	const [confirm, setConfirm] = useState("");
-	const [busy, setBusyState] = useState(false);
+	const current = useSignal("");
+	const next = useSignal("");
+	const confirm = useSignal("");
+	const busy = useSignal(false);
 
-	const busyRef = useRef(false);
+	const changePasswordDisabled = useComputed(() => busy.value || !current.value || !next.value || !confirm.value);
+
 	const currentRef = useRef<HTMLInputElement | null>(null);
 
-	const setBusy = (b: boolean) => {
-		busyRef.current = b;
-		setBusyState(b);
-	};
-
-	// Fresh form each time the modal opens.
+	// Fresh form each time the modal opens (the instance mounts per open).
 	useEffect(() => {
-		if (!props.open) return;
-		setCurrent("");
-		setNext("");
-		setConfirm("");
-	}, [props.open]);
+		current.value = "";
+		next.value = "";
+		confirm.value = "";
+	}, []);
 
 	const close = () => {
-		if (busyRef.current) return;
+		if (busy.value) return;
 		props.onCloseRequest();
 	};
 
 	const submit = async (e: TargetedEvent<HTMLFormElement>) => {
 		e.preventDefault();
-		if (busyRef.current) return;
-		if (!current) { currentRef.current?.focus(); return; }
-		if (next.length < PASSWORD_MIN) {
+		if (busy.value) return;
+		if (!current.value) { currentRef.current?.focus(); return; }
+		if (next.value.length < PASSWORD_MIN) {
 			toast.show(`The new password must be at least ${PASSWORD_MIN} characters.`, "err");
 			return;
 		}
-		if (next !== confirm) {
+		if (next.value !== confirm.value) {
 			toast.show("The new passwords do not match.", "err");
 			return;
 		}
-		setBusy(true);
+		busy.value = true;
 		try {
-			await api.changePassword(current, next);
+			await api.changePassword(current.value, next.value);
 			toast.show("Password changed.", "ok");
 			props.onCloseRequest();
 		} catch (err) {
 			toast.show((err as Error).message || "Could not change the password.", "err");
 		} finally {
-			setBusy(false);
+			busy.value = false;
 		}
 	};
 
@@ -92,7 +92,7 @@ export function ChangePasswordModal(props: ChangePasswordModalProps) {
 						autocomplete="current-password"
 						disabled={busy}
 						value={current}
-						onInput={(e) => setCurrent(e.currentTarget.value)}
+						onInput={(e) => { current.value = e.currentTarget.value; }}
 					/>
 
 					<label class="field-label" for="passwordNew">New password</label>
@@ -103,7 +103,7 @@ export function ChangePasswordModal(props: ChangePasswordModalProps) {
 						autocomplete="new-password"
 						disabled={busy}
 						value={next}
-						onInput={(e) => setNext(e.currentTarget.value)}
+						onInput={(e) => { next.value = e.currentTarget.value; }}
 					/>
 
 					<label class="field-label" for="passwordConfirm">Confirm new password</label>
@@ -114,13 +114,18 @@ export function ChangePasswordModal(props: ChangePasswordModalProps) {
 						autocomplete="new-password"
 						disabled={busy}
 						value={confirm}
-						onInput={(e) => setConfirm(e.currentTarget.value)}
+						onInput={(e) => { confirm.value = e.currentTarget.value; }}
 					/>
 
 					<footer class="modal-foot">
 						<button type="button" class="btn btn-ghost" data-close disabled={busy}>Cancel</button>
-						<button type="submit" id="passwordSubmit" class="btn btn-accent" disabled={busy || !current || !next || !confirm}>
-							{busy ? "Saving…" : "Change password"}
+						<button
+							type="submit"
+							id="passwordSubmit"
+							class="btn btn-accent"
+							disabled={changePasswordDisabled}
+						>
+							{busy.value ? "Saving…" : "Change password"}
 						</button>
 					</footer>
 				</form>

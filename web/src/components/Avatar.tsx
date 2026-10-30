@@ -6,56 +6,71 @@
 // are fetched through the API wrapper (header attached, no cookies) and
 // handed to the DOM as an object URL instead.
 
-import { useEffect, useState } from "preact/hooks";
 import { getShareContext } from "../api/core";
 import { fetchThumbObjectURL } from "../api/people";
 import { initials } from "../util";
+import { batch, useComputed, useSignal, useSignalEffect } from "@preact/signals";
+import { Show, useLiveSignal } from "@preact/signals/utils";
 
 export function Avatar({ src, name }: { src: string; name: string }) {
-	const [failed, setFailed] = useState(false);
-	const [fetchedURL, setFetchedURL] = useState<string | null>(null);
+	const failed = useSignal(false)
+	const fetchedURL = useSignal<string | undefined>(undefined)
+	const srcSignal = useLiveSignal(src)
 	// Read once per render: the share context is set before ShareView mounts,
 	// and nothing below re-reads it afterwards.
-	const share = getShareContext() !== null;
+	const share = getShareContext() !== null
 
 	// A re-selected avatar gets a new URL — retry the image.
-	useEffect(() => {
-		setFailed(false);
-		setFetchedURL(null);
-	}, [src]);
+	useSignalEffect(() => {
+		void srcSignal.value
+		batch(() => {
+			failed.value = false
+			fetchedURL.value = undefined
+		})
+	});
 
 	// Share mode: fetch the thumbnail through the wrapper; the object URL is
 	// revoked on replacement or unmount so no thumbnail stays pinned.
-	useEffect(() => {
-		if (!share || !src) return;
+	useSignalEffect(() => {
+		if (!share || !srcSignal.value) return;
 		let alive = true;
-		let url: string | null = null;
-		fetchThumbObjectURL(src)
+		let url: string | undefined = undefined;
+		fetchThumbObjectURL(srcSignal.value)
 			.then((u) => {
 				if (!alive) {
 					URL.revokeObjectURL(u);
 					return;
 				}
 				url = u;
-				setFetchedURL(u);
+				fetchedURL.value = u
 			})
 			.catch(() => {
-				if (alive) setFailed(true);
+				if (alive) failed.value = true
 			});
 		return () => {
 			alive = false;
 			if (url) URL.revokeObjectURL(url);
 		};
-	}, [src, share]);
+	});
 
-	if (share) {
-		if (failed || !fetchedURL) {
-			return <span class="person-avatar">{initials(name)}</span>;
-		}
-		return <img class="person-avatar person-avatar-img" src={fetchedURL} alt="" onError={() => setFailed(true)} />;
-	}
-	if (!src || failed) {
-		return <span class="person-avatar">{initials(name)}</span>;
-	}
-	return <img class="person-avatar person-avatar-img" src={src} alt="" onError={() => setFailed(true)} />;
+	const imageURL = useComputed(() =>
+		failed.value ? undefined : share ? fetchedURL.value : srcSignal.value
+	);
+
+	return (
+		<Show
+			when={imageURL}
+			fallback={<span class="person-avatar">{initials(name)}</span>}
+		>
+			{(url) => (
+				<img
+					class="person-avatar person-avatar-img"
+					src={url}
+					alt=""
+					onError={() => { failed.value = true; }}
+					loading="lazy"
+				/>
+			)}
+		</Show>
+	);
 }

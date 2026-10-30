@@ -359,22 +359,74 @@ command hits a permission error.
   `npm --prefix web run dev` for the Vite dev server on :5173 — it proxies
   `/api` to the Go server on :8080, so no rebuild is needed for API-side
   checks. Architecture notes:
-  - **Server data lives in `MainApp`** (repos, selected repo, people,
-    threshold, health) and reaches the components through the app-store
-    context (`appStore.tsx`, `useApp()`); mutations refresh via the shared
-    `refreshAll()` action. ShareView provides its own read-only store
-    instance. Dialog state is nowhere in the shells — components open
-    dialogs themselves.
-  - **Modals are a pool service** (`modalService.tsx` + `modalRegistry.tsx`):
-    `ModalProvider` renders one instance per open key in pool order (later
-    paints on top); `open(key, args)` mounts or replaces the args, `close()`
-    UNMOUNTS the instance, `patch()` updates its args (live face-check
-    updates, rename propagation). An instance with another modal on top
-    stays mounted ("paused", state intact). The provider injects the
-    lifecycle props (`open`, `onCloseRequest`, and the positional
-    `isTopmost`) and owns the Escape keydown and the body scroll lock; the
-    registry maps keys → components and arg shapes, `useModals()` is the
-    typed facade.
+  - **All UI state is Preact signals** (`@preact/signals`; `Show`/`For` from
+    its `utils` subpath). The conventions:
+    - **Server data lives in `MainApp`** as the app store (`appStore.tsx`):
+      a `createModel`/`useModel` signals model (repos, selected repo,
+      people, threshold, health, perms as `ReadonlySignal`s + shared server
+      actions) provided through `AppProvider`/`useApp()`; mutations refresh
+      via the shared `refreshAll()` action. ShareView provides its own
+      read-only model instance. Dialog state is nowhere in the shells —
+      components open dialogs themselves. Shells read no store signals in
+      their own render: the reactive reads sit in the smallest components
+      (e.g. the layout branches in an `AppLayout` child, the status pill in
+      the exported `StatusPill`, the repo select in `RepoSelect`), so a
+      health poll or list refresh re-renders that block only. `Stage` and
+      `PeoplePanel` take no props — they read their permissions from the
+      store themselves.
+    - **Component-local state**: `useSignal` per state, `useComputed` for
+      derived values, `useSignalEffect` for effects keyed on signals.
+      Never pair a state with a mirror `useRef` (`setXBoth`/`xRef` pattern
+      — deleted): imperative closures read `sig.value` at call time and
+      untracked reads inside effects/async guards use `sig.peek()`.
+      Refs remain only for non-reactive things: DOM elements, timers,
+      promise chains, request sequences, Files, and mirrors of PROPS
+      (props are not signals — e.g. PersonModal's `personRef`).
+    - **Pass signals down to attributes**: Preact natively unwraps signals
+      on intrinsic attributes (`hidden`, `disabled`, `value`, `checked`,
+      `class`) — pass the signal, not `.value`, when the attribute is the
+      only use. Signal-valued JSX children update reactively. Custom
+      components receive signals as props and read `.value` (or computed)
+      in the smallest child. `style` accepts a signal ONLY when its value
+      is a string — object styles are unsupported; dynamic styles are
+      string templates of internal numbers/enums (never user text).
+    - **`Show`/`For` always with function children**: `<Show when={sig}>`
+      `{(v) => ...}</Show>` (children get the narrowed truthy value) —
+      `when` must be a Signal/ReadonlySignal or a thunk `() => boolean`,
+      NEVER a plain boolean read from a signal (that drops reactivity).
+      `<For each={arrOrSig} getKey={...}>{(item, i) => ...}</For>`; `For`
+      tracks items by object identity, so never feed it primitive arrays
+      or arrays with duplicates (keep `.map` there: `MetaRows`, alias
+      spans of a freshly fetched detail document) and remember a server
+      refetch re-creates all rows (same as `.map`). Row-varying signals
+      are passed INTO the row component (e.g. `cmpKey` → `EnrollThumb`)
+      and read there, so a change re-renders only the affected rows.
+    - **Admin modals extract per-item row components** (`RepoRow`,
+      `UserRow`, `KeyRow`) receiving the item + the signals they show, so
+      expansion/busy changes don't re-render the whole modal body; refs a
+      parent's validation needs (focus-on-error) stay parent-owned and
+      are passed down. Modal instances mount fresh per open: the old
+      `if (!props.open) return;` guards were vestigial — open-reloads are
+      plain mount effects.
+    - **Modals are a pool service** (`modalService.tsx` +
+      `modalRegistry.tsx`): the ordered instance pool is a signal rendered
+      through `<For>` keyed by the modal key (later paints on top);
+      `open(key, args)` mounts or replaces the args (a same-key replacement
+      reuses the component instance — state survives arg patches),
+      `close()` UNMOUNTS the instance, `patch()` updates its args (live
+      face-check updates, rename propagation). An instance with another
+      modal on top stays mounted ("paused", state intact). The provider
+      injects the lifecycle props (`open`, `onCloseRequest`, and the
+      positional `isTopmost`) and owns the Escape keydown and the body
+      scroll lock; the registry maps keys → components and arg shapes,
+      `useModals()` is the typed facade. Lifecycle props stay plain
+      props (booleans/callbacks), never signals.
+    - **View models**: full-page auth forms (`LoginView`, `SetupView`)
+      build a `createModel` view-model — field signals, `error`/`busy`
+      signals, a `submitDisabled` computed where applicable, signal-backed
+      input refs (`ref={(el) => { model.xRef.value = el }}`) — mounted
+      with `useModel(() => new ViewModel(...))` and prop functions wrapped
+      in `useLiveSignal`.
   - **Clipboard routing lives in `paste.ts`** — no paste code in the modal
     service. Components opt in with `usePasteFiles(enabled, handler)`:
     inside a modal instance `enabled` is the injected `isTopmost` prop (the

@@ -8,8 +8,15 @@
 // service and keeps its per-file session in this component's vault between
 // the close (which unmounts the editor and hands the session back) and the
 // next Edit on the same file.
+//
+// All component-local state is signals; the refs hold what signals must not
+// (the current File, the object-URL lifecycle, the request sequence, the
+// editor session vault).
 
-import { useCallback, useEffect, useRef, useState } from "preact/hooks";
+import { useCallback, useRef } from "preact/hooks";
+import { useComputed, useSignal, useSignalEffect } from "@preact/signals";
+import type { Signal } from "@preact/signals";
+import { For, Show } from "@preact/signals/utils";
 import type { TargetedDragEvent, TargetedKeyboardEvent } from "preact";
 import * as api from "../api";
 import type { Face } from "../types";
@@ -20,13 +27,6 @@ import { useModals } from "../modalRegistry";
 import { usePasteFiles, PASTE_FALLBACK } from "../paste";
 import type { EditSession } from "./EditModal";
 
-interface StageProps {
-	/** may enroll people in this repo (writer or admin)? gates the Edit
-	 *  buttons and the per-face "name this person" enroll form — readers and
-	 *  share visitors get a pure inspection stage */
-	canEnroll: boolean;
-}
-
 /** The editor's session vault: the committed session of the file it belongs
  *  to (null source = no session kept). File identity is the key — any other
  *  file invalidates it. */
@@ -35,18 +35,16 @@ interface EditVault {
 	session: EditSession | null;
 }
 
-export function Stage({ canEnroll }: StageProps) {
+export function Stage() {
 	const toast = useToast();
 	const app = useApp();
 	const modals = useModals();
-	const repoId = app.repoId;
-	const refreshAll = app.refreshAll;
 
-	const [previewURL, setPreviewURL] = useState<string | null>(null);
-	const [meta, setMeta] = useState("");
-	const [faces, setFaces] = useState<Face[] | null>(null);
-	const [enrolled, setEnrolled] = useState<Record<number, string>>({});
-	const [drag, setDrag] = useState(false);
+	const previewURL = useSignal<string | null>(null);
+	const meta = useSignal("");
+	const faces = useSignal<Face[] | null>(null);
+	const enrolled = useSignal<Record<number, string>>({});
+	const drag = useSignal(false);
 
 	const fileInputRef = useRef<HTMLInputElement | null>(null);
 	const imgRef = useRef<HTMLImageElement | null>(null);
@@ -68,23 +66,19 @@ export function Stage({ canEnroll }: StageProps) {
 	// The editor's per-file session vault (see EditVault).
 	const editVaultRef = useRef<EditVault>({ source: null, session: null });
 
-	// repoId changes must not invalidate the mount-stable callbacks (an open
-	// editor's onUse arg must keep working across a repo switch) — they read
-	// the current value through this ref.
-	const repoIdRef = useRef(repoId);
-	repoIdRef.current = repoId;
-	const refreshRef = useRef(refreshAll);
-	refreshRef.current = refreshAll;
+	// The mount-stable callbacks read the store's current values at call
+	// time (the model object is context-stable, so a repo switch never
+	// invalidates them — an open editor's onUse arg keeps working).
 
 	const openPicker = () => fileInputRef.current?.click();
 
 	const resetStage = useCallback(() => {
 		if (stageURLRef.current) URL.revokeObjectURL(stageURLRef.current);
 		stageURLRef.current = null;
-		setPreviewURL(null);
-		setFaces(null);
-		setMeta("");
-		setEnrolled({});
+		previewURL.value = null;
+		faces.value = null;
+		meta.value = "";
+		enrolled.value = {};
 		currentFileRef.current = null;
 		editOriginalRef.current = null;
 	}, []);
@@ -106,18 +100,18 @@ export function Stage({ canEnroll }: StageProps) {
 		const url = URL.createObjectURL(file);
 		if (stageURLRef.current) URL.revokeObjectURL(stageURLRef.current);
 		stageURLRef.current = url;
-		setPreviewURL(url);
-		setFaces(null);
-		setEnrolled({});
-		setMeta("analyzing…");
+		previewURL.value = url;
+		faces.value = null;
+		enrolled.value = {};
+		meta.value = "analyzing…";
 		try {
-			const j = await api.recognize(file, repoIdRef.current ?? "");
+			const j = await api.recognize(file, app.repoId.value ?? "");
 			if (seq !== reqSeq.current) return; // another file took over
-			setFaces(j.faces || []);
-			setMeta(`${file.name} · ${(file.size / 1024).toFixed(0)} KB`);
+			faces.value = j.faces || [];
+			meta.value = `${file.name} · ${(file.size / 1024).toFixed(0)} KB`;
 		} catch (e) {
 			if (seq !== reqSeq.current) return;
-			setMeta("");
+			meta.value = "";
 			toast.show((e as Error).message || "Recognition failed.", "err");
 		}
 	}, [toast]);
@@ -131,11 +125,13 @@ export function Stage({ canEnroll }: StageProps) {
 	}, PASTE_FALLBACK);
 
 	// Draw the overlay once both the image and the faces are ready.
-	useEffect(() => {
-		if (previewURL && faces && imgRef.current && canvasRef.current) {
-			drawWhenReady(canvasRef.current, imgRef.current, faces, { labels: true });
+	useSignalEffect(() => {
+		const list = faces.value;
+		const url = previewURL.value;
+		if (url && list && imgRef.current && canvasRef.current) {
+			drawWhenReady(canvasRef.current, imgRef.current, list, { labels: true });
 		}
-	}, [previewURL, faces]);
+	});
 
 	// The editor hands its committed session back at close time; keep it for
 	// this file only (a different file invalidates the vault entry).
@@ -174,19 +170,19 @@ export function Stage({ canEnroll }: StageProps) {
 	}, [modals, applyEdited, saveEditorSession]);
 
 	const onDropzoneClick = () => {
-		if (previewURL === null) openPicker();
+		if (previewURL.value === null) openPicker();
 	};
 	const onDropzoneKeyDown = (e: TargetedKeyboardEvent<HTMLDivElement>) => {
-		if ((e.key === "Enter" || e.key === " ") && previewURL === null) {
+		if ((e.key === "Enter" || e.key === " ") && previewURL.value === null) {
 			e.preventDefault();
 			openPicker();
 		}
 	};
 	const onDrop = (e: TargetedDragEvent<HTMLDivElement>) => {
 		e.preventDefault();
-		setDrag(false);
+		drag.value = false;
 		const f = e.dataTransfer?.files?.[0];
-		if (f) handleFile(f);
+		if (f) void handleFile(f);
 	};
 
 	// Enroll the given 1-based face of the current photo under the typed
@@ -194,11 +190,11 @@ export function Stage({ canEnroll }: StageProps) {
 	const handleRowEnroll = useCallback((faceNo: number, person: string, done: (ok: boolean) => void) => {
 		const file = currentFileRef.current;
 		if (!file) { done(false); return; }
-		api.enrollFace(person, repoIdRef.current ?? "", file, faceNo)
+		api.enrollFace(person, app.repoId.value ?? "", file, faceNo)
 			.then((j) => {
 				toast.show(`Enrolled ${person} (${j.saved}).`, "ok");
-				setEnrolled((m) => ({ ...m, [faceNo - 1]: person }));
-				refreshRef.current();
+				enrolled.value = { ...enrolled.value, [faceNo - 1]: person };
+				app.refreshAll();
 				done(true);
 			})
 			.catch((err: Error) => {
@@ -207,7 +203,10 @@ export function Stage({ canEnroll }: StageProps) {
 			});
 	}, [toast]);
 
-	const cursor = previewURL ? "default" : "pointer";
+	// Derived state as computeds; they drive the attribute signals.
+	const noPreview = useComputed(() => previewURL.value === null);
+	const cursorStyle = useComputed(() => `cursor: ${previewURL.value ? "default" : "pointer"}`);
+	const dropzoneClass = useComputed(() => "dropzone" + (drag.value ? " drag" : ""));
 
 	return (
 		<section class="panel stage" aria-labelledby="stageTitle">
@@ -218,16 +217,16 @@ export function Stage({ canEnroll }: StageProps) {
 
 			<div
 				id="dropzone"
-				class={"dropzone" + (drag ? " drag" : "")}
-				style={`cursor: ${cursor}`}
+				class={dropzoneClass}
+				style={cursorStyle}
 				tabindex={0}
 				role="button"
 				aria-label="Upload a photo to recognize faces"
 				onClick={onDropzoneClick}
 				onKeyDown={onDropzoneKeyDown}
-				onDragEnter={(e) => { e.preventDefault(); setDrag(true); }}
-				onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
-				onDragLeave={(e) => { e.preventDefault(); setDrag(false); }}
+				onDragEnter={(e) => { e.preventDefault(); drag.value = true; }}
+				onDragOver={(e) => { e.preventDefault(); drag.value = true; }}
+				onDragLeave={(e) => { e.preventDefault(); drag.value = false; }}
 				onDrop={onDrop}
 			>
 				<input
@@ -238,11 +237,11 @@ export function Stage({ canEnroll }: StageProps) {
 					hidden
 					onChange={(e) => {
 						const f = e.currentTarget.files?.[0];
-						if (f) handleFile(f);
+						if (f) void handleFile(f);
 						e.currentTarget.value = "";
 					}}
 				/>
-				{previewURL === null ? (
+				<Show when={previewURL} fallback={
 					<div class="dz-empty" id="dzEmpty">
 						<svg viewBox="0 0 48 48" class="dz-icon" aria-hidden="true">
 							<rect x="6" y="10" width="36" height="28" rx="3" fill="none" stroke="currentColor" stroke-width="2" />
@@ -252,23 +251,25 @@ export function Stage({ canEnroll }: StageProps) {
 						<p class="dz-primary">Drop a photo here, or <span class="dz-browse">browse</span></p>
 						<p class="dz-hint">JPG, PNG, WebP or BMP — or paste from the clipboard (Ctrl+V)</p>
 					</div>
-				) : (
-					<div class="dz-preview" id="dzPreview">
-						<div class="canvas-wrap">
-							<img ref={imgRef} id="previewImg" alt="Uploaded photo preview" src={previewURL} />
-							<canvas ref={canvasRef} id="overlay" />
+				}>
+					{(url) => (
+						<div class="dz-preview" id="dzPreview">
+							<div class="canvas-wrap">
+								<img ref={imgRef} id="previewImg" alt="Uploaded photo preview" src={url} />
+								<canvas ref={canvasRef} id="overlay" />
+							</div>
 						</div>
-					</div>
-				)}
+					)}
+				</Show>
 			</div>
 
 			<div class="stage-actions">
-				{canEnroll && (
+				{app.perms.value.writer && (
 					<>
 						<button
 							id="editBtn"
 							class="btn"
-							hidden={previewURL === null}
+							hidden={noPreview}
 							onClick={(e) => {
 								e.stopPropagation();
 								openEditor();
@@ -293,11 +294,11 @@ export function Stage({ canEnroll }: StageProps) {
 						</button>
 					</>
 				)}
-				<button id="clearBtn" class="btn btn-ghost" hidden={previewURL === null} onClick={resetStage}>Clear</button>
+				<button id="clearBtn" class="btn btn-ghost" hidden={noPreview} onClick={resetStage}>Clear</button>
 				<button
 					id="againBtn"
 					class="btn btn-ghost"
-					hidden={previewURL === null}
+					hidden={noPreview}
 					onClick={(e) => { e.stopPropagation(); openPicker(); }}
 				>
 					Choose another
@@ -305,23 +306,25 @@ export function Stage({ canEnroll }: StageProps) {
 				<span class="stage-meta" id="stageMeta">{meta}</span>
 			</div>
 
-			{faces !== null && (
-				<div id="results" class="results">
-					<h2 class="results-title"><span id="resultCount">{faces.length}</span> face(s) found</h2>
-					<ul id="faceList" class="face-list">
-						{faces.map((f, i) => (
-							<FaceRow
-								key={i}
-								face={f}
-								index={i}
-								canEnroll={canEnroll && currentFileRef.current !== null}
-								enrolledName={enrolled[i]}
-								onEnroll={handleRowEnroll}
-							/>
-						))}
-					</ul>
-				</div>
-			)}
+			<Show when={faces} fallback={null}>
+				{(list) => (
+					<div id="results" class="results">
+						<h2 class="results-title"><span id="resultCount">{list.length}</span> face(s) found</h2>
+						<ul id="faceList" class="face-list">
+							<For each={list}>
+								{(f, i) => (
+									<FaceRow
+										face={f}
+										index={i}
+										enrolled={enrolled}
+										onEnroll={handleRowEnroll}
+									/>
+								)}
+							</For>
+						</ul>
+					</div>
+				)}
+			</Show>
 		</section>
 	);
 }
@@ -329,15 +332,18 @@ export function Stage({ canEnroll }: StageProps) {
 // One face row: index badge, identity, ranked matches (with a duplicate hint
 // when the top two scores are nearly tied), and — for unknown faces when the
 // viewer may write to this repo — the inline "name this person" enroll form.
+// The row subscribes to the store (canEnroll) and the enrolled map itself;
+// a re-render of the Stage's own signals does not reach past the row list.
 function FaceRow(props: {
 	face: Face;
 	index: number;
-	canEnroll: boolean;
-	enrolledName?: string;
+	enrolled: Signal<Record<number, string>>;
 	onEnroll: (faceNo: number, person: string, done: (ok: boolean) => void) => void;
 }) {
+	const app = useApp();
 	const f = props.face;
-	const name = props.enrolledName ?? f.name;
+	const enrolledName = props.enrolled.value[props.index];
+	const name = enrolledName ?? f.name;
 	const known = name !== "unknown";
 	const conf = Math.round((f.confidence || 0) * 100);
 
@@ -345,8 +351,8 @@ function FaceRow(props: {
 	const showMatches = matches.length >= 2;
 	const near = showMatches && matches[0].score - matches[1].score <= 0.05;
 
-	const [person, setPerson] = useState("");
-	const [busy, setBusy] = useState(false);
+	const person = useSignal("");
+	const busy = useSignal(false);
 	const inputRef = useRef<HTMLInputElement | null>(null);
 
 	const matchesBlock = showMatches && (
@@ -369,17 +375,17 @@ function FaceRow(props: {
 			<div>
 				<div class="face-name">{name}</div>
 				{matchesBlock}
-				{!known && props.canEnroll && (
+				{!known && app.perms.value.writer && (
 					<form
 						class="face-enroll"
 						onSubmit={(e) => {
 							e.preventDefault();
-							const p = person.trim();
+							const p = person.value.trim();
 							if (!p) { inputRef.current?.focus(); return; }
-							setBusy(true);
+							busy.value = true;
 							props.onEnroll(props.index + 1, p, (ok) => {
 								if (!ok) {
-									setBusy(false);
+									busy.value = false;
 									inputRef.current?.focus();
 								}
 							});
@@ -396,7 +402,7 @@ function FaceRow(props: {
 							aria-label="Enroll this face as"
 							disabled={busy}
 							value={person}
-							onInput={(e) => setPerson(e.currentTarget.value)}
+							onInput={(e) => { person.value = e.currentTarget.value; }}
 						/>
 						<button type="submit" class="btn btn-accent btn-sm" disabled={busy}>Enroll</button>
 					</form>

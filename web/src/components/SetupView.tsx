@@ -3,10 +3,13 @@
 // this form exchanges it for the administrator account. Submit →
 // POST /api/setup → POST /api/login → App re-probes and renders the app.
 // Errors surface in-form (403 = wrong key or setup already completed).
+// Built as a view-model (createModel) like LoginView: the fields, error and
+// busy flags are signals, validation runs inside submit (with refocus).
 
-import { useEffect, useRef, useState } from "preact/hooks";
 import type { TargetedEvent } from "preact";
 import * as api from "../api";
+import { batch, createModel, Signal, signal, useModel, useSignalEffect, type ReadonlySignal } from "@preact/signals";
+import { Show, useLiveSignal } from "@preact/signals/utils";
 import { USERNAME_RE } from "../util";
 
 interface SetupViewProps {
@@ -16,53 +19,86 @@ interface SetupViewProps {
 
 const PASSWORD_MIN = 8;
 
-export function SetupView({ onAuthed }: SetupViewProps) {
-	const [key, setKey] = useState("");
-	const [username, setUsername] = useState("");
-	const [password, setPassword] = useState("");
-	const [confirm, setConfirm] = useState("");
-	const [error, setError] = useState<string | null>(null);
-	const [busy, setBusy] = useState(false);
+interface ISetupViewModel {
+	key: Signal<string>;
+	username: Signal<string>;
+	password: Signal<string>;
+	confirm: Signal<string>;
+	error: ReadonlySignal<string | null>;
+	busy: ReadonlySignal<boolean>;
+	keyInputRef: Signal<HTMLInputElement | null>;
+	submit: (e: TargetedEvent<HTMLFormElement>) => Promise<void>;
+}
 
-	const keyRef = useRef<HTMLInputElement | null>(null);
-	useEffect(() => keyRef.current?.focus(), []);
+const SetupViewModel = createModel<ISetupViewModel, [ReadonlySignal<() => void>]>((onAuthed: ReadonlySignal<() => void>) => {
+	const key = signal("");
+	const username = signal("");
+	const password = signal("");
+	const confirm = signal("");
+	const error = signal<string | null>(null);
+	const busy = signal(false);
+	const keyInputRef = signal<HTMLInputElement | null>(null);
 
-	const submit = async (e: TargetedEvent<HTMLFormElement>) => {
-		e.preventDefault();
-		if (busy) return;
-		const u = username.trim();
-		if (!key.trim()) { setError("Enter the setup key printed to the server console."); keyRef.current?.focus(); return; }
-		if (!USERNAME_RE.test(u)) {
-			setError("Username must be 2–32 characters and start with a letter or digit (letters, digits, dots, underscores and hyphens after).");
-			return;
-		}
-		if (password.length < PASSWORD_MIN) {
-			setError(`Password must be at least ${PASSWORD_MIN} characters.`);
-			return;
-		}
-		if (password !== confirm) {
-			setError("The passwords do not match.");
-			return;
-		}
-		setBusy(true);
-		setError(null);
-		try {
-			await api.setup({ key: key.trim(), username: u, password });
-		} catch (err) {
-			setBusy(false);
-			setError((err as Error).message || "Setup failed.");
-			return;
-		}
-		// Setup created the admin — sign the new account in right away. A
-		// failed login is NOT a failed setup (resubmitting would 403): hand
-		// control back so the re-probe routes to the login view.
-		try {
-			await api.login(u, password);
-		} catch {
-			// fall through to onAuthed
-		}
-		onAuthed();
+	return {
+		key,
+		username,
+		password,
+		confirm,
+		error,
+		busy,
+		keyInputRef,
+		async submit(e: TargetedEvent<HTMLFormElement>) {
+			e.preventDefault();
+			if (busy.value) return;
+			const u = username.value.trim();
+			if (!key.value.trim()) { error.value = "Enter the setup key printed to the server console."; keyInputRef.value?.focus(); return; }
+			if (!USERNAME_RE.test(u)) {
+				error.value = "Username must be 2–32 characters and start with a letter or digit (letters, digits, dots, underscores and hyphens after).";
+				return;
+			}
+			if (password.value.length < PASSWORD_MIN) {
+				error.value = `Password must be at least ${PASSWORD_MIN} characters.`;
+				return;
+			}
+			if (password.value !== confirm.value) {
+				error.value = "The passwords do not match.";
+				return;
+			}
+			batch(() => {
+				busy.value = true;
+				error.value = null;
+			});
+			try {
+				await api.setup({ key: key.value.trim(), username: u, password: password.value });
+			} catch (err) {
+				batch(() => {
+					busy.value = false;
+					error.value = (err as Error).message || "Setup failed.";
+				});
+				return;
+			}
+			// Setup created the admin — sign the new account in right away. A
+			// failed login is NOT a failed setup (resubmitting would 403): hand
+			// control back so the re-probe routes to the login view.
+			try {
+				await api.login(u, password.value);
+			} catch {
+				// fall through to onAuthed
+			}
+			onAuthed.value();
+		},
 	};
+});
+
+export function SetupView({ onAuthed }: SetupViewProps) {
+	const onAuthedSignal = useLiveSignal(onAuthed);
+	const model = useModel(() => new SetupViewModel(onAuthedSignal));
+
+	// Focus the setup key on mount (the input ref lives on the model as a
+	// signal, so the tracked read drives the effect).
+	useSignalEffect(() => {
+		model.keyInputRef.value?.focus();
+	});
 
 	return (
 		<div class="auth-page">
@@ -81,18 +117,18 @@ export function SetupView({ onAuthed }: SetupViewProps) {
 					account.
 				</p>
 
-				<form class="auth-form" novalidate onSubmit={submit}>
+				<form class="auth-form" novalidate onSubmit={model.submit}>
 					<label class="field-label" for="setupKey">Setup key</label>
 					<input
-						ref={keyRef}
+						ref={(el) => { model.keyInputRef.value = el }}
 						id="setupKey"
 						type="text"
 						placeholder="XXXX-XXXX-XXXX-XXXX"
 						autocomplete="off"
 						spellcheck={false}
-						disabled={busy}
-						value={key}
-						onInput={(e) => setKey(e.currentTarget.value)}
+						disabled={model.busy}
+						value={model.key}
+						onInput={(e) => model.key.value = e.currentTarget.value}
 					/>
 
 					<label class="field-label" for="setupUsername">Admin username</label>
@@ -102,9 +138,9 @@ export function SetupView({ onAuthed }: SetupViewProps) {
 						placeholder="username"
 						autocomplete="username"
 						spellcheck={false}
-						disabled={busy}
-						value={username}
-						onInput={(e) => setUsername(e.currentTarget.value)}
+						disabled={model.busy}
+						value={model.username}
+						onInput={(e) => model.username.value = e.currentTarget.value}
 					/>
 
 					<label class="field-label" for="setupPassword">Password</label>
@@ -113,9 +149,9 @@ export function SetupView({ onAuthed }: SetupViewProps) {
 						type="password"
 						placeholder={`At least ${PASSWORD_MIN} characters`}
 						autocomplete="new-password"
-						disabled={busy}
-						value={password}
-						onInput={(e) => setPassword(e.currentTarget.value)}
+						disabled={model.busy}
+						value={model.password}
+						onInput={(e) => model.password.value = e.currentTarget.value}
 					/>
 
 					<label class="field-label" for="setupConfirm">Confirm password</label>
@@ -124,15 +160,17 @@ export function SetupView({ onAuthed }: SetupViewProps) {
 						type="password"
 						placeholder="Repeat the password"
 						autocomplete="new-password"
-						disabled={busy}
-						value={confirm}
-						onInput={(e) => setConfirm(e.currentTarget.value)}
+						disabled={model.busy}
+						value={model.confirm}
+						onInput={(e) => model.confirm.value = e.currentTarget.value}
 					/>
 
-					{error && <p class="auth-error" id="setupError" role="alert">{error}</p>}
+					<Show when={model.error}>
+						{(msg) => <p class="auth-error" id="setupError" role="alert">{msg}</p>}
+					</Show>
 
-					<button type="submit" id="setupSubmit" class="btn btn-accent" disabled={busy}>
-						{busy ? "Setting up…" : "Create administrator"}
+					<button type="submit" id="setupSubmit" class="btn btn-accent" disabled={model.busy}>
+						{model.busy.value ? "Setting up…" : "Create administrator"}
 					</button>
 				</form>
 			</div>

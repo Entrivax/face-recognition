@@ -14,14 +14,17 @@
 // context pair as MainApp: a read-only store (fixed repository, no-op
 // mutating actions, its own people list) and the shared modal registry —
 // the details modal opens through the service like everywhere else.
+// Boot phase and the learned repository name are signals; Stage,
+// PeoplePanel and StatusPill read the store themselves (no props).
 
-import { useCallback, useEffect, useState } from "preact/hooks";
-import * as api from "../api";
-import { ShareInvalidError, setOnShareInvalid, setShareContext } from "../api/core";
-import type { Health, PersonDetail, PersonSummary } from "../types";
-import { AppProvider, type AppContextValue, type Perms } from "../appStore";
+import { useCallback, useEffect } from "preact/hooks";
+import { useComputed, useModel, useSignal, type ReadonlySignal } from "@preact/signals";
+import { setOnShareInvalid, setShareContext } from "../api/core";
+import type { PersonDetail } from "../types";
+import { AppModel, AppProvider } from "../appStore";
 import { ModalProvider } from "../modalService";
 import { MODAL_DEFS } from "../modalRegistry";
+import { StatusPill } from "./Topbar";
 import { Stage } from "./Stage";
 import { PeoplePanel } from "./PeoplePanel";
 
@@ -57,89 +60,54 @@ interface ShareViewProps {
 type SharePhase = "loading" | "ready" | "invalid";
 
 export function ShareView({ repoId, token }: ShareViewProps) {
-	const [phase, setPhase] = useState<SharePhase>("loading");
-	const [repoName, setRepoName] = useState<string | null>(null);
-	const [people, setPeople] = useState<PersonSummary[]>([]);
-	const [peopleErr, setPeopleErr] = useState(false);
-	const [health, setHealth] = useState<Health | null>(null);
-	const [healthErr, setHealthErr] = useState(false);
+	// Boot phase (which card renders) + the repository's human name, learned
+	// from the first person-details document (the store hooks it below).
+	const phase = useSignal<SharePhase>("loading");
+	const repoName = useSignal<string | null>(null);
 
 	// Attach the share context to every API call and clear it again on
 	// unmount (a visitor who then somehow re-enters the app must not keep
 	// the header). 401/403 anywhere flip the phase to the error card.
 	useEffect(() => {
 		setShareContext({ repoId, token });
-		setOnShareInvalid(() => setPhase("invalid"));
+		setOnShareInvalid(() => { phase.value = "invalid"; });
 		return () => {
 			setShareContext(null);
 			setOnShareInvalid(null);
 		};
 	}, [repoId, token]);
 
-	const checkHealth = useCallback(async () => {
-		try {
-			const h = await api.getHealth();
-			setHealth(h);
-			setHealthErr(false);
-		} catch {
-			setHealthErr(true);
-		}
-	}, []);
-
-	const loadPeople = useCallback(async () => {
-		try {
-			const j = await api.getPeople(repoId);
-			setPeople(j.people || []);
-			setPeopleErr(false);
-			setPhase("ready");
-		} catch (e) {
-			if (e instanceof ShareInvalidError) return; // the hook already flipped the phase
-			setPeopleErr(true);
-			setPhase("ready");
-		}
-	}, [repoId]);
-
-	// Boot: verify the token by loading the repo's people list.
-	useEffect(() => {
-		void loadPeople();
-	}, [loadPeople]);
-
-	useEffect(() => {
-		void checkHealth();
-		const t = window.setInterval(checkHealth, 30000);
-		return () => window.clearInterval(t);
-	}, [checkHealth]);
-
+	// The read-only store handed to the share tree: fixed repository, no
+	// mutating actions, threshold unknown (the row hides for share visitors).
 	// A person detail carries repo_name — the one place a share visitor can
 	// learn the repository's human name (the repos list needs a session).
 	const onDetailLoaded = useCallback((d: PersonDetail) => {
-		if (d.repo_name) setRepoName(d.repo_name);
+		if (d.repo_name) repoName.value = d.repo_name;
 	}, []);
+	const app = useModel(() => new AppModel({ mode: "share", fixedRepoId: repoId, onPersonDetail: onDetailLoaded }));
 
-	// The read-only store handed to the share tree: fixed repository, no
-	// mutating actions, threshold unknown (the row hides for share visitors).
-	const store: AppContextValue = {
-		user: null,
-		health,
-		healthErr,
-		repos: [],
-		reposErr: false,
-		repoId,
-		repo: null,
-		people,
-		peopleErr,
-		threshold: null,
-		perms: { user: false, writer: false, admin: false },
-		setRepoId: () => { /* fixed repository in share mode */ },
-		logout: async () => { /* nothing to end — no session */ },
-		refreshAll: () => { void loadPeople(); void checkHealth(); },
-		commitThreshold: async () => { /* readers cannot change the threshold */ },
-		rescan: async () => { /* share visitors cannot rescan */ },
-		removePerson: async () => { /* share visitors cannot remove people */ },
-		onPersonDetail: onDetailLoaded,
-	};
+	// Boot: verify the token by loading the repo's people list (the model
+	// also polls health every 30 s). A rejected load is a ShareInvalidError —
+	// the hook above has already flipped the phase; anything else resolves
+	// with peopleErr set.
+	useEffect(() => {
+		void app.init();
+		app.loadPeople().then(
+			() => { phase.value = "ready"; },
+			() => {}, // invalid token — the hook already flipped the phase
+		);
+	}, [app]);
 
-	if (phase === "loading") {
+	// Banner display name: the learned human name, else the short repo id.
+	// A computed so a late detail load swaps it into the rendered banner.
+	const bannerName = useComputed(() => repoName.value ?? shortRepoId(repoId));
+
+	// The phase chain reads phase.value in render (a tracked read), so a
+	// flip re-renders exactly one branch: the loading/invalid cards stand
+	// alone; the ready tree mounts the providers around the propless
+	// children. (Three exclusive phases with a provider-carrying fall-through
+	// — the chain is cleaner here than nested Shows.)
+	if (phase.value === "loading") {
 		return (
 			<div class="auth-page">
 				<div class="auth-card">
@@ -149,7 +117,7 @@ export function ShareView({ repoId, token }: ShareViewProps) {
 		);
 	}
 
-	if (phase === "invalid") {
+	if (phase.value === "invalid") {
 		return (
 			<div class="auth-page">
 				<div class="auth-card">
@@ -165,20 +133,10 @@ export function ShareView({ repoId, token }: ShareViewProps) {
 		);
 	}
 
-	const perms: Perms = { user: false, writer: false, admin: false };
-	const cls = healthErr ? "status err" : health ? "status ok" : "status";
-	const statusText = healthErr ? "server unreachable" : health ? health.status : "connecting…";
-
 	return (
-		<AppProvider value={store}>
+		<AppProvider model={app}>
 			<ModalProvider defs={MODAL_DEFS}>
-				<ShareTree
-					repoId={repoId}
-					repoName={repoName ?? shortRepoId(repoId)}
-					perms={perms}
-					cls={cls}
-					statusText={statusText}
-				/>
+				<ShareTree repoId={repoId} repoName={bannerName} />
 			</ModalProvider>
 		</AppProvider>
 	);
@@ -186,13 +144,11 @@ export function ShareView({ repoId, token }: ShareViewProps) {
 
 // The visible share surface, inside the providers (the modal instances see
 // the store). The person-details dialog is opened by the people panel
-// through the modal service.
-function ShareTree({ repoId, repoName, perms, cls, statusText }: {
+// through the modal service; the status pill and the panels read the store
+// from context, and the banner name rides the signal.
+function ShareTree({ repoId, repoName }: {
 	repoId: string;
-	repoName: string;
-	perms: Perms;
-	cls: string;
-	statusText: string;
+	repoName: ReadonlySignal<string>;
 }) {
 	return (
 		<>
@@ -207,15 +163,12 @@ function ShareTree({ repoId, repoName, perms, cls, statusText }: {
 					<span class="share-banner-label">read-only shared repository</span>
 					<span class="share-banner-name" title={repoId}>{repoName}</span>
 				</div>
-				<div class={cls} id="status">
-					<span class="status-dot" id="statusDot" />
-					<span id="statusText">{statusText}</span>
-				</div>
+				<StatusPill />
 			</header>
 
 			<main class="layout">
-				<Stage canEnroll={false} />
-				<PeoplePanel perms={perms} />
+				<Stage />
+				<PeoplePanel />
 			</main>
 		</>
 	);

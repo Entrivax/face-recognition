@@ -5,10 +5,17 @@
 // Filling the ready row spawns the next empty one, and removing rows keeps
 // the ready slot at the end. Blank rows (including the ready slot) are
 // dropped by the caller before saving.
+//
+// `entries` is the owning component's signal (ReadonlySignal<string[]>);
+// edits read .value and report the next array through onChange — the rows
+// stay a plain .map (For tracks items by identity, and two empty rows would
+// be indistinguishable keys).
+
+import type { ReadonlySignal } from "@preact/signals";
 
 export function MetaRows(props: {
 	/** list state, always ending in the trailing empty row */
-	entries: string[];
+	entries: ReadonlySignal<string[]>;
 	onChange: (next: string[]) => void;
 	/** aria-label for every row input ("Alias" / "URL") */
 	label: string;
@@ -16,21 +23,23 @@ export function MetaRows(props: {
 	maxLength: number;
 	disabled?: boolean;
 }) {
+	const entries = props.entries.value;
+
 	function rowInput(i: number, v: string) {
-		const next = [...props.entries];
+		const next = [...entries];
 		next[i] = v;
-		if (i === props.entries.length - 1 && v.trim() !== "") next.push("");
+		if (i === entries.length - 1 && v.trim() !== "") next.push("");
 		props.onChange(next);
 	}
 	function rowRemove(i: number) {
-		const next = props.entries.filter((_, j) => j !== i);
+		const next = entries.filter((_, j) => j !== i);
 		if (next.length === 0 || next[next.length - 1].trim() !== "") next.push("");
 		props.onChange(next);
 	}
 
 	return (
 		<div class="meta-rows">
-			{props.entries.map((val, i) => (
+			{entries.map((val, i) => (
 				<div class="meta-row" key={i}>
 					<input
 						type="text"
@@ -43,7 +52,7 @@ export function MetaRows(props: {
 						disabled={props.disabled}
 						onInput={(e) => rowInput(i, e.currentTarget.value)}
 					/>
-					{!(i === props.entries.length - 1 && val.trim() === "") && (
+					{!(i === entries.length - 1 && val.trim() === "") && (
 						<button
 							type="button"
 							class="meta-row-del"
