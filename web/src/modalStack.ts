@@ -1,6 +1,6 @@
 // Escape-stack registry: Escape closes the topmost open modal only. Each
-// open modal pushes a close callback; App installs the single document
-// keydown handler that pops the top entry.
+// open modal pushes a close callback; the ModalProvider installs the single
+// document keydown handler that pops the top entry.
 
 type CloseFn = () => void;
 

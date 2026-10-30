@@ -2,40 +2,49 @@
 // each face's identity with its ranked matches. Unknown faces can be named
 // and enrolled right from their row (re-sending the same file with the
 // row's 1-based face index).
+//
+// Clipboard images with no modal to take them land here (the modal
+// service's fallback route). The photo editor is opened through the modal
+// service and keeps its per-file session in this component's vault between
+// the close (which unmounts the editor and hands the session back) and the
+// next Edit on the same file.
+//
+// All component-local state is signals; the refs hold what signals must not
+// (the current File, the object-URL lifecycle, the request sequence, the
+// editor session vault).
 
-import { useCallback, useEffect, useRef, useState } from "preact/hooks";
+import { useCallback, useRef } from "preact/hooks";
+import { batch, useComputed, useSignal, useSignalEffect } from "@preact/signals";
+import type { Signal } from "@preact/signals";
+import { For, Show } from "@preact/signals/utils";
 import type { TargetedDragEvent, TargetedKeyboardEvent } from "preact";
 import * as api from "../api";
 import type { Face } from "../types";
 import { drawWhenReady } from "../overlay";
 import { useToast } from "../toast";
-import { EditModal } from "./EditModal";
+import { useApp } from "../appStore";
+import { useModals } from "../modalRegistry";
+import { usePasteFiles, PASTE_FALLBACK } from "../paste";
+import type { EditSession } from "./EditModal";
 
-interface StageProps {
-	/** may enroll people in this repo (writer or admin)? gates the Edit
-	 *  buttons and the per-face "name this person" enroll form — readers and
-	 *  share visitors get a pure inspection stage */
-	canEnroll: boolean;
-	/** the repository recognition runs against */
-	repoId: string;
-	/** refresh people + health after a face was enrolled from a row */
-	onEnrolled: () => void;
-	/** register the paste-routing entry point (inspect a file on the stage) */
-	registerInspect: (fn: ((file: File) => void) | null) => void;
-	/** report editor visibility to App (body scroll lock + paste routing) */
-	onEditOpenChange: (open: boolean) => void;
+/** The editor's session vault: the committed session of the file it belongs
+ *  to (null source = no session kept). File identity is the key — any other
+ *  file invalidates it. */
+interface EditVault {
+	source: File | null;
+	session: EditSession | null;
 }
 
-export function Stage({ canEnroll, repoId, onEnrolled, registerInspect, onEditOpenChange }: StageProps) {
+export function Stage() {
 	const toast = useToast();
+	const app = useApp();
+	const modals = useModals();
 
-	const [previewURL, setPreviewURL] = useState<string | null>(null);
-	const [meta, setMeta] = useState("");
-	const [faces, setFaces] = useState<Face[] | null>(null);
-	const [enrolled, setEnrolled] = useState<Record<number, string>>({});
-	const [drag, setDrag] = useState(false);
-	// Source file while the photo editor is open (null = closed).
-	const [editSource, setEditSource] = useState<File | null>(null);
+	const previewURL = useSignal<string | null>(null);
+	const meta = useSignal("");
+	const faces = useSignal<Face[] | null>(null);
+	const enrolled = useSignal<Record<number, string>>({});
+	const drag = useSignal(false);
 
 	const fileInputRef = useRef<HTMLInputElement | null>(null);
 	const imgRef = useRef<HTMLImageElement | null>(null);
@@ -49,23 +58,31 @@ export function Stage({ canEnroll, repoId, onEnrolled, registerInspect, onEditOp
 	// editor over the original with the committed history restored, and
 	// backs the "Cancel edits" button (re-inspect the original); any new
 	// upload resets it, so the edit session resets with the photo.
-	const editOriginalRef = useRef<File | null>(null);
+	const editOriginal = useSignal<File | null>(null);
 	// Object URL of the current stage preview; revoked when replaced or
 	// cleared — otherwise every inspected photo would stay pinned in memory.
 	const stageURLRef = useRef<string | null>(null);
 	const reqSeq = useRef(0);
+	// The editor's per-file session vault (see EditVault).
+	const editVaultRef = useRef<EditVault>({ source: null, session: null });
+
+	// The mount-stable callbacks read the store's current values at call
+	// time (the model object is context-stable, so a repo switch never
+	// invalidates them — an open editor's onUse arg keeps working).
 
 	const openPicker = () => fileInputRef.current?.click();
 
 	const resetStage = useCallback(() => {
 		if (stageURLRef.current) URL.revokeObjectURL(stageURLRef.current);
 		stageURLRef.current = null;
-		setPreviewURL(null);
-		setFaces(null);
-		setMeta("");
-		setEnrolled({});
+		batch(() => {
+			previewURL.value = null;
+			faces.value = null;
+			meta.value = "";
+			enrolled.value = {};
+			editOriginal.value = null;
+		})
 		currentFileRef.current = null;
-		editOriginalRef.current = null;
 	}, []);
 
 	// Inspect one image file: show the preview immediately, then run
@@ -79,72 +96,95 @@ export function Stage({ canEnroll, repoId, onEnrolled, registerInspect, onEditOp
 			return;
 		}
 		currentFileRef.current = file;
-		editOriginalRef.current = editedFrom ?? null;
+		editOriginal.value = editedFrom ?? null;
 		const seq = ++reqSeq.current;
 		// Show the preview immediately (revoking the previous object URL).
 		const url = URL.createObjectURL(file);
-		if (stageURLRef.current) URL.revokeObjectURL(stageURLRef.current);
-		stageURLRef.current = url;
-		setPreviewURL(url);
-		setFaces(null);
-		setEnrolled({});
-		setMeta("analyzing…");
+		resetStage()
+		batch(() => {
+			stageURLRef.current = url;
+			previewURL.value = url;
+			meta.value = "analyzing…";
+		})
 		try {
-			const j = await api.recognize(file, repoId);
+			const j = await api.recognize(file, app.repoId.value ?? "");
 			if (seq !== reqSeq.current) return; // another file took over
-			setFaces(j.faces || []);
-			setMeta(`${file.name} · ${(file.size / 1024).toFixed(0)} KB`);
+			faces.value = j.faces || [];
+			meta.value = `${file.name} · ${(file.size / 1024).toFixed(0)} KB`;
 		} catch (e) {
 			if (seq !== reqSeq.current) return;
-			setMeta("");
+			meta.value = "";
 			toast.show((e as Error).message || "Recognition failed.", "err");
 		}
-	}, [repoId, toast]);
+	}, [toast, resetStage]);
 
-	// Paste routing entry point.
-	useEffect(() => {
-		registerInspect(handleFile);
-		return () => registerInspect(null);
-	}, [handleFile, registerInspect]);
-
-	// Editor visibility goes up to App: it owns the body scroll lock and the
-	// paste routing that must not swap the stage photo under an open editor.
-	useEffect(() => {
-		onEditOpenChange(editSource !== null);
-		return () => onEditOpenChange(false);
-	}, [editSource, onEditOpenChange]);
+	// Clipboard routing entry point: when no modal is interested (registered
+	// under a modal key), the paste lands here (the reserved "*" fallback).
+	// More than one image: the first is inspected, the rest reported.
+	usePasteFiles(true, (files) => {
+		void handleFile(files[0]);
+		if (files.length > 1) toast.show("Clipboard had several images — inspecting the first.");
+	}, PASTE_FALLBACK);
 
 	// Draw the overlay once both the image and the faces are ready.
-	useEffect(() => {
-		if (previewURL && faces && imgRef.current && canvasRef.current) {
-			drawWhenReady(canvasRef.current, imgRef.current, faces, { labels: true });
+	useSignalEffect(() => {
+		const list = faces.value;
+		const url = previewURL.value;
+		if (url && list && imgRef.current && canvasRef.current) {
+			drawWhenReady(canvasRef.current, imgRef.current, list, { labels: true });
 		}
-	}, [previewURL, faces]);
+	});
+
+	// The editor hands its committed session back at close time; keep it for
+	// this file only (a different file invalidates the vault entry).
+	const saveEditorSession = useCallback((source: File, session: EditSession) => {
+		const vault = editVaultRef.current;
+		if (vault.source === source) vault.session = session;
+		else editVaultRef.current = { source, session };
+	}, []);
 
 	// "Use this image": re-inspect the exported file like any fresh upload
 	// (preview + recognition re-run, same reqSeq guard), while remembering
 	// which pristine original it came from — the next Edit round reopens the
-	// editor over that original with the committed history restored.
+	// editor over that original with the committed history restored. The
+	// editor instance closes (= unmounts) and saved its session into the
+	// vault on the way out.
 	const applyEdited = useCallback((exported: File) => {
-		const original = editOriginalRef.current ?? currentFileRef.current;
-		setEditSource(null);
+		const original = editOriginal.peek() ?? currentFileRef.current;
+		modals.close("edit");
 		if (original) void handleFile(exported, original);
-	}, [handleFile]);
+	}, [modals, handleFile]);
+
+	// Open the editor over the pristine original (or the fresh upload) —
+	// never the previously exported bytes. The session vault rides along:
+	// when it holds a session for this file it is restored (initialSession),
+	// and the editor saves back into it at close time (onSaveSession).
+	const openEditor = useCallback(() => {
+		const source = editOriginal.peek() ?? currentFileRef.current;
+		if (!source) return;
+		const vault = editVaultRef.current;
+		modals.open("edit", {
+			source,
+			initialSession: vault.source === source ? vault.session : null,
+			onUse: applyEdited,
+			onSaveSession: saveEditorSession,
+		});
+	}, [modals, applyEdited, saveEditorSession]);
 
 	const onDropzoneClick = () => {
-		if (previewURL === null) openPicker();
+		if (previewURL.value === null) openPicker();
 	};
 	const onDropzoneKeyDown = (e: TargetedKeyboardEvent<HTMLDivElement>) => {
-		if ((e.key === "Enter" || e.key === " ") && previewURL === null) {
+		if ((e.key === "Enter" || e.key === " ") && previewURL.value === null) {
 			e.preventDefault();
 			openPicker();
 		}
 	};
 	const onDrop = (e: TargetedDragEvent<HTMLDivElement>) => {
 		e.preventDefault();
-		setDrag(false);
+		drag.value = false;
 		const f = e.dataTransfer?.files?.[0];
-		if (f) handleFile(f);
+		if (f) void handleFile(f);
 	};
 
 	// Enroll the given 1-based face of the current photo under the typed
@@ -152,20 +192,23 @@ export function Stage({ canEnroll, repoId, onEnrolled, registerInspect, onEditOp
 	const handleRowEnroll = useCallback((faceNo: number, person: string, done: (ok: boolean) => void) => {
 		const file = currentFileRef.current;
 		if (!file) { done(false); return; }
-		api.enrollFace(person, repoId, file, faceNo)
+		api.enrollFace(person, app.repoId.value ?? "", file, faceNo)
 			.then((j) => {
 				toast.show(`Enrolled ${person} (${j.saved}).`, "ok");
-				setEnrolled((m) => ({ ...m, [faceNo - 1]: person }));
-				onEnrolled();
+				enrolled.value = { ...enrolled.value, [faceNo - 1]: person };
+				app.refreshAll();
 				done(true);
 			})
 			.catch((err: Error) => {
 				toast.show(err.message || "Enrollment failed.", "err");
 				done(false);
 			});
-	}, [repoId, onEnrolled, toast]);
+	}, [toast]);
 
-	const cursor = previewURL ? "default" : "pointer";
+	// Derived state as computeds; they drive the attribute signals.
+	const noPreview = useComputed(() => previewURL.value === null);
+	const cursorStyle = useComputed(() => `cursor: ${previewURL.value ? "default" : "pointer"}`);
+	const dropzoneClass = useComputed(() => "dropzone" + (drag.value ? " drag" : ""));
 
 	return (
 		<section class="panel stage" aria-labelledby="stageTitle">
@@ -176,16 +219,16 @@ export function Stage({ canEnroll, repoId, onEnrolled, registerInspect, onEditOp
 
 			<div
 				id="dropzone"
-				class={"dropzone" + (drag ? " drag" : "")}
-				style={`cursor: ${cursor}`}
+				class={dropzoneClass}
+				style={cursorStyle}
 				tabindex={0}
 				role="button"
 				aria-label="Upload a photo to recognize faces"
 				onClick={onDropzoneClick}
 				onKeyDown={onDropzoneKeyDown}
-				onDragEnter={(e) => { e.preventDefault(); setDrag(true); }}
-				onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
-				onDragLeave={(e) => { e.preventDefault(); setDrag(false); }}
+				onDragEnter={(e) => { e.preventDefault(); drag.value = true; }}
+				onDragOver={(e) => { e.preventDefault(); drag.value = true; }}
+				onDragLeave={(e) => { e.preventDefault(); drag.value = false; }}
 				onDrop={onDrop}
 			>
 				<input
@@ -196,11 +239,11 @@ export function Stage({ canEnroll, repoId, onEnrolled, registerInspect, onEditOp
 					hidden
 					onChange={(e) => {
 						const f = e.currentTarget.files?.[0];
-						if (f) handleFile(f);
+						if (f) void handleFile(f);
 						e.currentTarget.value = "";
 					}}
 				/>
-				{previewURL === null ? (
+				<Show when={previewURL} fallback={
 					<div class="dz-empty" id="dzEmpty">
 						<svg viewBox="0 0 48 48" class="dz-icon" aria-hidden="true">
 							<rect x="6" y="10" width="36" height="28" rx="3" fill="none" stroke="currentColor" stroke-width="2" />
@@ -210,28 +253,28 @@ export function Stage({ canEnroll, repoId, onEnrolled, registerInspect, onEditOp
 						<p class="dz-primary">Drop a photo here, or <span class="dz-browse">browse</span></p>
 						<p class="dz-hint">JPG, PNG, WebP or BMP — or paste from the clipboard (Ctrl+V)</p>
 					</div>
-				) : (
-					<div class="dz-preview" id="dzPreview">
-						<div class="canvas-wrap">
-							<img ref={imgRef} id="previewImg" alt="Uploaded photo preview" src={previewURL} />
-							<canvas ref={canvasRef} id="overlay" />
+				}>
+					{(url) => (
+						<div class="dz-preview" id="dzPreview">
+							<div class="canvas-wrap">
+								<img ref={imgRef} id="previewImg" alt="Uploaded photo preview" src={url} />
+								<canvas ref={canvasRef} id="overlay" />
+							</div>
 						</div>
-					</div>
-				)}
+					)}
+				</Show>
 			</div>
 
 			<div class="stage-actions">
-				{canEnroll && (
+				{app.perms.value.writer && (
 					<>
 						<button
 							id="editBtn"
 							class="btn"
-							hidden={previewURL === null}
+							hidden={noPreview}
 							onClick={(e) => {
 								e.stopPropagation();
-								// Edit the pristine original (or the fresh upload) — never
-								// the previously exported bytes.
-								setEditSource(editOriginalRef.current ?? currentFileRef.current);
+								openEditor();
 							}}
 						>
 							Edit
@@ -239,13 +282,13 @@ export function Stage({ canEnroll, repoId, onEnrolled, registerInspect, onEditOp
 						<button
 							id="cancelEditsBtn"
 							class="btn btn-ghost"
-							hidden={editOriginalRef.current === null}
+							hidden={editOriginal.value === null}
 							onClick={(e) => {
 								e.stopPropagation();
 								// Back to the pristine original: re-inspecting it without
 								// the edit lineage resets the editor session and re-runs
 								// recognition on the untouched bytes.
-								const original = editOriginalRef.current;
+								const original = editOriginal.value;
 								if (original) void handleFile(original);
 							}}
 						>
@@ -253,11 +296,11 @@ export function Stage({ canEnroll, repoId, onEnrolled, registerInspect, onEditOp
 						</button>
 					</>
 				)}
-				<button id="clearBtn" class="btn btn-ghost" hidden={previewURL === null} onClick={resetStage}>Clear</button>
+				<button id="clearBtn" class="btn btn-ghost" hidden={noPreview} onClick={resetStage}>Clear</button>
 				<button
 					id="againBtn"
 					class="btn btn-ghost"
-					hidden={previewURL === null}
+					hidden={noPreview}
 					onClick={(e) => { e.stopPropagation(); openPicker(); }}
 				>
 					Choose another
@@ -265,29 +308,25 @@ export function Stage({ canEnroll, repoId, onEnrolled, registerInspect, onEditOp
 				<span class="stage-meta" id="stageMeta">{meta}</span>
 			</div>
 
-			{faces !== null && (
-				<div id="results" class="results">
-					<h2 class="results-title"><span id="resultCount">{faces.length}</span> face(s) found</h2>
-					<ul id="faceList" class="face-list">
-						{faces.map((f, i) => (
-							<FaceRow
-								key={i}
-								face={f}
-								index={i}
-								canEnroll={canEnroll && currentFileRef.current !== null}
-								enrolledName={enrolled[i]}
-								onEnroll={handleRowEnroll}
-							/>
-						))}
-					</ul>
-				</div>
-			)}
-
-			<EditModal
-				source={editSource}
-				onCloseRequest={() => setEditSource(null)}
-				onUse={applyEdited}
-			/>
+			<Show when={faces} fallback={null}>
+				{(list) => (
+					<div id="results" class="results">
+						<h2 class="results-title"><span id="resultCount">{list.length}</span> face(s) found</h2>
+						<ul id="faceList" class="face-list">
+							<For each={list}>
+								{(f, i) => (
+									<FaceRow
+										face={f}
+										index={i}
+										enrolled={enrolled}
+										onEnroll={handleRowEnroll}
+									/>
+								)}
+							</For>
+						</ul>
+					</div>
+				)}
+			</Show>
 		</section>
 	);
 }
@@ -295,15 +334,18 @@ export function Stage({ canEnroll, repoId, onEnrolled, registerInspect, onEditOp
 // One face row: index badge, identity, ranked matches (with a duplicate hint
 // when the top two scores are nearly tied), and — for unknown faces when the
 // viewer may write to this repo — the inline "name this person" enroll form.
+// The row subscribes to the store (canEnroll) and the enrolled map itself;
+// a re-render of the Stage's own signals does not reach past the row list.
 function FaceRow(props: {
 	face: Face;
 	index: number;
-	canEnroll: boolean;
-	enrolledName?: string;
+	enrolled: Signal<Record<number, string>>;
 	onEnroll: (faceNo: number, person: string, done: (ok: boolean) => void) => void;
 }) {
+	const app = useApp();
 	const f = props.face;
-	const name = props.enrolledName ?? f.name;
+	const enrolledName = props.enrolled.value[props.index];
+	const name = enrolledName ?? f.name;
 	const known = name !== "unknown";
 	const conf = Math.round((f.confidence || 0) * 100);
 
@@ -311,8 +353,8 @@ function FaceRow(props: {
 	const showMatches = matches.length >= 2;
 	const near = showMatches && matches[0].score - matches[1].score <= 0.05;
 
-	const [person, setPerson] = useState("");
-	const [busy, setBusy] = useState(false);
+	const person = useSignal("");
+	const busy = useSignal(false);
 	const inputRef = useRef<HTMLInputElement | null>(null);
 
 	const matchesBlock = showMatches && (
@@ -335,17 +377,17 @@ function FaceRow(props: {
 			<div>
 				<div class="face-name">{name}</div>
 				{matchesBlock}
-				{!known && props.canEnroll && (
+				{!known && app.perms.value.writer && (
 					<form
 						class="face-enroll"
 						onSubmit={(e) => {
 							e.preventDefault();
-							const p = person.trim();
+							const p = person.value.trim();
 							if (!p) { inputRef.current?.focus(); return; }
-							setBusy(true);
+							busy.value = true;
 							props.onEnroll(props.index + 1, p, (ok) => {
 								if (!ok) {
-									setBusy(false);
+									busy.value = false;
 									inputRef.current?.focus();
 								}
 							});
@@ -362,7 +404,7 @@ function FaceRow(props: {
 							aria-label="Enroll this face as"
 							disabled={busy}
 							value={person}
-							onInput={(e) => setPerson(e.currentTarget.value)}
+							onInput={(e) => { person.value = e.currentTarget.value; }}
 						/>
 						<button type="submit" class="btn btn-accent btn-sm" disabled={busy}>Enroll</button>
 					</form>

@@ -1,7 +1,8 @@
 // Shared modal shell: backdrop, card, header (eyebrow + title + optional
 // actions), close button, focus trap, focus save/restore, and Escape-stack
-// registration. Shells stay mounted and toggle the `hidden` attribute — the
-// stylesheet keys modal visibility off `.modal[hidden]`.
+// registration. Whether a shell is mounted is decided by the modal service
+// that rendered it: open == mounted, close == unmounted, and an instance
+// with another modal on top stays mounted (paused, state intact).
 //
 // Clicking the backdrop, the × button, or any [data-close] element inside
 // invokes onCloseRequest (callers decide to refuse while busy). A mouse
@@ -14,6 +15,7 @@
 import { useEffect, useRef } from "preact/hooks";
 import type { ComponentChildren, HTMLAttributes, TargetedKeyboardEvent, TargetedMouseEvent } from "preact";
 import { pushEscape, removeEscape } from "../modalStack";
+import { Signal, useComputed } from "@preact/signals"
 
 export interface ModalProps {
 	open: boolean;
@@ -24,7 +26,7 @@ export interface ModalProps {
 	/** extra classes on .modal-card (e.g. "wide") */
 	cardClass?: string;
 	/** busy lock: dims and blocks interaction via .locked */
-	locked?: boolean;
+	locked?: Signal<boolean>;
 	eyebrow: string;
 	titleId: string;
 	title: string;
@@ -124,8 +126,10 @@ export function Modal(props: ModalProps) {
 		if (press != null ? press === release : release != null && e.detail === 0) closeRef.current();
 	};
 
+	const classes = useComputed(() => `modal${locked?.value ? " locked" : ""}`)
+
 	return (
-		<div id={id} class={"modal" + (locked ? " locked" : "")} hidden={!open} {...rootProps} onClick={onClick} onMouseDown={onMouseDown}>
+		<div id={id} class={classes} hidden={!open} {...rootProps} onClick={onClick} onMouseDown={onMouseDown}>
 			<div class="modal-backdrop" data-close={backdropClickDisabled ? undefined : true} />
 			<div
 				class={"modal-card" + (cardClass ? ` ${cardClass}` : "")}

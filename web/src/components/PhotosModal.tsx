@@ -1,124 +1,132 @@
 // Photos manager modal.
-// Opens from the person details modal (admins only): the grid lists their
+// Opens from the person details modal (writers, via the modal service — the
+// details modal stays mounted underneath, paused): the grid lists their
 // enrolled photos (remove per tile, add via drop/paste/browse); clicking a
 // tile opens the detail view, which runs detection on the stored photo and
 // draws the faces over it so the user can judge the photo's quality. The
 // header carries an inline rename editor; saving renames everything
-// server-side.
+// server-side and patches both open modals' person (the photos manager
+// reloads under the new name, the details modal follows).
 //
 // Any two enrolled photos of this person can be compared face-to-face: each
 // grid tile has a compare button (the detail view has a "Compare faces…"
 // button) — the first pick marks the photo (A), the second pick loads both
-// photos and launches the compare modal, auto-running the similarity check.
+// photos and opens the compare modal seeded, auto-running the similarity
+// check.
+//
+// All component-local state is signals. The props mirror (props are not
+// signals) lets imperative closures see the person the modal currently
+// manages, and every handler reads signal values at call time — so no
+// handler can act on a stale render's detail view, rename edit or compare
+// pick (the former detailRef/busyRef mirrors are gone: detailPath and busy
+// are read directly, .peek() where a guard must not subscribe).
 
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useRef } from "preact/hooks";
+import { batch, useComputed, useSignal, useSignalEffect } from "@preact/signals";
+import type { ReadonlySignal } from "@preact/signals";
+import { For, Show } from "@preact/signals/utils";
 import type { TargetedEvent } from "preact";
 import * as api from "../api";
 import type { Face, PersonPhoto } from "../types";
 import { drawFaces } from "../overlay";
 import { useToast } from "../toast";
+import { useApp } from "../appStore";
+import { useModals } from "../modalRegistry";
+import { usePasteFiles } from "../paste";
 import { Modal } from "./Modal";
 
 interface PhotosModalProps {
-	/** name of the person being managed; null = closed */
-	person: string | null;
-	/** the repository the person lives in ("" while closed) */
-	repoId: string;
+	/** injected by the modal service (instances render open) */
+	open: boolean;
+	/** injected by the modal service: true while no other instance sits above */
+	isTopmost: boolean;
+	/** injected by the modal service; closing unmounts the instance */
 	onCloseRequest: () => void;
-	/** the person was renamed server-side; App updates the open person */
-	onRenamed: (name: string) => void;
-	/** photos added/removed or avatar changed → refresh people + health */
-	onChange: () => void;
-	/** compare two enrolled photos face-to-face (opens the compare modal) */
-	onComparePhotos: (a: File, b: File) => void;
-	registerAddFiles: (fn: ((files: FileList | File[]) => void) | null) => void;
+	/** the person being managed */
+	person: string;
 }
 
 export function PhotosModal(props: PhotosModalProps) {
 	const toast = useToast();
-	// The repo the open person belongs to, stable for imperative closures.
-	const repoRef = useRef(props.repoId);
-	repoRef.current = props.repoId;
+	const app = useApp();
+	const modals = useModals();
+	const { open, isTopmost, onCloseRequest } = props;
 
-	const [photos, setPhotos] = useState<PersonPhoto[] | null>(null);
-	const [hint, setHint] = useState("Loading photos…");
-	const [detailPath, setDetailPath] = useState<string | null>(null);
-	const [verdict, setVerdict] = useState("");
-	const [verdictWarn, setVerdictWarn] = useState(false);
-	const [busy, setBusyState] = useState(false);
-	const [renaming, setRenaming] = useState(false);
-	const [renameVal, setRenameVal] = useState("");
-	const [dropHint, setDropHint] = useState(false);
+	// Component-local state as signals.
+	const photos = useSignal<PersonPhoto[] | null>(null);
+	const hint = useSignal("Loading photos…");
+	// detailPath doubles as the former detailRef mirror: async continuations
+	// read detailPath.peek() to detect that the detail view moved on.
+	const detailPath = useSignal<string | null>(null);
+	const verdict = useSignal("");
+	const verdictWarn = useSignal(false);
+	const busy = useSignal(false);
+	const renaming = useSignal(false);
+	const renameVal = useSignal("");
+	const dropHint = useSignal(false);
 	// Enrolled photo currently marked as photo A of a comparison (path).
-	const [cmpPath, setCmpPath] = useState<string | null>(null);
+	const cmpPath = useSignal<string | null>(null);
 
-	const personRef = useRef<string | null>(props.person);
-	const detailRef = useRef<string | null>(null);
-	const busyRef = useRef(false);
+	// The person being managed, mirrored from props (props are not signals):
+	// imperative closures (paste routing, uploads, compare launches) read it
+	// at call time.
+	const personRef = useRef(props.person);
+	personRef.current = props.person;
+
 	const detailImgRef = useRef<HTMLImageElement | null>(null);
 	const detailCanvasRef = useRef<HTMLCanvasElement | null>(null);
 	const addInputRef = useRef<HTMLInputElement | null>(null);
 	const renameInputRef = useRef<HTMLInputElement | null>(null);
 
-	// Keep the ref in sync for imperative closures (click handlers, async
-	// continuations that must observe "which person/detail is current now").
+	// Open: drop any detail view and load the grid.
 	useEffect(() => {
-		personRef.current = props.person;
-	}, [props.person]);
-
-	const setBusy = (b: boolean) => {
-		busyRef.current = b;
-		setBusyState(b);
-	};
-
-	// Open / person switch: drop any detail view and load the grid.
-	useEffect(() => {
-		if (!props.person) return;
-		detailRef.current = null;
-		setDetailPath(null);
-		setRenaming(false);
-		setCmpPath(null);
-		setPhotos(null);
-		setHint("Loading photos…");
+		batch(() => {
+			detailPath.value = null;
+			renaming.value = false;
+			cmpPath.value = null;
+			photos.value = null;
+			hint.value = "Loading photos…";
+		})
 		loadGrid(props.person);
 	}, [props.person]);
 
-	// Paste routing surface (registered with App).
-	useEffect(() => {
-		props.registerAddFiles((files) => {
-			if (busyRef.current || !personRef.current || detailRef.current !== null) return;
-			addPhotos(files);
-		});
-		return () => props.registerAddFiles(null);
-	}, []);
-
-	const open = props.person !== null;
+	// ---- paste routing (via the injected isTopmost flag) ----
+	// While this modal is topmost, pasted images upload straight into that
+	// person's profile — but not while the detail view is showing (the add
+	// grid is gone).
+	usePasteFiles(isTopmost, (files) => {
+		if (busy.value || !personRef.current || detailPath.peek() !== null) return;
+		addPhotos(files);
+	});
 
 	const close = () => {
-		if (busyRef.current) return; // locked while a request is in flight
-		props.onCloseRequest();
+		if (busy.value) return; // locked while a request is in flight
+		onCloseRequest();
 	};
 
 	// Escape cancels the inline rename edit, then a pending compare pick,
-	// then closes.
+	// then closes. All reads are call-time signal reads — no handler can act
+	// on a stale render's state.
 	const onEscape = () => {
-		if (renaming) cancelRename();
-		else if (cmpPath) setCmpPath(null);
+		if (renaming.value) cancelRename();
+		else if (cmpPath.value) cmpPath.value = null;
 		else close();
 	};
 
 	// ---- grid ----
 	async function loadGrid(name: string) {
-		setHint("Loading photos…");
+		hint.value = "Loading photos…";
 		try {
-			const j = await api.getPersonPhotos(name, repoRef.current);
+			const j = await api.getPersonPhotos(name, app.repoId.value ?? "");
 			const list = j.photos || [];
-			setPhotos(list);
-			setHint(list.length
-				? "Click a photo to see the detected faces. Drop, paste, or use the box below to add more."
-				: "No photos enrolled for this person yet — add some below.");
+			batch(() => {
+				photos.value = list;
+				hint.value = list.length
+					? "Click a photo to see the detected faces. Drop, paste, or use the box below to add more."
+					: "No photos enrolled for this person yet — add some below.";
+			})
 		} catch (e) {
-			setHint((e as Error).message || "Could not load photos.");
+			hint.value = (e as Error).message || "Could not load photos.";
 		}
 	}
 
@@ -127,27 +135,29 @@ export function PhotosModal(props: PhotosModalProps) {
 	// Saving renames everything server-side: the people/ folder, the person's
 	// ID, the thumbnail sidecar and the DB record.
 	function openRename() {
-		if (busyRef.current || renaming || !personRef.current) return;
-		setRenameVal(personRef.current);
-		setRenaming(true);
+		if (busy.value || renaming.value || !personRef.current) return;
+		batch(() => {
+			renameVal.value = personRef.current;
+			renaming.value = true;
+		})
 	}
 
-	useEffect(() => {
-		if (renaming) {
+	useSignalEffect(() => {
+		if (renaming.value) {
 			renameInputRef.current?.focus();
 			renameInputRef.current?.select();
 		}
-	}, [renaming]);
+	});
 
 	function cancelRename() {
-		setRenaming(false);
+		renaming.value = false;
 	}
 
 	const submitRename = async (e: TargetedEvent<HTMLFormElement>) => {
 		e.preventDefault();
-		if (busyRef.current || !renaming || !personRef.current) return;
+		if (busy.value || !renaming.value || !personRef.current) return;
 		const oldName = personRef.current;
-		const newName = renameVal.trim();
+		const newName = renameVal.value.trim();
 		if (!newName) {
 			toast.show("Enter the person's new name.", "err");
 			renameInputRef.current?.focus();
@@ -155,22 +165,23 @@ export function PhotosModal(props: PhotosModalProps) {
 		}
 		if (newName === oldName) { cancelRename(); return; }
 
-		setBusy(true);
+		busy.value = true;
 		try {
-			const j = await api.renamePerson(oldName, repoRef.current, newName);
+			const j = await api.renamePerson(oldName, app.repoId.value ?? "", newName);
 			const canonical = j.name || newName; // DB-canonical name
 			// Photo URLs embed the person's name: drop any open detail view and
-			// reload the grid under the new name (the person-prop effect does it).
-			detailRef.current = null;
-			setDetailPath(null);
+			// reload the grid under the new name (the person-args effect does
+			// it), and let the details modal underneath follow the person too.
+			detailPath.value = null;
 			cancelRename();
-			props.onRenamed(canonical);
+			modals.patch("photos", { person: canonical });
+			modals.patch("person", { name: canonical }, (cur) => cur?.name === oldName);
 			toast.show(`Renamed to ${canonical}.`, "ok");
-			props.onChange(); // refresh people list + health
+			app.refreshAll(); // refresh people list + health
 		} catch (err) {
 			toast.show((err as Error).message || "Could not rename.", "err");
 		} finally {
-			setBusy(false);
+			busy.value = false;
 		}
 	};
 
@@ -180,21 +191,24 @@ export function PhotosModal(props: PhotosModalProps) {
 	async function openDetail(photoPath: string) {
 		const person = personRef.current;
 		if (!person) return;
-		detailRef.current = photoPath;
-		setDetailPath(photoPath);
-		setVerdictWarn(false);
-		setVerdict("Detecting faces…");
+		batch(() => {
+			detailPath.value = photoPath;
+			verdictWarn.value = false;
+			verdict.value = "Detecting faces…";
+		})
 		// Clear any boxes left over from a previously viewed photo.
 		const c = detailCanvasRef.current;
 		c?.getContext("2d")?.clearRect(0, 0, c.width, c.height);
 		try {
-			const j = await api.detectPhoto(person, repoRef.current, photoPath);
-			if (detailRef.current !== photoPath) return; // view moved on
+			const j = await api.detectPhoto(person, app.repoId.value ?? "", photoPath);
+			if (detailPath.peek() !== photoPath) return; // view moved on
 			renderVerdict(j.faces || [], photoPath);
 		} catch (e) {
-			if (detailRef.current === photoPath) {
-				setVerdict((e as Error).message || "Could not analyze this photo.");
-				setVerdictWarn(true);
+			if (detailPath.peek() === photoPath) {
+				batch(() => {
+					verdict.value = (e as Error).message || "Could not analyze this photo.";
+					verdictWarn.value = true;
+				})
 			}
 		}
 	}
@@ -205,17 +219,19 @@ export function PhotosModal(props: PhotosModalProps) {
 		const canvas = detailCanvasRef.current;
 		if (img && canvas) {
 			const draw = () => {
-				if (detailRef.current !== photoPath) return; // view moved on
+				if (detailPath.peek() !== photoPath) return; // view moved on
 				drawFaces(canvas, img, faces, { labels: true });
 			};
 			if (img.complete && img.naturalWidth) draw();
 			else img.onload = draw;
 		}
 
-		setVerdictWarn(false);
+		verdictWarn.value = false;
 		if (!faces.length) {
-			setVerdict("No face detected — this photo contributes nothing to recognition.");
-			setVerdictWarn(true);
+			batch(() => {
+				verdict.value = "No face detected — this photo contributes nothing to recognition.";
+				verdictWarn.value = true;
+			})
 			return;
 		}
 		const parts = faces.map((f) => {
@@ -226,12 +242,11 @@ export function PhotosModal(props: PhotosModalProps) {
 		});
 		const n = faces.length;
 		const lead = n === 1 ? "1 face detected" : `${n} faces detected — enrollment uses the largest`;
-		setVerdict(`${lead} · ${parts.join(", ")}`);
+		verdict.value = `${lead} · ${parts.join(", ")}`;
 	}
 
 	function backToGrid() {
-		detailRef.current = null;
-		setDetailPath(null);
+		detailPath.value = null;
 	}
 
 	// ---- compare two enrolled photos ----
@@ -241,35 +256,36 @@ export function PhotosModal(props: PhotosModalProps) {
 	// similarity check. Works from the grid's per-tile buttons and from the
 	// detail view's "Compare faces…" button alike.
 	function pickComparePath(path: string) {
-		if (busyRef.current) return;
-		if (!cmpPath) {
-			setCmpPath(path);
+		if (busy.value) return;
+		if (!cmpPath.value) {
+			cmpPath.value = path;
 			toast.show(`${path} set as photo A — pick another photo to compare.`, "ok");
 			return;
 		}
-		if (cmpPath === path) {
-			setCmpPath(null);
+		if (cmpPath.value === path) {
+			cmpPath.value = null;
 			return;
 		}
-		launchCompare(cmpPath, path);
+		launchCompare(cmpPath.value, path);
 	}
 
 	async function launchCompare(aPath: string, bPath: string) {
 		const person = personRef.current;
-		if (busyRef.current || !person) return;
-		setBusy(true);
+		if (busy.value || !person) return;
+		busy.value = true;
 		try {
 			const [a, b] = await Promise.all([
-				api.fetchPhotoFile(person, repoRef.current, aPath),
-				api.fetchPhotoFile(person, repoRef.current, bPath),
+				api.fetchPhotoFile(person, app.repoId.value ?? "", aPath),
+				api.fetchPhotoFile(person, app.repoId.value ?? "", bPath),
 			]);
-			setCmpPath(null);
-			props.onComparePhotos(a, b);
+			cmpPath.value = null;
+			// Stacked on top of this modal (which stays open underneath).
+			modals.open("compare", { seed: { a, b } });
 		} catch (e) {
-			setCmpPath(null);
+			cmpPath.value = null;
 			toast.show((e as Error).message || "Could not load the photos for comparison.", "err");
 		} finally {
-			setBusy(false);
+			busy.value = false;
 		}
 	}
 
@@ -277,54 +293,54 @@ export function PhotosModal(props: PhotosModalProps) {
 	// grid so another photo can be picked; with A already marked it follows
 	// the usual rule (click the marked photo again = cancel, otherwise launch).
 	function compareFromDetail() {
-		if (busyRef.current || !detailPath) return;
-		if (cmpPath && cmpPath !== detailPath) {
-			launchCompare(cmpPath, detailPath);
+		const path = detailPath.value;
+		if (busy.value || !path) return;
+		if (cmpPath.value && cmpPath.value !== path) {
+			launchCompare(cmpPath.value, path);
 			return;
 		}
-		if (!cmpPath) {
-			setCmpPath(detailPath);
+		if (!cmpPath.value) {
+			cmpPath.value = path;
 			backToGrid();
-			toast.show(`${detailPath} set as photo A — pick another photo to compare.`, "ok");
+			toast.show(`${path} set as photo A — pick another photo to compare.`, "ok");
 			return;
 		}
-		setCmpPath(null); // the detail photo was the marked one — cancel
+		cmpPath.value = null; // the detail photo was the marked one — cancel
 	}
 
 	async function deletePhoto(photoPath: string) {
 		const person = personRef.current;
-		if (busyRef.current || !person) return;
+		if (busy.value || !person) return;
 		if (!confirm(`Remove ${photoPath} from ${person}? The file is deleted from the people folder too.`)) return;
-		setBusy(true);
+		busy.value = true;
 		try {
-			await api.deletePhoto(person, repoRef.current, photoPath);
+			await api.deletePhoto(person, app.repoId.value ?? "", photoPath);
 			toast.show(`Removed ${photoPath}.`, "ok");
-			if (detailRef.current === photoPath) {
-				detailRef.current = null;
-				setDetailPath(null); // the photo under inspection is gone — back to the grid
+			if (detailPath.peek() === photoPath) {
+				detailPath.value = null; // the photo under inspection is gone — back to the grid
 			}
-			if (cmpPath === photoPath) setCmpPath(null); // was marked for comparison
+			if (cmpPath.value === photoPath) cmpPath.value = null; // was marked for comparison
 			loadGrid(person);
-			props.onChange();
+			app.refreshAll();
 		} catch (e) {
 			toast.show((e as Error).message || "Could not remove the photo.", "err");
 		} finally {
-			setBusy(false);
+			busy.value = false;
 		}
 	}
 
 	async function setAsAvatar() {
 		const person = personRef.current;
-		if (busyRef.current || !person || !detailRef.current) return;
-		setBusy(true);
+		if (busy.value || !person || !detailPath.value) return;
+		busy.value = true;
 		try {
-			await api.setThumbnail(person, repoRef.current, detailRef.current);
+			await api.setThumbnail(person, app.repoId.value ?? "", detailPath.value);
 			toast.show("Avatar updated.", "ok");
-			props.onChange();
+			app.refreshAll();
 		} catch (e) {
 			toast.show((e as Error).message || "Could not update the avatar.", "err");
 		} finally {
-			setBusy(false);
+			busy.value = false;
 		}
 	}
 
@@ -335,29 +351,37 @@ export function PhotosModal(props: PhotosModalProps) {
 		const person = personRef.current;
 		const files = Array.from(fileList).filter((f) => f.type.startsWith("image/"));
 		if (!files.length) { toast.show("No image files to add.", "err"); return; }
-		if (busyRef.current || !person) return;
-		setBusy(true);
-		setHint(`Uploading ${files.length} photo${files.length === 1 ? "" : "s"}…`);
+		if (busy.value || !person) return;
+		batch(() => {
+			busy.value = true;
+			hint.value = `Uploading ${files.length} photo${files.length === 1 ? "" : "s"}…`;
+		})
 		try {
-			const j = await api.enrollPhotos(person, repoRef.current, files);
+			const j = await api.enrollPhotos(person, app.repoId.value ?? "", files);
 			if (j.added > 0) toast.show(`Added ${j.added} photo${j.added === 1 ? "" : "s"}.`, "ok");
 			if (j.failures && j.failures.length) {
 				toast.show(`${j.failures.length} photo(s) rejected: ${j.failures[0]}`, "err");
 			}
-			props.onChange();
+			app.refreshAll();
 		} catch (e) {
 			toast.show((e as Error).message || "Upload failed.", "err");
 		} finally {
-			setBusy(false);
+			busy.value = false;
 			if (personRef.current) loadGrid(personRef.current);
 		}
 	}
 
-	const canDrop = !busy && detailPath === null;
+	// Derived state as computeds; they drive the attribute signals.
+	const canDrop = useComputed(() => !busy.value && detailPath.value === null);
+	const addBoxClass = useComputed(() => "photo-add" + (dropHint.value ? " drag" : ""));
+	const hintClass = useComputed(() => "field-hint" + (cmpPath.value ? " cmp-hint" : ""));
 	// While a photo is marked for comparison the hint line guides the pick.
-	const hintShown = cmpPath
-		? `Pick another photo to compare with "${cmpPath}" — or click its compare button again to cancel.`
-		: hint;
+	const hintShown = useComputed(() => cmpPath.value
+		? `Pick another photo to compare with "${cmpPath.value}" — or click its compare button again to cancel.`
+		: hint.value);
+	const verdictClass = useComputed(() => "photo-verdict" + (verdictWarn.value ? " warn" : ""));
+	const renameFormHidden = useComputed(() => !renaming.value);
+	const gridPhotos = useComputed(() => photos.value ?? []);
 
 	return (
 		<Modal
@@ -368,12 +392,12 @@ export function PhotosModal(props: PhotosModalProps) {
 			locked={busy}
 			eyebrow="photos"
 			titleId="photoTitle"
-			title={props.person ?? ""}
+			title={props.person}
 			headerExtras={
 				<form
 					id="photoRenameForm"
 					class="rename-row"
-					hidden={!renaming}
+					hidden={renameFormHidden}
 					onSubmit={submitRename}
 				>
 					<input
@@ -386,7 +410,7 @@ export function PhotosModal(props: PhotosModalProps) {
 						aria-label="New name"
 						disabled={busy}
 						value={renameVal}
-						onInput={(e) => setRenameVal(e.currentTarget.value)}
+						onInput={(e) => { renameVal.value = e.currentTarget.value; }}
 					/>
 					<button type="submit" class="btn btn-accent btn-sm" id="photoRenameSave" disabled={busy}>Save</button>
 					<button type="button" class="btn btn-ghost btn-sm" id="photoRenameCancel" onClick={cancelRename}>Cancel</button>
@@ -406,101 +430,104 @@ export function PhotosModal(props: PhotosModalProps) {
 			onEscape={onEscape}
 			onCloseRequest={close}
 			rootProps={{
-				onDragEnter: (e) => { e.preventDefault(); if (canDrop) setDropHint(true); },
-				onDragOver: (e) => { e.preventDefault(); if (canDrop) setDropHint(true); },
+				onDragEnter: (e) => { e.preventDefault(); if (canDrop.value) dropHint.value = true; },
+				onDragOver: (e) => { e.preventDefault(); if (canDrop.value) dropHint.value = true; },
 				onDragLeave: (e) => {
-					if (!(e as DragEvent).relatedTarget) setDropHint(false);
+					if (!(e as DragEvent).relatedTarget) dropHint.value = false;
 				},
 				onDrop: (e) => {
 					e.preventDefault();
-					setDropHint(false);
-					if (canDrop && e.dataTransfer?.files?.length) addPhotos(e.dataTransfer.files);
+					dropHint.value = false;
+					if (canDrop.value && e.dataTransfer?.files?.length) addPhotos(e.dataTransfer.files);
 				},
 			}}
 			body={
 				<div class="modal-body">
-					<p class={"field-hint" + (cmpPath ? " cmp-hint" : "")} id="photoHint">{hintShown}</p>
+					<p class={hintClass} id="photoHint">{hintShown}</p>
 
-					{/* grid view */}
-					{detailPath === null && (
-						<div id="photoGridView">
-							<ul id="photoGrid" class="photo-grid">
-								{(photos ?? []).map((ph) => (
-									<PhotoTile
-										key={ph.path}
-										person={props.person ?? ""}
-										repoId={props.repoId}
-										ph={ph}
-										cmpMark={cmpPath === ph.path}
-										onOpen={() => openDetail(ph.path)}
-										onDelete={() => deletePhoto(ph.path)}
-										onCompare={() => pickComparePath(ph.path)}
-									/>
-								))}
-							</ul>
-							<div
-								id="photoAdd"
-								class={"photo-add" + (dropHint ? " drag" : "")}
-								tabindex={0}
-								role="button"
-								aria-label="Add photos — drag and drop, paste, or press Enter to browse"
-								onClick={() => { if (!busy) addInputRef.current?.click(); }}
-								onKeyDown={(e) => {
-									if ((e.key === "Enter" || e.key === " ") && !busy) {
-										e.preventDefault();
-										addInputRef.current?.click();
-									}
-								}}
-							>
-								<p class="pa-primary">Drag &amp; drop, paste, or <span class="pa-browse">browse</span> to add photos</p>
-								<p class="pa-hint">Photos upload immediately and become part of this person's dataset</p>
-								<input
-									ref={addInputRef}
-									id="photoFiles"
-									type="file"
-									accept="image/*"
-									multiple
-									hidden
-									onChange={(e) => {
-										if (e.currentTarget.files?.length) addPhotos(e.currentTarget.files);
-										e.currentTarget.value = "";
+					{/* grid view (fallback) ↔ detail view (when a photo is open) */}
+					<Show
+						when={detailPath}
+						fallback={
+							<div id="photoGridView">
+								<ul id="photoGrid" class="photo-grid">
+									<For each={gridPhotos} getKey={(ph) => ph.path}>
+										{(ph) => (
+											<PhotoTile
+												person={props.person}
+												repoId={app.repoId.value ?? ""}
+												ph={ph}
+												cmpPath={cmpPath}
+												onOpen={() => openDetail(ph.path)}
+												onDelete={() => deletePhoto(ph.path)}
+												onCompare={() => pickComparePath(ph.path)}
+											/>
+										)}
+									</For>
+								</ul>
+								<div
+									id="photoAdd"
+									class={addBoxClass}
+									tabindex={0}
+									role="button"
+									aria-label="Add photos — drag and drop, paste, or press Enter to browse"
+									onClick={() => { if (!busy.value) addInputRef.current?.click(); }}
+									onKeyDown={(e) => {
+										if ((e.key === "Enter" || e.key === " ") && !busy.value) {
+											e.preventDefault();
+											addInputRef.current?.click();
+										}
 									}}
-								/>
-							</div>
-						</div>
-					)}
-
-					{/* detail view: photo with detected faces drawn over it */}
-					{detailPath !== null && (
-						<div id="photoDetailView">
-							<button type="button" class="photo-back" id="photoBackBtn" onClick={backToGrid}>← All photos</button>
-							<div class="canvas-wrap photo-canvas">
-								<img
-									ref={detailImgRef}
-									id="photoDetailImg"
-									alt="Enrolled photo"
-									src={api.withRepoQuery(api.photoURL(props.person ?? "", detailPath), props.repoId)}
-								/>
-								<canvas ref={detailCanvasRef} id="photoOverlay" />
-							</div>
-							<p class={"photo-verdict" + (verdictWarn ? " warn" : "")} id="photoVerdict" aria-live="polite">{verdict}</p>
-							<div class="photo-actions">
-								<button type="button" class="btn btn-ghost" id="photoThumbBtn" onClick={setAsAvatar}>Set as avatar</button>
-								<button
-									type="button"
-									class="btn btn-ghost"
-									id="photoCompareBtn"
-									title={cmpPath === detailPath
-										? "Photo A selected — click again to cancel"
-										: "Compare this photo with another enrolled photo"}
-									onClick={compareFromDetail}
 								>
-									Compare faces…
-								</button>
-								<button type="button" class="btn btn-ghost photo-remove" id="photoDelBtn" onClick={() => detailPath && deletePhoto(detailPath)}>Remove photo</button>
+									<p class="pa-primary">Drag &amp; drop, paste, or <span class="pa-browse">browse</span> to add photos</p>
+									<p class="pa-hint">Photos upload immediately and become part of this person's dataset</p>
+									<input
+										ref={addInputRef}
+										id="photoFiles"
+										type="file"
+										accept="image/*"
+										multiple
+										hidden
+										onChange={(e) => {
+											if (e.currentTarget.files?.length) addPhotos(e.currentTarget.files);
+											e.currentTarget.value = "";
+										}}
+									/>
+								</div>
 							</div>
-						</div>
-					)}
+						}
+					>
+						{(path) => (
+							<div id="photoDetailView">
+								<button type="button" class="photo-back" id="photoBackBtn" onClick={backToGrid}>← All photos</button>
+								<div class="canvas-wrap photo-canvas">
+									<img
+										ref={detailImgRef}
+										id="photoDetailImg"
+										alt="Enrolled photo"
+										src={api.withRepoQuery(api.photoURL(props.person, path), app.repoId.value ?? "")}
+									/>
+									<canvas ref={detailCanvasRef} id="photoOverlay" />
+								</div>
+								<p class={verdictClass} id="photoVerdict" aria-live="polite">{verdict}</p>
+								<div class="photo-actions">
+									<button type="button" class="btn btn-ghost" id="photoThumbBtn" onClick={setAsAvatar}>Set as avatar</button>
+									<button
+										type="button"
+										class="btn btn-ghost"
+										id="photoCompareBtn"
+										title={cmpPath.value === path
+											? "Photo A selected — click again to cancel"
+											: "Compare this photo with another enrolled photo"}
+										onClick={compareFromDetail}
+									>
+										Compare faces…
+									</button>
+									<button type="button" class="btn btn-ghost photo-remove" id="photoDelBtn" onClick={() => deletePhoto(path)}>Remove photo</button>
+								</div>
+							</div>
+						)}
+					</Show>
 
 					<footer class="modal-foot">
 						<button type="button" class="btn btn-ghost" data-close>Close</button>
@@ -518,15 +545,18 @@ function PhotoTile(props: {
 	person: string;
 	repoId: string;
 	ph: PersonPhoto;
-	cmpMark: boolean;
+	/** the photo currently marked as comparison photo A (read here, so a
+	 *  cmpPath change re-renders only the affected tiles) */
+	cmpPath: ReadonlySignal<string | null>;
 	onOpen: () => void;
 	onDelete: () => void;
 	onCompare: () => void;
 }) {
-	const [broken, setBroken] = useState(false);
+	const broken = useSignal(false);
 	const ph = props.ph;
+	const cmpMark = props.cmpPath.value === ph.path;
 	return (
-		<li class={"photo-tile" + (props.cmpMark ? " cmp-mark" : "")}>
+		<li class={"photo-tile" + (cmpMark ? " cmp-mark" : "")}>
 			<button
 				type="button"
 				class="photo-tile"
@@ -534,18 +564,18 @@ function PhotoTile(props: {
 				disabled={broken}
 				onClick={props.onOpen}
 			>
-				{broken
+				{broken.value
 					? "unavailable"
 					// The photo route is repo-scoped (?repo= is required), so the
 					// URL must carry the repository the person lives in.
-					: <img alt={ph.path} src={api.withRepoQuery(api.photoURL(props.person, ph.path), props.repoId)} onError={() => setBroken(true)} />}
+					: <img alt={ph.path} src={api.withRepoQuery(api.photoURL(props.person, ph.path), props.repoId)} onError={() => broken.value = true} />}
 			</button>
 			<button
 				type="button"
 				class="photo-tile-cmp"
 				aria-label={`Compare ${ph.path} with another photo`}
-				aria-pressed={props.cmpMark}
-				title={props.cmpMark
+				aria-pressed={cmpMark}
+				title={cmpMark
 					? "Photo A selected — click again to cancel, or pick another photo"
 					: "Compare with another photo"}
 				onClick={(e) => { e.stopPropagation(); props.onCompare(); }}
@@ -562,7 +592,7 @@ function PhotoTile(props: {
 					/>
 				</svg>
 			</button>
-			{props.cmpMark && <span class="cmp-badge">A</span>}
+			{cmpMark && <span class="cmp-badge">A</span>}
 			<button
 				type="button"
 				class="photo-tile-del"

@@ -1,10 +1,11 @@
 // Enroll modal.
 // Photos chosen for enrollment are held client-side for review; the upload
 // only happens when the user confirms with the "Enroll" button. More photos
-// can be added at any time by drag & drop, paste, or the file input. Each
-// pending photo immediately gets a server-side face check (sequential —
-// inference is a single serialized stream) so the user sees the detected
-// faces before committing to enrollment.
+// can be added at any time by drag & drop, paste (routed by the modal
+// service), or the file input. Each pending photo immediately gets a
+// server-side face check (sequential — inference is a single serialized
+// stream) so the user sees the detected faces before committing to
+// enrollment.
 //
 // An optional collapsed "Person details" section collects the person's
 // metadata (aliases, birthdate, links, notes) — the same fields and edit
@@ -15,16 +16,38 @@
 //
 // Any two pending photos can also be compared face-to-face: each thumb has
 // a compare button — the first click marks the photo (A), the second pick
-// launches the compare modal with both, auto-running the similarity check.
+// opens the compare modal with both (seeded, auto-running the similarity
+// check). The enlarged face-check viewer opens the same way, stacked on
+// top; its faces are patched in as checks complete.
+//
+// All state and behavior live in EnrollViewModel (createModel/useModel, the
+// appStore/LoginView pattern): the form signals, signal-backed element
+// refs, the computeds, every action, and the model-owned effects (the
+// details pre-fill, the beforeunload guard, the preview-URL revocation —
+// disposed with the model). Returned actions are batched and untracked, so
+// the async chains (the check queue, the enrollment request, the details
+// pre-fill) read the values they guard at call time — pending.value/peek(),
+// enrolling.value, cmpKey.value, metaTouched.peek(), name.peek() — and
+// nothing can act on a removed photo or a superseded name. Non-reactive
+// plumbing (the pre-fill watermark, the serialized check chain, the pulse
+// timer) stays in plain closure locals, not state. The component keeps only
+// the injected lifecycle props: open/isTopmost stay plain; onCloseRequest
+// reaches the model through useLiveSignal; paste routing stays in paste.ts.
 
-import { useEffect, useRef, useState } from "preact/hooks";
-import type { TargetedEvent } from "preact";
+import { useEffect, useRef } from "preact/hooks";
+import { batch, computed, createModel, effect, signal, useModel } from "@preact/signals";
+import type { ReadonlySignal, Signal } from "@preact/signals";
+import { For, useLiveSignal } from "@preact/signals/utils";
+import type { TargetedDragEvent, TargetedEvent } from "preact";
 import * as api from "../api";
-import type { CheckView, Face } from "../types";
+import type { Face } from "../types";
 import { BIRTH_FORMATS_HINT, formatBirthText, parseBirthText } from "../birthdate";
 import { drawFaces } from "../overlay";
 import { fmtSize, plural } from "../util";
-import { useToast } from "../toast";
+import { useToast, type ToastKind } from "../toast";
+import { useApp, type IAppModel } from "../appStore";
+import { useModals, type TypedModalService } from "../modalRegistry";
+import { usePasteFiles } from "../paste";
 import { MetaRows } from "./MetaRows";
 import { Modal } from "./Modal";
 
@@ -45,221 +68,248 @@ interface PendingPhoto {
 	note?: string;
 }
 
-// Imperative surface App uses for clipboard routing while the modal is open.
-export interface EnrollPasteTarget {
-	addPending: (files: FileList | File[]) => void;
-	pulseDrop: () => void;
-	scrollLastThumb: () => void;
-	isBusy: () => boolean;
-}
-
 interface EnrollModalProps {
+	/** injected by the modal service (instances render open) */
 	open: boolean;
-	/** the repository enrollment targets */
-	repoId: string;
-	peopleNames: string[];
+	/** injected by the modal service: true while no other instance sits above */
+	isTopmost: boolean;
+	/** injected by the modal service; closing unmounts the instance */
 	onCloseRequest: () => void;
-	/** refresh people + health after a successful enroll */
-	onChange: () => void;
-	/** open the enlarged face-check viewer for a pending photo */
-	onCheck: (view: CheckView) => void;
-	/** live-update the viewer when a check finishes for the photo it shows */
-	onCheckFaces: (src: string, faces: Face[]) => void;
-	/** compare two pending photos face-to-face (opens the compare modal) */
-	onComparePhotos: (a: File, b: File) => void;
-	registerPasteTarget: (t: EnrollPasteTarget | null) => void;
 }
 
-export function EnrollModal(props: EnrollModalProps) {
-	const toast = useToast();
-	// The repo enrollment targets, stable for imperative closures.
-	const repoRef = useRef(props.repoId);
-	repoRef.current = props.repoId;
+/** What the model needs from its owner; wired per mount in the component. */
+interface EnrollModelDeps {
+	app: IAppModel;
+	toast: { show(msg: string, kind?: ToastKind): void };
+	modals: TypedModalService;
+	/** the service-injected close request (live-updated per render) */
+	onCloseRequest: ReadonlySignal<() => void>;
+}
 
-	const [name, setName] = useState("");
-	const [pending, setPending] = useState<PendingPhoto[]>([]);
-	const [enrolling, setEnrolling] = useState(false);
-	const [dropHint, setDropHint] = useState(false); // .drag on the dropzone
-	const [pulse, setPulse] = useState(false); // brief highlight on paste
-	const [submitMeta, setSubmitMeta] = useState<string | null>(null);
+interface IEnrollModel {
+	// ---- form state ----
+	name: Signal<string>;
+	pending: Signal<PendingPhoto[]>;
+	/** the enrollment request is in flight (Modal.locked + disabled attrs) */
+	enrolling: Signal<boolean>;
+	/** the pending photo currently marked as comparison photo A */
+	cmpKey: Signal<string | null>;
+	// ---- person details section ----
+	aliases: Signal<string[]>;
+	urls: Signal<string[]>;
+	birthField: Signal<string>;
+	description: Signal<string>;
+	// ---- element refs (signal-backed; JSX attaches via ref callbacks) ----
+	nameInputRef: Signal<HTMLInputElement | null>;
+	birthInputRef: Signal<HTMLInputElement | null>;
+	dropInputRef: Signal<HTMLInputElement | null>;
+	thumbsRef: Signal<HTMLUListElement | null>;
+	detailsRef: Signal<HTMLDetailsElement | null>;
+	// ---- derived ----
+	nameHint: ReadonlySignal<string>;
+	nameHintClass: ReadonlySignal<string>;
+	meta: ReadonlySignal<string>;
+	noPending: ReadonlySignal<boolean>;
+	submitDisabled: ReadonlySignal<boolean>;
+	submitLabel: ReadonlySignal<string>;
+	enrollDropClass: ReadonlySignal<string>;
+	// ---- actions ----
+	onAliasesChange(v: string[]): void;
+	onUrlsChange(v: string[]): void;
+	onBirthInput(v: string): void;
+	onDescriptionInput(v: string): void;
+	onDragEnter(e: TargetedDragEvent<HTMLDivElement>): void;
+	onDragOver(e: TargetedDragEvent<HTMLDivElement>): void;
+	onDragLeave(e: TargetedDragEvent<HTMLDivElement>): void;
+	onDrop(e: TargetedDragEvent<HTMLDivElement>): void;
+	/** paste handler, registered by the component while it is topmost */
+	onPaste(files: File[]): void;
+	/** add files to the review list (no upload) */
+	addPending(fileList: FileList | File[]): void;
+	removePending(file: File): void;
+	pickCompare(p: PendingPhoto): void;
+	/** open the enlarged face-check viewer for one pending photo */
+	inspect(p: PendingPhoto): void;
+	openPicker(): void;
+	submit(e: TargetedEvent<HTMLFormElement>): Promise<void>;
+	requestClose(): void;
+}
+
+const EnrollViewModel = createModel<IEnrollModel, [EnrollModelDeps]>((deps: EnrollModelDeps): IEnrollModel => {
+	const { app, toast, modals } = deps;
+
+	// ---- form state ----
+	const name = signal("");
+	const pending = signal<PendingPhoto[]>([]);
+	const enrolling = signal(false);
+	// Pending photo currently marked as photo A of a comparison.
+	const cmpKey = signal<string | null>(null);
 
 	// Optional person details, saved right after the photos enroll (the meta
 	// endpoint needs the person to exist). Same edit model as the person
 	// details modal: row lists with a trailing empty slot, one dashed
 	// birthdate text field, markdown notes.
-	const [aliases, setAliases] = useState<string[]>([""]);
-	const [urls, setUrls] = useState<string[]>([""]);
-	const [birthField, setBirthField] = useState("");
-	const [description, setDescription] = useState("");
+	const aliases = signal<string[]>([""]);
+	const urls = signal<string[]>([""]);
+	const birthField = signal("");
+	const description = signal("");
 	// Touched = the user edited the details section (vs. a programmatic
 	// pre-fill): the save then carries the fields even when everything is
-	// empty, so clearing a pre-filled value really clears it.
-	const [metaTouched, setMetaTouched] = useState(false);
+	// empty, so clearing a pre-filled value really clears it. Not exposed —
+	// only the actions, the pre-fill guard and the dirty computed read it.
+	const metaTouched = signal(false);
 
-	const pendingRef = useRef<PendingPhoto[]>([]);
-	const enrollingRef = useRef(false);
-	// Pending photo currently marked as photo A of a comparison (ref mirrors
-	// the state for imperative closures, as with pending).
-	const cmpKeyRef = useRef<string | null>(null);
-	const [cmpKey, setCmpKey] = useState<string | null>(null);
-	const nameInputRef = useRef<HTMLInputElement | null>(null);
-	const birthInputRef = useRef<HTMLInputElement | null>(null);
-	const dropInputRef = useRef<HTMLInputElement | null>(null);
-	const thumbsRef = useRef<HTMLUListElement | null>(null);
-	const detailsRef = useRef<HTMLDetailsElement | null>(null);
-	const pulseTimer = useRef<number | undefined>(undefined);
-	const chainRef = useRef<Promise<void>>(Promise.resolve());
-	// Mirrors for the async details pre-fill: a fetched person's details may
-	// only land while the typed name still matches them and the user has not
-	// edited the fields meanwhile.
-	const nameRef = useRef("");
-	const metaTouchedRef = useRef(false);
-	const prefilledRef = useRef<string | null>(null);
+	// Render-invisible state (only computeds/actions read them).
+	const submitMeta = signal<string | null>(null);
+	const dropHint = signal(false); // .drag on the dropzone
+	const pulse = signal(false); // brief highlight on paste
 
-	// State + ref are updated together: async checks test membership via the
-	// ref (photos can be removed while their check is queued/in flight).
-	const setPendingBoth = (updater: (prev: PendingPhoto[]) => PendingPhoto[]) => {
-		setPending((prev) => {
-			const next = updater(prev);
-			pendingRef.current = next;
-			return next;
-		});
-	};
+	// Element refs, signal-backed (the view-model convention): JSX attaches
+	// them via ref callbacks; actions read .value at call time.
+	const nameInputRef = signal<HTMLInputElement | null>(null);
+	const birthInputRef = signal<HTMLInputElement | null>(null);
+	const dropInputRef = signal<HTMLInputElement | null>(null);
+	const thumbsRef = signal<HTMLUListElement | null>(null);
+	const detailsRef = signal<HTMLDetailsElement | null>(null);
 
-	const clearPending = () => {
-		for (const p of pendingRef.current) URL.revokeObjectURL(p.url);
-		pendingRef.current = [];
-		setPending([]);
-	};
-
-	const setCmpKeyBoth = (key: string | null) => {
-		cmpKeyRef.current = key;
-		setCmpKey(key);
-	};
-
-	const setBusy = (b: boolean) => {
-		enrollingRef.current = b;
-		setEnrolling(b);
-	};
-
-	const setMetaTouchedBoth = (b: boolean) => {
-		metaTouchedRef.current = b;
-		setMetaTouched(b);
-	};
+	// Non-reactive plumbing — plain closure locals, not state: the pre-fill
+	// watermark ("did we pre-fill for this name"), the serialized check
+	// chain and the pulse timer.
+	let prefilled: string | null = null;
+	let chain: Promise<void> = Promise.resolve();
+	let pulseTimer: number | undefined = undefined;
 
 	// Empty the details section back to a fresh state (one trailing empty
 	// row per list, closed disclosure).
 	const resetDetails = () => {
-		setAliases([""]);
-		setUrls([""]);
-		setBirthField("");
-		setDescription("");
-		setMetaTouchedBoth(false);
-		prefilledRef.current = null;
-		if (detailsRef.current) detailsRef.current.open = false;
+		batch(() => {
+			aliases.value = [""];
+			urls.value = [""];
+			birthField.value = "";
+			description.value = "";
+			metaTouched.value = false;
+		});
+		prefilled = null;
+		if (detailsRef.value) detailsRef.value.open = false;
 	};
 
-	// User edits mark the section touched; pre-fill never does.
-	const onAliasesChange = (v: string[]) => { setMetaTouchedBoth(true); setAliases(v); };
-	const onUrlsChange = (v: string[]) => { setMetaTouchedBoth(true); setUrls(v); };
-	const onBirthInput = (v: string) => { setMetaTouchedBoth(true); setBirthField(v); };
-	const onDescriptionInput = (v: string) => { setMetaTouchedBoth(true); setDescription(v); };
+	// User edits mark the section touched; pre-fill never does. (Returned
+	// actions are batched by createModel — no explicit batch() needed.)
+	const onAliasesChange = (v: string[]) => { metaTouched.value = true; aliases.value = v; };
+	const onUrlsChange = (v: string[]) => { metaTouched.value = true; urls.value = v; };
+	const onBirthInput = (v: string) => { metaTouched.value = true; birthField.value = v; };
+	const onDescriptionInput = (v: string) => { metaTouched.value = true; description.value = v; };
 
-	// Fresh session each time the modal opens; empty it when it closes.
-	useEffect(() => {
-		clearPending();
-		setSubmitMeta(null);
-		setCmpKeyBoth(null);
-		if (props.open) {
-			setName("");
-			resetDetails();
-		}
-	}, [props.open]);
+	// ---- derived state ----
+	const metaFilled = computed(() =>
+		aliases.value.some((a) => a.trim() !== "") || urls.value.some((u) => u.trim() !== "") ||
+		birthField.value.trim() !== "" || description.value.trim() !== "");
+	const dirty = computed(() =>
+		pending.value.length > 0 || name.value.trim() !== "" || metaTouched.value || metaFilled.value);
+	const known = computed(() => Boolean(name.value.trim()) &&
+		app.people.value.some((x) => x.name.toLowerCase() === name.value.trim().toLowerCase()));
+	const nameHint = computed(() => known.value
+		? `${name.value.trim()} is already enrolled — photos will be added to their profile; their details are pre-filled in the section below.`
+		: NAME_HINT);
+	const nameHintClass = computed(() => "field-hint" + (known.value ? " warn" : ""));
+	const n = computed(() => pending.value.length);
+	const bytes = computed(() => pending.value.reduce((s, p) => s + p.file.size, 0));
+	const meta = computed(() => submitMeta.value ?? (n.value
+		? `${plural(n.value)} ready · ${fmtSize(bytes.value)} · review, then enroll`
+		: "No photos selected yet."));
+	const noPending = computed(() => n.value === 0);
+	const submitDisabled = computed(() => !n.value || !name.value.trim());
+	const submitLabel = computed(() => enrolling.value
+		? "Enrolling…"
+		: n.value
+			? `Enroll ${n.value} photo${n.value === 1 ? "" : "s"}`
+			: "Enroll photos");
+	const canDrop = computed(() => !enrolling.value);
+	const enrollDropClass = computed(() =>
+		"enroll-drop" + (enrolling.value ? " disabled" : "") +
+		(dropHint.value ? " drag" : "") + (pulse.value ? " pulse" : ""));
+
+	// The instance unmounts on close: drop the preview URLs with it (the
+	// review list dies with the model, so everything else was per-open
+	// state already). A dependency-free effect runs once; its cleanup runs
+	// when the model is disposed.
+	effect(() => () => {
+		for (const p of pending.peek()) URL.revokeObjectURL(p.url);
+	});
 
 	// Pre-fill the details when the typed name matches an enrolled person:
 	// the meta save is a full-replace, so the form must show exactly what
 	// would be saved. Best-effort — a failed fetch leaves the fields as they
 	// are. When the name stops matching, drop a stale pre-fill unless the
-	// user has edited the fields since (their edits win).
-	useEffect(() => {
-		if (!props.open) return;
-		const trimmed = name.trim();
-		nameRef.current = trimmed;
-		const known = trimmed !== "" &&
-			props.peopleNames.some((x) => x.toLowerCase() === trimmed.toLowerCase());
-		if (!known) {
-			if (prefilledRef.current !== null && !metaTouchedRef.current) resetDetails();
+	// user has edited the fields since (their edits win). The effect tracks
+	// the typed name only: the enrolled-people list and the repo are read
+	// with peek(), so a background refresh does not re-run the pre-fill.
+	effect(() => {
+		const trimmed = name.value.trim();
+		const knownNow = trimmed !== "" &&
+			app.people.peek().some((x) => x.name.toLowerCase() === trimmed.toLowerCase());
+		if (!knownNow) {
+			// peek(): metaTouched must not become a tracked dependency — the
+			// effect re-runs on the typed name only.
+			if (prefilled !== null && !metaTouched.peek()) resetDetails();
 			return;
 		}
 		let stale = false;
-		api.getPerson(trimmed, repoRef.current).then((j) => {
-			if (stale || nameRef.current !== trimmed || metaTouchedRef.current) return;
-			prefilledRef.current = trimmed;
-			setAliases([...(j.aliases ?? []), ""]);
-			setUrls([...(j.urls ?? []), ""]);
-			setBirthField(formatBirthText(j.birthdate));
-			setDescription(j.description ?? "");
+		api.getPerson(trimmed, app.repoId.peek() ?? "").then((j) => {
+			if (stale || name.peek() !== trimmed || metaTouched.peek()) return;
+			prefilled = trimmed;
+			batch(() => {
+				aliases.value = [...(j.aliases ?? []), ""];
+				urls.value = [...(j.urls ?? []), ""];
+				birthField.value = formatBirthText(j.birthdate);
+				description.value = j.description ?? "";
+			});
 		}).catch(() => {
 			// The save is a full-replace: warn when the section may not show
 			// everything stored for this person, so nothing is wiped unseen.
-			if (stale || nameRef.current !== trimmed) return;
+			if (stale || name.peek() !== trimmed) return;
 			toast.show(`Could not load ${trimmed}'s current details — the section below may not show everything stored for them.`, "err");
 		});
 		return () => { stale = true; };
-	}, [name, props.open]);
+	});
 
-	const metaFilled = aliases.some((a) => a.trim() !== "") || urls.some((u) => u.trim() !== "") ||
-		birthField.trim() !== "" || description.trim() !== "";
-	const dirty = props.open && (pending.length > 0 || name.trim() !== "" || metaTouched || metaFilled);
-	useEffect(() => {
-		if (!dirty) return;
+	// Warn before an unload that would lose an in-progress review.
+	effect(() => {
+		if (!dirty.value) return;
 		const onUnload = (e: BeforeUnloadEvent) => {
 			e.preventDefault();
 			e.returnValue = ""; // legacy Chrome/Safari; modern engines ignore custom text
 		};
 		window.addEventListener("beforeunload", onUnload);
 		return () => window.removeEventListener("beforeunload", onUnload);
-	}, [dirty]);
-
-	// ---- paste/drop routing surface (registered with App) ----
-	useEffect(() => {
-		props.registerPasteTarget({
-			addPending,
-			pulseDrop: () => {
-				setPulse(true);
-				clearTimeout(pulseTimer.current);
-				pulseTimer.current = window.setTimeout(() => setPulse(false), 900);
-			},
-			scrollLastThumb: () => {
-				thumbsRef.current?.lastElementChild?.scrollIntoView({ block: "nearest" });
-			},
-			isBusy: () => enrollingRef.current,
-		});
-		return () => props.registerPasteTarget(null);
-	}, []);
+	});
 
 	// ---- pre-submit face check ----
 	// Each pending photo is sent to /api/recognize as soon as it joins the
 	// list (sequentially — inference is a single serialized stream) so the
 	// user sees the detected faces before deciding to enroll.
 	const updatePending = (target: PendingPhoto, patch: Partial<PendingPhoto>) => {
-		setPendingBoth((prev) => prev.map((p) => (p === target ? { ...p, ...patch } : p)));
+		pending.value = pending.value.map((p) => (p === target ? { ...p, ...patch } : p));
 	};
 
 	const checkPendingFace = async (p: PendingPhoto) => {
-		if (!pendingRef.current.includes(p)) return; // removed while queued
+		if (!pending.value.includes(p)) return; // removed while queued
 		try {
-			const j = await api.recognize(p.file, repoRef.current);
-			if (!pendingRef.current.includes(p)) return;
+			const j = await api.recognize(p.file, app.repoId.value ?? "");
+			if (!pending.value.includes(p)) return;
 			const faces = j.faces || [];
 			updatePending(p, { faces, status: "checked" });
-			// Live-update the enlarged viewer when it is showing this photo.
-			props.onCheckFaces(p.url, faces);
+			// Live-update the enlarged viewer when it is showing this photo
+			// (patch no-ops while no check instance is open).
+			modals.patch("check", { view: { src: p.url, title: p.file.name, faces } },
+				(cur) => cur?.view?.src === p.url);
 		} catch {
-			if (!pendingRef.current.includes(p)) return;
+			if (!pending.value.includes(p)) return;
 			updatePending(p, { status: "error" });
 		}
 	};
+
+	// ---- pending photos ----
 
 	// Add files to the review list (no upload). Dedupes by name+size+mtime.
 	function addPending(fileList: FileList | File[]) {
@@ -268,14 +318,14 @@ export function EnrollModal(props: EnrollModalProps) {
 		for (const file of Array.from(fileList)) {
 			if (!file.type.startsWith("image/")) { notImage++; continue; }
 			const key = `${file.name}\n${file.size}\n${file.lastModified}`;
-			if (pendingRef.current.some((p) => p.key === key)) { duplicate++; continue; }
+			if (pending.value.some((p) => p.key === key)) { duplicate++; continue; }
 			additions.push({ key, file, url: URL.createObjectURL(file), faces: null, status: "checking" });
 			added++;
 		}
 		if (additions.length) {
-			setPendingBoth((prev) => [...prev, ...additions]);
+			pending.value = [...pending.value, ...additions];
 			for (const p of additions) {
-				chainRef.current = chainRef.current
+				chain = chain
 					.then(() => checkPendingFace(p))
 					.catch(() => {});
 			}
@@ -285,66 +335,97 @@ export function EnrollModal(props: EnrollModalProps) {
 	}
 
 	function removePending(file: File) {
-		const i = pendingRef.current.findIndex((p) => p.file === file);
+		const list = pending.value;
+		const i = list.findIndex((p) => p.file === file);
 		if (i < 0) return;
-		URL.revokeObjectURL(pendingRef.current[i].url);
-		if (cmpKeyRef.current === pendingRef.current[i].key) setCmpKeyBoth(null);
-		setPendingBoth((prev) => prev.filter((p) => p.file !== file));
+		URL.revokeObjectURL(list[i].url);
+		if (cmpKey.value === list[i].key) cmpKey.value = null;
+		pending.value = list.filter((p) => p.file !== file);
 	}
 
 	// ---- compare two pending photos ----
 	// First pick marks the photo as photo A; picking the marked photo again
-	// cancels; picking a different photo hands both to the compare modal,
-	// which fills its slots and auto-runs the similarity check.
+	// cancels; picking a different photo opens the compare modal with both
+	// (seeded — it fills its slots and auto-runs the similarity check).
 	function pickCompare(p: PendingPhoto) {
-		if (enrollingRef.current) return;
-		if (!cmpKeyRef.current) {
-			setCmpKeyBoth(p.key);
+		if (enrolling.value) return;
+		if (!cmpKey.value) {
+			cmpKey.value = p.key;
 			toast.show(`${p.file.name} set as photo A — pick another photo to compare.`, "ok");
 			return;
 		}
-		if (cmpKeyRef.current === p.key) {
-			setCmpKeyBoth(null);
+		if (cmpKey.value === p.key) {
+			cmpKey.value = null;
 			return;
 		}
-		const a = pendingRef.current.find((x) => x.key === cmpKeyRef.current);
-		setCmpKeyBoth(null);
-		if (a) props.onComparePhotos(a.file, p.file);
+		const a = pending.value.find((x) => x.key === cmpKey.value);
+		cmpKey.value = null;
+		if (a) modals.open("compare", { seed: { a: a.file, b: p.file } });
 	}
 
-	const close = () => {
-		if (enrollingRef.current) return; // locked while the request is in flight
-		props.onCloseRequest();
+	// Enlarged face-check viewer for one pending photo (stacked on top).
+	const inspect = (p: PendingPhoto) =>
+		modals.open("check", { view: { src: p.url, title: p.file.name, faces: p.faces } });
+
+	// ---- dropzone (drag & drop + file picker) ----
+	const openPicker = () => {
+		if (!enrolling.value) dropInputRef.value?.click();
+	};
+	const onDragEnter = (e: TargetedDragEvent<HTMLDivElement>) => { e.preventDefault(); if (canDrop.value) dropHint.value = true; };
+	const onDragOver = (e: TargetedDragEvent<HTMLDivElement>) => { e.preventDefault(); if (canDrop.value) dropHint.value = true; };
+	const onDragLeave = (e: TargetedDragEvent<HTMLDivElement>) => {
+		if (!e.relatedTarget) dropHint.value = false;
+	};
+	const onDrop = (e: TargetedDragEvent<HTMLDivElement>) => {
+		e.preventDefault();
+		dropHint.value = false;
+		if (canDrop.value && e.dataTransfer?.files?.length) addPending(e.dataTransfer.files);
+	};
+
+	// ---- clipboard paste (the component registers this while topmost) ----
+	const onPaste = (files: File[]) => {
+		if (enrolling.value) return; // busy swallows the paste silently
+		addPending(files);
+		pulse.value = true;
+		clearTimeout(pulseTimer);
+		pulseTimer = window.setTimeout(() => { pulse.value = false; }, 900);
+		thumbsRef.value?.lastElementChild?.scrollIntoView({ block: "nearest" });
+		toast.show(`Added ${plural(files.length)} from clipboard.`, "ok");
+	};
+
+	const requestClose = () => {
+		if (enrolling.value) return; // locked while the request is in flight
+		deps.onCloseRequest.value();
 	};
 
 	const submit = async (e: TargetedEvent<HTMLFormElement>) => {
 		e.preventDefault();
-		if (enrollingRef.current) return;
-		const person = name.trim();
+		if (enrolling.value) return;
+		const person = name.value.trim();
 		if (!person) {
 			toast.show("Enter the person's name first.", "err");
-			nameInputRef.current?.focus();
+			nameInputRef.value?.focus();
 			return;
 		}
-		if (!pendingRef.current.length) {
+		if (!pending.value.length) {
 			toast.show("Add at least one photo.", "err");
 			return;
 		}
 
 		// Validate the details fully client-side so a bad field never sends
 		// the photos; the server re-checks everything when the meta save runs.
-		const birth = parseBirthText(birthField);
+		const birth = parseBirthText(birthField.value);
 		if (!birth.ok) {
 			toast.show(birth.error, "err");
-			birthInputRef.current?.focus();
+			birthInputRef.value?.focus();
 			return;
 		}
 		const parts = birth.parts;
 		const birthdate = parts.year == null && parts.month == null && parts.day == null
 			? null
 			: { year: parts.year ?? null, month: parts.month ?? null, day: parts.day ?? null };
-		const aliasList = aliases.map((a) => a.trim()).filter(Boolean);
-		const urlList = urls.map((u) => u.trim()).filter(Boolean);
+		const aliasList = aliases.value.map((a) => a.trim()).filter(Boolean);
+		const urlList = urls.value.map((u) => u.trim()).filter(Boolean);
 		if (aliasList.length > MAX_ALIASES) {
 			toast.show(`Too many aliases (max ${MAX_ALIASES}).`, "err");
 			return;
@@ -355,32 +436,34 @@ export function EnrollModal(props: EnrollModalProps) {
 		}
 		// A touched section sends even when everything is now empty (a
 		// deliberate clear must clear); otherwise only non-empty fields do.
-		const hasMeta = metaTouched || aliasList.length > 0 || urlList.length > 0 ||
-			birthdate !== null || description.trim() !== "";
+		const hasMeta = metaTouched.value || aliasList.length > 0 || urlList.length > 0 ||
+			birthdate !== null || description.value.trim() !== "";
 
-		setBusy(true);
-		setSubmitMeta(`Enrolling ${pendingRef.current.length} photo${pendingRef.current.length === 1 ? "" : "s"} for ${person}…`);
+		batch(() => {
+			enrolling.value = true;
+			submitMeta.value = `Enrolling ${pending.value.length} photo${pending.value.length === 1 ? "" : "s"} for ${person}…`;
+		});
 
 		try {
-			const j = await api.enrollPhotos(person, repoRef.current, pendingRef.current.map((p) => p.file));
+			const j = await api.enrollPhotos(person, app.repoId.value ?? "", pending.value.map((p) => p.file));
 
 			if (j.added > 0) toast.show(`Enrolled ${j.added} photo${j.added === 1 ? "" : "s"} for ${person}.`, "ok");
-			props.onChange();
+			app.refreshAll();
 
 			// The details save after the photos because the meta endpoint
 			// needs the person to exist; its failure must not lose the
 			// enrollment result.
 			if (hasMeta && j.added > 0) {
-				setSubmitMeta(`Saving details for ${person}…`);
+				submitMeta.value = `Saving details for ${person}…`;
 				try {
-					await api.setPersonMeta(person, repoRef.current, {
+					await api.setPersonMeta(person, app.repoId.value ?? "", {
 						aliases: aliasList,
 						birthdate,
 						urls: urlList,
-						description,
+						description: description.value,
 					});
 					toast.show("Details saved.", "ok");
-					props.onChange(); // the people list summary carries aliases
+					app.refreshAll(); // the people list summary carries aliases
 				} catch (err) {
 					const why = (err as Error).message || "could not save the details";
 					toast.show(`Photos enrolled, but the details could not be saved (${why}) — edit them later in the person's details.`, "err");
@@ -393,7 +476,7 @@ export function EnrollModal(props: EnrollModalProps) {
 				.map((f) => (f.includes(":") ? f.slice(0, f.indexOf(":")) : f).trim())
 				.filter(Boolean));
 			const kept: PendingPhoto[] = [];
-			for (const p of pendingRef.current) {
+			for (const p of pending.value) {
 				if (!failedNames.has(p.file.name)) {
 					URL.revokeObjectURL(p.url);
 					continue;
@@ -402,103 +485,110 @@ export function EnrollModal(props: EnrollModalProps) {
 				const reason = raw.slice(p.file.name.length + 1).trim() || "could not be enrolled";
 				kept.push({ ...p, failed: true, note: reason.includes("no face detected") ? "no face detected" : reason });
 			}
-			pendingRef.current = kept;
-			setPending(kept);
-			setBusy(false);
+
+			batch(() => {
+				pending.value = kept;
+				enrolling.value = false;
+			});
 			if (kept.length) {
-				setSubmitMeta(null);
+				submitMeta.value = null;
 				toast.show(`${kept.length} photo(s) had no detectable face — remove or replace them.`, "err");
 			} else {
-				close();
+				requestClose();
 			}
 		} catch (err) {
-			setBusy(false);
-			setSubmitMeta(null);
+			batch(() => {
+				enrolling.value = false;
+				submitMeta.value = null;
+			});
 			toast.show((err as Error).message || "Enroll failed.", "err");
 		}
 	};
 
-	// ---- render ----
-	const n = pending.length;
-	const bytes = pending.reduce((s, p) => s + p.file.size, 0);
-	const meta = submitMeta ?? (n
-		? `${plural(n)} ready · ${fmtSize(bytes)} · review, then enroll`
-		: "No photos selected yet.");
+	return {
+		name, pending, enrolling, cmpKey,
+		aliases, urls, birthField, description,
+		nameInputRef, birthInputRef, dropInputRef, thumbsRef, detailsRef,
+		nameHint, nameHintClass, meta, noPending, submitDisabled, submitLabel, enrollDropClass,
+		onAliasesChange, onUrlsChange, onBirthInput, onDescriptionInput,
+		onDragEnter, onDragOver, onDragLeave, onDrop,
+		onPaste, addPending, removePending, pickCompare, inspect, openPicker,
+		submit, requestClose,
+	};
+});
 
-	const known = Boolean(name.trim()) && props.peopleNames.some((x) => x.toLowerCase() === name.trim().toLowerCase());
-	const nameHint = known
-		? `${name.trim()} is already enrolled — photos will be added to their profile; their details are pre-filled in the section below.`
-		: NAME_HINT;
+export function EnrollModal(props: EnrollModalProps) {
+	const { open, isTopmost } = props;
+	const app = useApp();
+	const toast = useToast();
+	const modals = useModals();
+	const onCloseRequest = useLiveSignal(props.onCloseRequest);
+	const model = useModel(() => new EnrollViewModel({ app, toast, modals, onCloseRequest }));
 
-	const canDrop = !enrolling;
+	// While this modal is topmost, pasted images join the review list.
+	usePasteFiles(isTopmost, model.onPaste);
 
 	return (
 		<Modal
-			open={props.open}
+			open={open}
 			id="enrollModal"
 			cardId="enrollCard"
-			locked={enrolling}
+			locked={model.enrolling}
 			eyebrow="enrollment"
 			titleId="enrollTitle"
 			title="Enroll a new person"
-			initialFocus={() => nameInputRef.current}
+			initialFocus={() => model.nameInputRef.value}
 			backdropClickDisabled={true}
-			onCloseRequest={close}
+			onCloseRequest={model.requestClose}
 			rootProps={{
-				onDragEnter: (e) => { e.preventDefault(); if (canDrop) setDropHint(true); },
-				onDragOver: (e) => { e.preventDefault(); if (canDrop) setDropHint(true); },
-				onDragLeave: (e) => {
-					if (!(e as DragEvent).relatedTarget) setDropHint(false);
-				},
-				onDrop: (e) => {
-					e.preventDefault();
-					setDropHint(false);
-					if (canDrop && e.dataTransfer?.files?.length) addPending(e.dataTransfer.files);
-				},
+				onDragEnter: model.onDragEnter,
+				onDragOver: model.onDragOver,
+				onDragLeave: model.onDragLeave,
+				onDrop: model.onDrop,
 			}}
 			body={
-				<form id="enrollForm" class="modal-body" novalidate onSubmit={submit}>
+				<form id="enrollForm" class="modal-body" novalidate onSubmit={model.submit}>
 					<label class="field-label" for="enrollName">Name</label>
 					<input
-						ref={nameInputRef}
+						ref={(el) => { model.nameInputRef.value = el; }}
 						id="enrollName"
 						type="text"
 						placeholder="Person's name"
 						autocomplete="off"
 						spellcheck={false}
-						disabled={enrolling}
-						value={name}
-						onInput={(e) => setName(e.currentTarget.value)}
+						disabled={model.enrolling}
+						value={model.name}
+						onInput={(e) => { model.name.value = e.currentTarget.value; }}
 					/>
-					<p class={"field-hint" + (known ? " warn" : "")} id="enrollNameHint">{nameHint}</p>
+					<p class={model.nameHintClass} id="enrollNameHint">{model.nameHint}</p>
 
-					<details ref={detailsRef} id="enrollDetails" class="enroll-details">
+					<details ref={(el) => { model.detailsRef.value = el; }} id="enrollDetails" class="enroll-details">
 						<summary>Person details — aliases, birthdate, links, notes (optional)</summary>
 						<div class="enroll-details-body">
 							<div class="enroll-field">
 								<span class="field-label">Aliases</span>
-								<MetaRows entries={aliases} onChange={onAliasesChange} label="Alias" placeholder="Alias" maxLength={120} disabled={enrolling} />
+								<MetaRows entries={model.aliases} onChange={model.onAliasesChange} label="Alias" placeholder="Alias" maxLength={120} disabled={model.enrolling.value} />
 							</div>
 
 							<div class="enroll-field">
 								<label class="field-label" for="enrollBirth">Birthdate — leave empty if unknown</label>
 								<input
-									ref={birthInputRef}
+									ref={(el) => { model.birthInputRef.value = el; }}
 									id="enrollBirth"
 									type="text"
 									placeholder="1965-03-02"
 									autocomplete="off"
 									spellcheck={false}
-									disabled={enrolling}
-									value={birthField}
-									onInput={(e) => onBirthInput(e.currentTarget.value)}
+									disabled={model.enrolling}
+									value={model.birthField}
+									onInput={(e) => model.onBirthInput(e.currentTarget.value)}
 								/>
 								<p class="field-hint">{BIRTH_FORMATS_HINT}</p>
 							</div>
 
 							<div class="enroll-field">
 								<span class="field-label">Links</span>
-								<MetaRows entries={urls} onChange={onUrlsChange} label="URL" placeholder="https://…" maxLength={2048} disabled={enrolling} />
+								<MetaRows entries={model.urls} onChange={model.onUrlsChange} label="URL" placeholder="https://…" maxLength={2048} disabled={model.enrolling.value} />
 							</div>
 
 							<div class="enroll-field">
@@ -508,9 +598,9 @@ export function EnrollModal(props: EnrollModalProps) {
 									rows={4}
 									maxLength={20000}
 									placeholder="Free-form description…"
-									disabled={enrolling}
-									value={description}
-									onInput={(e) => onDescriptionInput(e.currentTarget.value)}
+									disabled={model.enrolling}
+									value={model.description}
+									onInput={(e) => model.onDescriptionInput(e.currentTarget.value)}
 								/>
 							</div>
 						</div>
@@ -518,15 +608,15 @@ export function EnrollModal(props: EnrollModalProps) {
 
 					<div
 						id="enrollDrop"
-						class={"enroll-drop" + (enrolling ? " disabled" : "") + (dropHint ? " drag" : "") + (pulse ? " pulse" : "")}
+						class={model.enrollDropClass}
 						tabindex={0}
 						role="button"
 						aria-label="Add photos — drag and drop, paste, or press Enter to browse"
-						onClick={() => { if (!enrolling) dropInputRef.current?.click(); }}
+						onClick={model.openPicker}
 						onKeyDown={(e) => {
-							if ((e.key === "Enter" || e.key === " ") && !enrolling) {
+							if ((e.key === "Enter" || e.key === " ") && !model.enrolling.value) {
 								e.preventDefault();
-								dropInputRef.current?.click();
+								model.openPicker();
 							}
 						}}
 					>
@@ -544,37 +634,38 @@ export function EnrollModal(props: EnrollModalProps) {
 						<p class="edz-primary">Drag &amp; drop, paste, or <span class="edz-browse">browse</span></p>
 						<p class="edz-hint">Nothing uploads until you review and confirm</p>
 						<input
-							ref={dropInputRef}
+							ref={(el) => { model.dropInputRef.value = el; }}
 							id="enrollPhotos"
 							type="file"
 							accept="image/*"
 							multiple
 							hidden
 							onChange={(e) => {
-								if (e.currentTarget.files?.length) addPending(e.currentTarget.files);
+								if (e.currentTarget.files?.length) model.addPending(e.currentTarget.files);
 								e.currentTarget.value = ""; // allow re-picking the same file later
 							}}
 						/>
 					</div>
 
-					<ul ref={thumbsRef} id="enrollThumbs" class="enroll-thumbs" hidden={n === 0}>
-						{pending.map((p) => (
-							<EnrollThumb
-								key={p.key}
-								p={p}
-								cmpMark={cmpKey === p.key}
-								onRemove={() => removePending(p.file)}
-								onInspect={() => props.onCheck({ src: p.url, title: p.file.name, faces: p.faces })}
-								onCompare={() => pickCompare(p)}
-							/>
-						))}
+					<ul ref={(el) => { model.thumbsRef.value = el; }} id="enrollThumbs" class="enroll-thumbs" hidden={model.noPending}>
+						<For each={model.pending} getKey={(p) => p.key}>
+							{(p) => (
+								<EnrollThumb
+									p={p}
+									cmpKey={model.cmpKey}
+									onRemove={() => model.removePending(p.file)}
+									onInspect={() => model.inspect(p)}
+									onCompare={() => model.pickCompare(p)}
+								/>
+							)}
+						</For>
 					</ul>
-					<p class="enroll-meta" id="enrollMeta">{meta}</p>
+					<p class="enroll-meta" id="enrollMeta">{model.meta}</p>
 
 					<footer class="modal-foot">
 						<button type="button" class="btn btn-ghost" data-close>Cancel</button>
-						<button type="submit" id="enrollSubmit" class="btn btn-accent" disabled={!n || !name.trim()}>
-							{enrolling ? "Enrolling…" : n ? `Enroll ${n} photo${n === 1 ? "" : "s"}` : "Enroll photos"}
+						<button type="submit" id="enrollSubmit" class="btn btn-accent" disabled={model.submitDisabled}>
+							{model.submitLabel}
 						</button>
 					</footer>
 				</form>
@@ -587,9 +678,12 @@ export function EnrollModal(props: EnrollModalProps) {
 // badge, compare button (marks the photo as photo A of a face-to-face
 // comparison) and remove button. Clicking the tile inspects the faces
 // full-size; clicks on the corner buttons never trigger the inspect action.
+// The tile subscribes to the compare-mark signal itself (a cmpKey change
+// re-renders only the affected tiles).
 function EnrollThumb(props: {
 	p: PendingPhoto;
-	cmpMark: boolean;
+	/** the pending photo currently marked as comparison photo A (read here) */
+	cmpKey: ReadonlySignal<string | null>;
 	onRemove: () => void;
 	onInspect: () => void;
 	onCompare: () => void;
@@ -597,6 +691,7 @@ function EnrollThumb(props: {
 	const { p } = props;
 	const imgRef = useRef<HTMLImageElement | null>(null);
 	const canvasRef = useRef<HTMLCanvasElement | null>(null);
+	const cmpMark = props.cmpKey.value === p.key;
 
 	// Face boxes are drawn over the thumbnail as soon as detection returns.
 	useEffect(() => {
@@ -623,7 +718,7 @@ function EnrollThumb(props: {
 
 	return (
 		<li
-			class={"enroll-thumb" + (p.failed ? " failed" : "") + (props.cmpMark ? " cmp-mark" : "")}
+			class={"enroll-thumb" + (p.failed ? " failed" : "") + (cmpMark ? " cmp-mark" : "")}
 			tabIndex={0}
 			title="Click to inspect faces"
 			onClick={(e) => {
@@ -644,8 +739,8 @@ function EnrollThumb(props: {
 				type="button"
 				class="enroll-thumb-cmp"
 				aria-label={`Compare ${p.file.name} with another photo`}
-				aria-pressed={props.cmpMark}
-				title={props.cmpMark
+				aria-pressed={cmpMark}
+				title={cmpMark
 					? "Photo A selected — click again to cancel, or pick another photo"
 					: "Compare with another pending photo"}
 				onClick={props.onCompare}
@@ -662,7 +757,7 @@ function EnrollThumb(props: {
 					/>
 				</svg>
 			</button>
-			{props.cmpMark && <span class="cmp-badge">A</span>}
+			{cmpMark && <span class="cmp-badge">A</span>}
 			<button
 				type="button"
 				class="enroll-thumb-del"

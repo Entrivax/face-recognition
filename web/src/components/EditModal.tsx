@@ -1,23 +1,32 @@
 // Stage photo editor.
 // Opt-in refinement pass before recognition: rotate (free angle −180…180°),
 // crop a region, and add a solid pad ("skirt") around the image, with
-// multi-step undo/redo. Opened from the stage's Edit button; "Use this
-// image" exports a JPEG and hands it back for a fresh recognition run.
+// multi-step undo/redo. Opened from the stage through the modal service;
+// "Use this image" exports a JPEG and hands it back for a fresh recognition
+// run.
 //
 // Sessions are iterative by design: the editor always works from the
 // ORIGINAL file — never a previous export — and its committed history
-// (ops + undo position + active tool) survives close/reopen, so clicking
-// Edit again restores the previous parameters. The session resets only when
-// a different file becomes the source (any fresh upload on the stage).
+// (ops + undo position + active tool) survives close/reopen. Closing
+// UNMOUNTS the instance (the modal service removes it), so the session is
+// handed to the opener at close time (onSaveSession — the stage keeps it in
+// a vault keyed by the source file) and restored at open (initialSession).
+// Uncommitted tool state and the decoded bitmap are dropped on unmount; the
+// bitmap is re-decoded on reopen and refolded identically. The session
+// resets only when a different file becomes the source (any fresh upload on
+// the stage).
 //
 // The image is shown WITHOUT EXIF auto-rotation (createImageBitmap's
 // imageOrientation: "none"), matching what the Go server sees: image.Decode
 // ignores the EXIF orientation flag, so a phone photo taken sideways must be
 // fixed here rather than trusted to the browser preview.
 
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useCallback, useEffect, useRef } from "preact/hooks";
+import { batch, useComputed, useSignal, useSignalEffect } from "@preact/signals";
+import { Show } from "@preact/signals/utils";
 import type { TargetedPointerEvent } from "preact";
 import { useToast } from "../toast";
+import { usePasteFiles } from "../paste";
 import { Modal } from "./Modal";
 
 // Working-resolution cap. Recognition letterboxes to 640² and embeds at
@@ -50,12 +59,29 @@ interface Rect {
 	h: number;
 }
 
+/** The editor's per-file committed session — what survives close/reopen
+ *  (kept by the opener between the two, see onSaveSession/initialSession). */
+export interface EditSession {
+	hist: Hist;
+	tool: Tool;
+	padColor: PadColor;
+}
+
 interface EditModalProps {
-	/** the original file to edit (null = closed); identity change resets the session */
-	source: File | null;
+	/** injected by the modal service (instances render open) */
+	open: boolean;
+	/** injected by the modal service: true while no other instance sits above */
+	isTopmost: boolean;
+	/** injected by the modal service; closing unmounts the instance */
 	onCloseRequest: () => void;
+	/** the original file to edit */
+	source: File;
 	/** "Use this image": hand the exported file back to the stage */
 	onUse: (file: File) => void;
+	/** committed session of the SAME file to restore (null = fresh session) */
+	initialSession?: EditSession | null;
+	/** called at close time (unmount) with the committed session to keep */
+	onSaveSession?: (source: File, session: EditSession) => void;
 }
 
 const TOOL_HINTS: Record<Tool, string> = {
@@ -66,35 +92,39 @@ const TOOL_HINTS: Record<Tool, string> = {
 
 export function EditModal(props: EditModalProps) {
 	const toast = useToast();
-	const { source, onCloseRequest, onUse } = props;
-	const open = source !== null;
+	const { open, isTopmost, source, onUse, onCloseRequest, initialSession, onSaveSession } = props;
 
-	// ---- persistent session (survives close/reopen; reset per file) ----
-	const [hist, setHist] = useState<Hist>({ ops: [], idx: 0 });
-	const [tool, setTool] = useState<Tool>("rotate");
-	const [padColor, setPadColor] = useState<PadColor>("black");
+	// ---- per-file session (restored from the opener's vault when it holds
+	// one for this file; fresh otherwise). Committed history, active tool and
+	// pad color survive close/reopen through that vault; uncommitted tool
+	// state and the decoded bitmap die with the instance, as before.
+	const hist = useSignal<Hist>(initialSession?.hist ?? { ops: [], idx: 0 });
+	const tool = useSignal<Tool>(initialSession?.tool ?? "rotate");
+	const padColor = useSignal<PadColor>(initialSession?.padColor ?? "black");
 
-	// ---- transient state (dropped on close) ----
-	const [pendingRot, setPendingRot] = useState(0); // slider angle, live preview
-	const [pendingPadPct, setPendingPadPct] = useState(0); // pad slider, live preview
-	const [crop, setCrop] = useState<Rect | null>(null);
-	const [busy, setBusy] = useState(false);
-	const [src, setSrc] = useState<HTMLCanvasElement | null>(null); // decoded original
+	// ---- transient state (dropped at unmount) ----
+	const pendingRot = useSignal(0); // slider angle, live preview
+	const pendingPadPct = useSignal(0); // pad slider, live preview
+	const crop = useSignal<Rect | null>(null);
+	const busy = useSignal(false);
+	const src = useSignal<HTMLCanvasElement | null>(null); // decoded original
+	const view = useSignal<HTMLCanvasElement | null>(null);
+	const overlay = useSignal<HTMLCanvasElement | null>(null);
 
-	// Refs mirroring state for stable reads inside effects/async callbacks.
-	const srcRef = useRef<HTMLCanvasElement | null>(null);
-	srcRef.current = src;
-	const histRef = useRef(hist);
-	histRef.current = hist;
+	// Props mirrors for stable reads in the unmount cleanup and the async
+	// decode flow (props are not signals).
 	const closeRef = useRef(onCloseRequest);
 	closeRef.current = onCloseRequest;
+	const sourceRef = useRef(source);
+	sourceRef.current = source;
+	const saveRef = useRef(onSaveSession);
+	saveRef.current = onSaveSession;
 
 	const decodedForRef = useRef<File | null>(null);
-	const lastSourceRef = useRef<File | null>(null);
-	const viewRef = useRef<HTMLCanvasElement | null>(null);
-	const overlayRef = useRef<HTMLCanvasElement | null>(null);
 	const dragRef = useRef<{ x: number; y: number } | null>(null);
 	const scratchRef = useRef<[HTMLCanvasElement, HTMLCanvasElement] | null>(null);
+	const setView = useCallback((canvas: HTMLCanvasElement | null) => { view.value = canvas; }, []);
+	const setOverlay = useCallback((canvas: HTMLCanvasElement | null) => { overlay.value = canvas; }, []);
 
 	const getScratch = (): [HTMLCanvasElement, HTMLCanvasElement] => {
 		if (!scratchRef.current) {
@@ -106,42 +136,52 @@ export function EditModal(props: EditModalProps) {
 		return scratchRef.current;
 	};
 
-	// A different file resets the whole session (parameters are per-file);
-	// closing keeps everything so the next Edit restores it.
+	// The session is per file: a source swap on a still-mounted instance (an
+	// args replacement by the service) resets it and adopts the session the
+	// opener passed for the new file. The service normally opens a fresh
+	// instance per file — where this re-applies the values the init above
+	// already used (skipped when the source is unchanged).
+	const lastSourceRef = useRef<File | null>(null);
 	useEffect(() => {
-		if (!source || source === lastSourceRef.current) return;
+		if (source === lastSourceRef.current) return;
 		lastSourceRef.current = source;
-		setHist({ ops: [], idx: 0 });
-		setTool("rotate");
-		setPadColor("black");
-		setPendingRot(0);
-		setPendingPadPct(0);
-		setCrop(null);
+		batch(() => {
+			hist.value = initialSession?.hist ?? { ops: [], idx: 0 };
+			tool.value = initialSession?.tool ?? "rotate";
+			padColor.value = initialSession?.padColor ?? "black";
+			pendingRot.value = 0;
+			pendingPadPct.value = 0;
+			crop.value = null;
+			src.value = null;
+		})
 		decodedForRef.current = null;
-		setSrc(null);
 	}, [source]);
 
-	// Closing drops uncommitted tool state and the decoded bitmap (history
-	// is kept); the bitmap is re-decoded on reopen and refolded identically.
-	useEffect(() => {
-		if (open) return;
-		setPendingRot(0);
-		setPendingPadPct(0);
-		setCrop(null);
-		decodedForRef.current = null;
-		setSrc(null);
-	}, [open]);
+	// Close-time session save: the service unmounts the instance on close,
+	// so the unmount cleanup hands the committed session to the opener's
+	// vault. Uncommitted tool state (pending sliders, an in-progress crop)
+	// is deliberately not saved — it dies with the instance. (Signals stay
+	// readable after unmount, so the cleanup reads them directly.)
+	useEffect(() => () => {
+		saveRef.current?.(sourceRef.current, { hist: hist.value, tool: tool.value, padColor: padColor.value });
+	}, []);
+
+	// ---- clipboard routing (via the injected isTopmost flag) ----
+	// While the editor is open it sits over the stage: a pasted image must
+	// not swap the stage photo (and reset the edit session) under it.
+	usePasteFiles(isTopmost, () => {
+		toast.show("Close the editor to inspect a new photo.");
+	});
 
 	// Decode the source (once per open session) into the working canvas.
 	useEffect(() => {
-		if (!open || !source) return;
-		if (decodedForRef.current === source && srcRef.current) return;
+		if (decodedForRef.current === source && src.peek()) return;
 		let cancelled = false;
 		decodeToCanvas(source)
 			.then((canvas) => {
 				if (cancelled) return;
 				decodedForRef.current = source;
-				setSrc(canvas);
+				src.value = canvas;
 			})
 			.catch(() => {
 				if (cancelled) return;
@@ -151,72 +191,88 @@ export function EditModal(props: EditModalProps) {
 		return () => {
 			cancelled = true;
 		};
-	}, [open, source, toast]);
+	}, [source, toast]);
 
 	// Ops currently shown: everything applied plus a live-preview tail for
 	// the tool being dragged (slider angle / pad size).
-	const previewOps = (): EditOp[] | null => {
-		const s = srcRef.current;
+	const previewOps = useComputed<EditOp[] | null>(() => {
+		const s = src.value;
 		if (!s) return null;
-		const ops = histRef.current.ops.slice(0, histRef.current.idx);
-		if (pendingRot !== 0) ops.push({ kind: "rotate", deg: pendingRot, color: padColor });
-		if (pendingPadPct > 0) {
+		const ops = hist.value.ops.slice(0, hist.value.idx);
+		if (pendingRot.value !== 0) ops.push({ kind: "rotate", deg: pendingRot.value, color: padColor.value });
+		if (pendingPadPct.value > 0) {
 			const [w, h] = foldedSize(s.width, s.height, ops);
-			const px = Math.round((pendingPadPct / 100) * Math.max(w, h));
-			if (px > 0) ops.push({ kind: "skirt", px, color: padColor });
+			const px = Math.round((pendingPadPct.value / 100) * Math.max(w, h));
+			if (px > 0) ops.push({ kind: "skirt", px, color: padColor.value });
 		}
 		return ops;
-	};
+	});
 
 	// Refold the display canvas whenever anything visual changes.
-	useEffect(() => {
-		if (!open || !src) return;
-		const view = viewRef.current;
-		if (!view) return;
-		const out = foldOps(src, previewOps() ?? [], getScratch());
-		if (out === src) {
-			view.width = src.width;
-			view.height = src.height;
+	useSignalEffect(() => {
+		const s = src.value;
+		const ops = previewOps.value;
+		const canvas = view.value;
+		if (!s || !canvas) return;
+		const out = foldOps(s, ops ?? [], getScratch());
+		if (out === s) {
+			canvas.width = s.width;
+			canvas.height = s.height;
 		} else {
-			view.width = out.width;
-			view.height = out.height;
+			canvas.width = out.width;
+			canvas.height = out.height;
 		}
-		const ctx = view.getContext("2d");
+		const ctx = canvas.getContext("2d");
 		if (ctx) ctx.drawImage(out, 0, 0);
-	}, [open, src, hist, pendingRot, pendingPadPct, padColor]);
+	});
 
 	// Crop overlay: matched to the display size, redrawn on crop changes.
-	useEffect(() => {
-		const view = viewRef.current;
-		const ov = overlayRef.current;
-		if (!view || !ov) return;
-		if (ov.width !== view.width || ov.height !== view.height) {
-			ov.width = view.width;
-			ov.height = view.height;
+	// (The signal reads come first so the effect subscribes to every refold
+	// input even while the canvases are not mounted yet.)
+	useSignalEffect(() => {
+		previewOps.value;
+		const c = crop.value;
+		const canvas = view.value;
+		const ov = overlay.value;
+		if (!canvas || !ov) return;
+		if (ov.width !== canvas.width || ov.height !== canvas.height) {
+			ov.width = canvas.width;
+			ov.height = canvas.height;
 		}
-		drawCrop(ov, crop);
-	}, [crop, open, src, hist, pendingRot, pendingPadPct, padColor]);
+		drawCrop(ov, c);
+	});
 
 	// ---- history ----
 	const commit = (op: EditOp) => {
-		setHist((h) => ({ ops: [...h.ops.slice(0, h.idx), op], idx: h.idx + 1 }));
+		const h = hist.value;
+		hist.value = { ops: [...h.ops.slice(0, h.idx), op], idx: h.idx + 1 };
 	};
-	const undo = () => {
-		setCrop(null);
-		setHist((h) => (h.idx > 0 ? { ...h, idx: h.idx - 1 } : h));
-	};
-	const redo = () => {
-		setCrop(null);
-		setHist((h) => (h.idx < h.ops.length ? { ...h, idx: h.idx + 1 } : h));
-	};
+	// Stable for the keyboard binding below (undo/redo read the signals at
+	// call time, so no re-binding per render is needed).
+	const undo = useCallback(() => {
+		batch(() => {
+			crop.value = null;
+			const h = hist.value;
+			if (h.idx > 0) hist.value = { ...h, idx: h.idx - 1 };
+		})
+	}, []);
+	const redo = useCallback(() => {
+		batch(() => {
+			crop.value = null;
+			const h = hist.value;
+			if (h.idx < h.ops.length) hist.value = { ...h, idx: h.idx + 1 };
+		})
+	}, []);
 	const resetAll = () => {
-		setCrop(null);
-		setHist({ ops: [], idx: 0 });
+		batch(() => {
+			crop.value = null;
+			hist.value = { ops: [], idx: 0 };
+		})
 	};
 
 	// Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z, Ctrl+Y (not while a field has focus).
+	// Bound once: undo/redo are stable and touch only signals.
 	useEffect(() => {
-		if (!open) return;
 		const onKey = (e: KeyboardEvent) => {
 			const t = e.target as HTMLElement | null;
 			if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
@@ -232,49 +288,58 @@ export function EditModal(props: EditModalProps) {
 		};
 		document.addEventListener("keydown", onKey);
 		return () => document.removeEventListener("keydown", onKey);
-	});
+	}, [undo, redo]);
 
 	// ---- tool commits ----
 	const commitRotate = () => {
-		if (pendingRot !== 0) commit({ kind: "rotate", deg: pendingRot, color: padColor });
-		setPendingRot(0);
+		batch(() => {
+			if (pendingRot.value !== 0) commit({ kind: "rotate", deg: pendingRot.value, color: padColor.value });
+			pendingRot.value = 0;
+		})
 	};
 	const commitQuick = (deg: number) => {
-		setPendingRot(0);
-		commit({ kind: "rotate", deg, color: padColor });
+		batch(() => {
+			pendingRot.value = 0;
+			commit({ kind: "rotate", deg, color: padColor.value });
+		})
 	};
 	const commitPad = () => {
-		const s = srcRef.current;
-		if (s && pendingPadPct > 0) {
-			const [w, h] = foldedSize(s.width, s.height, histRef.current.ops.slice(0, histRef.current.idx));
-			const px = Math.round((pendingPadPct / 100) * Math.max(w, h));
-			if (px > 0) commit({ kind: "skirt", px, color: padColor });
-		}
-		setPendingPadPct(0);
+		const s = src.value;
+		batch(() => {
+			if (s && pendingPadPct.value > 0) {
+				const [w, h] = foldedSize(s.width, s.height, hist.value.ops.slice(0, hist.value.idx));
+				const px = Math.round((pendingPadPct.value / 100) * Math.max(w, h));
+				if (px > 0) commit({ kind: "skirt", px, color: padColor.value });
+			}
+			pendingPadPct.value = 0;
+		})
 	};
 	const applyCrop = () => {
-		const view = viewRef.current;
-		if (!view || !crop || crop.w < MIN_CROP || crop.h < MIN_CROP) return;
-		const x = clamp(crop.x, 0, view.width - MIN_CROP);
-		const y = clamp(crop.y, 0, view.height - MIN_CROP);
-		const w = clamp(crop.w, MIN_CROP, view.width - x);
-		const h = clamp(crop.h, MIN_CROP, view.height - y);
-		commit({ kind: "crop", x, y, w, h });
-		setCrop(null);
+		const canvas = view.peek();
+		const c = crop.value;
+		if (!canvas || !c || c.w < MIN_CROP || c.h < MIN_CROP) return;
+		const x = clamp(c.x, 0, canvas.width - MIN_CROP);
+		const y = clamp(c.y, 0, canvas.height - MIN_CROP);
+		const w = clamp(c.w, MIN_CROP, canvas.width - x);
+		const h = clamp(c.h, MIN_CROP, canvas.height - y);
+		batch(() => {
+			commit({ kind: "crop", x, y, w, h });
+			crop.value = null;
+		})
 	};
 
 	// ---- crop dragging (overlay canvas; pointer coords → image pixels) ----
 	const onCropDown = (e: TargetedPointerEvent<HTMLCanvasElement>) => {
-		if (tool !== "crop" || busy || !src) return;
+		if (tool.value !== "crop" || busy.value || !src.value) return;
 		e.preventDefault();
 		dragRef.current = toImgCoords(e);
-		setCrop({ x: dragRef.current.x, y: dragRef.current.y, w: 0, h: 0 });
+		crop.value = { x: dragRef.current.x, y: dragRef.current.y, w: 0, h: 0 };
 		e.currentTarget.setPointerCapture(e.pointerId);
 	};
 	const onCropMove = (e: TargetedPointerEvent<HTMLCanvasElement>) => {
 		if (!dragRef.current) return;
 		e.preventDefault();
-		setCrop(normRect(dragRef.current, toImgCoords(e)));
+		crop.value = normRect(dragRef.current, toImgCoords(e));
 	};
 	const onCropUp = (e: TargetedPointerEvent<HTMLCanvasElement>) => {
 		if (!dragRef.current) return;
@@ -283,26 +348,28 @@ export function EditModal(props: EditModalProps) {
 			e.currentTarget.releasePointerCapture(e.pointerId);
 		}
 		dragRef.current = null;
-		setCrop((c) => (c && c.w >= MIN_CROP && c.h >= MIN_CROP ? c : null));
+		const c = crop.value;
+		crop.value = c && c.w >= MIN_CROP && c.h >= MIN_CROP ? c : null;
 	};
 
 	// ---- export ----
 	const handleUse = () => {
-		const s = srcRef.current;
+		const s = src.value;
 		if (!source || !s) {
 			closeRef.current();
 			return;
 		}
-		if (hist.idx === 0) {
+		const h = hist.value;
+		if (h.idx === 0) {
 			closeRef.current(); // nothing effective applied — no pointless re-request
 			return;
 		}
-		setBusy(true);
+		busy.value = true;
 		try {
-			const out = foldOps(s, hist.ops.slice(0, hist.idx), getScratch());
+			const out = foldOps(s, h.ops.slice(0, h.idx), getScratch());
 			out.toBlob(
 				(blob) => {
-					setBusy(false);
+					busy.value = false;
 					if (!blob) {
 						toast.show("Could not export the edited image.", "err");
 						return;
@@ -313,12 +380,18 @@ export function EditModal(props: EditModalProps) {
 				0.92,
 			);
 		} catch {
-			setBusy(false);
+			busy.value = false;
 			toast.show("Could not export the edited image.", "err");
 		}
 	};
 
-	const dims = src ? foldedSize(src.width, src.height, previewOps() ?? []) : null;
+	const dims = useComputed(() => src.value ? foldedSize(src.value.width, src.value.height, previewOps.value ?? []) : null);
+
+	// Footer states that depend on busy + history, as signal attributes.
+	const undoDisabled = useComputed(() => busy.value || hist.value.idx === 0);
+	const redoDisabled = useComputed(() => busy.value || hist.value.idx >= hist.value.ops.length);
+	const resetDisabled = useComputed(() => busy.value || (hist.value.idx === 0 && hist.value.ops.length === 0));
+	const editingDisabled = useComputed(() => busy.value || !src.value);
 
 	return (
 		<Modal
@@ -334,103 +407,112 @@ export function EditModal(props: EditModalProps) {
 			body={
 				<div class="modal-body">
 					<div class="edit-tools">
-						<button type="button" class="edit-tool" aria-pressed={tool === "rotate"}
-							onClick={() => { setCrop(null); setTool("rotate"); }}>Rotate</button>
-						<button type="button" class="edit-tool" aria-pressed={tool === "crop"}
-							onClick={() => { setCrop(null); setTool("crop"); }}>Crop</button>
-						<button type="button" class="edit-tool" aria-pressed={tool === "pad"}
-							onClick={() => { setCrop(null); setTool("pad"); }}>Pad</button>
-						<span class="edit-dims">{dims ? `${dims[0]} × ${dims[1]} px` : ""}</span>
+						<button type="button" class="edit-tool" aria-pressed={tool.value === "rotate"}
+							onClick={() => { batch(() => { crop.value = null; tool.value = "rotate"; }) }}>Rotate</button>
+						<button type="button" class="edit-tool" aria-pressed={tool.value === "crop"}
+							onClick={() => { batch(() => { crop.value = null; tool.value = "crop"; }) }}>Crop</button>
+						<button type="button" class="edit-tool" aria-pressed={tool.value === "pad"}
+							onClick={() => { batch(() => { crop.value = null; tool.value = "pad"; }) }}>Pad</button>
+						<span class="edit-dims">{dims.value ? `${dims.value[0]} × ${dims.value[1]} px` : ""}</span>
 					</div>
 
 					<div class="edit-stage">
-						{!src ? (
-							<p class="edit-loading">Loading image…</p>
-						) : (
-							<div class="edit-canvas-wrap" data-cropping={tool === "crop" ? "true" : undefined}>
-								<canvas ref={viewRef} class="edit-canvas" aria-label="Photo being edited" />
-								<canvas
-									ref={overlayRef}
-									class="edit-overlay"
-									aria-hidden="true"
-									onPointerDown={onCropDown}
-									onPointerMove={onCropMove}
-									onPointerUp={onCropUp}
-									onPointerCancel={onCropUp}
-								/>
-							</div>
-						)}
+						<Show when={src} fallback={<p class="edit-loading">Loading image…</p>}>
+							{() => (
+								<div class="edit-canvas-wrap" data-cropping={tool.value === "crop" ? "true" : undefined}>
+									<canvas ref={setView} class="edit-canvas" aria-label="Photo being edited" />
+									<canvas
+										ref={setOverlay}
+										class="edit-overlay"
+										aria-hidden="true"
+										onPointerDown={onCropDown}
+										onPointerMove={onCropMove}
+										onPointerUp={onCropUp}
+										onPointerCancel={onCropUp}
+									/>
+								</div>
+							)}
+						</Show>
 					</div>
 
-					{tool === "rotate" && (
-						<div class="edit-slider-row">
-							<span class="edit-slider-label">Angle</span>
-							<input
-								type="range"
-								min={-180}
-								max={180}
-								step={1}
-								value={pendingRot}
-								disabled={busy || !src}
-								aria-label="Rotation angle"
-								onInput={(e) => setPendingRot(Number(e.currentTarget.value))}
-								onChange={commitRotate}
-							/>
-							<span class="edit-slider-value">{pendingRot}°</span>
-							<button type="button" class="btn btn-sm" disabled={busy || !src} onClick={() => commitQuick(-90)}>−90°</button>
-							<button type="button" class="btn btn-sm" disabled={busy || !src} onClick={() => commitQuick(90)}>+90°</button>
-						</div>
-					)}
-
-					{tool === "crop" && (
-						<div class="edit-crop-row">
-							<span>{crop ? `${crop.w} × ${crop.h} px` : "No area selected yet"}</span>
-							<button type="button" class="btn btn-ghost btn-sm" hidden={!crop} disabled={busy} onClick={() => setCrop(null)}>Clear</button>
-							<button
-								type="button"
-								class="btn btn-accent btn-sm"
-								disabled={!crop || crop.w < MIN_CROP || crop.h < MIN_CROP || busy}
-								onClick={applyCrop}
-							>
-								Apply crop
-							</button>
-						</div>
-					)}
-
-					{tool === "pad" && (
-						<div class="edit-slider-row">
-							<span class="edit-slider-label">Pad</span>
-							<input
-								type="range"
-								min={0}
-								max={25}
-								step={1}
-								value={pendingPadPct}
-								disabled={busy || !src}
-								aria-label="Padding around the image"
-								onInput={(e) => setPendingPadPct(Number(e.currentTarget.value))}
-								onChange={commitPad}
-							/>
-							<span class="edit-slider-value">{pendingPadPct}%</span>
-							<div class="edit-swatches" role="group" aria-label="Pad color">
-								<button type="button" class="edit-swatch black" aria-pressed={padColor === "black"}
-									aria-label="Black pad" disabled={busy} onClick={() => setPadColor("black")} />
-								<button type="button" class="edit-swatch white" aria-pressed={padColor === "white"}
-									aria-label="White pad" disabled={busy} onClick={() => setPadColor("white")} />
+					<Show when={() => tool.value === "rotate"}>
+						{() => (
+							<div class="edit-slider-row">
+								<span class="edit-slider-label">Angle</span>
+								<input
+									type="range"
+									min={-180}
+									max={180}
+									step={1}
+									value={pendingRot}
+									disabled={editingDisabled}
+									aria-label="Rotation angle"
+									onInput={(e) => { pendingRot.value = Number(e.currentTarget.value); }}
+									onChange={commitRotate}
+								/>
+								<span class="edit-slider-value">{pendingRot}°</span>
+								<button type="button" class="btn btn-sm" disabled={editingDisabled} onClick={() => commitQuick(-90)}>−90°</button>
+								<button type="button" class="btn btn-sm" disabled={editingDisabled} onClick={() => commitQuick(90)}>+90°</button>
 							</div>
-						</div>
-					)}
+						)}
+					</Show>
 
-					<p class="edit-hint">{TOOL_HINTS[tool]}</p>
+					<Show when={() => tool.value === "crop"}>
+						{() => {
+							const c = crop.value;
+							return (
+								<div class="edit-crop-row">
+									<span>{c ? `${c.w} × ${c.h} px` : "No area selected yet"}</span>
+									<button type="button" class="btn btn-ghost btn-sm" hidden={!c} disabled={busy} onClick={() => { crop.value = null; }}>Clear</button>
+									<button
+										type="button"
+										class="btn btn-accent btn-sm"
+										disabled={!c || c.w < MIN_CROP || c.h < MIN_CROP || busy.value}
+										onClick={applyCrop}
+									>
+										Apply crop
+									</button>
+								</div>
+							);
+						}}
+					</Show>
+
+					<Show when={() => tool.value === "pad"}>
+						{() => (
+							<div class="edit-slider-row">
+								<span class="edit-slider-label">Pad</span>
+								<input
+									type="range"
+									min={0}
+									max={25}
+									step={1}
+									value={pendingPadPct}
+									disabled={editingDisabled}
+									aria-label="Padding around the image"
+									onInput={(e) => { pendingPadPct.value = Number(e.currentTarget.value); }}
+									onChange={commitPad}
+								/>
+								<span class="edit-slider-value">{pendingPadPct.value}%</span>
+								<div class="edit-swatches" role="group" aria-label="Pad color">
+									<button type="button" class="edit-swatch black" aria-pressed={padColor.value === "black"}
+										aria-label="Black pad" disabled={editingDisabled} onClick={() => { padColor.value = "black"; }} />
+									<button type="button" class="edit-swatch white" aria-pressed={padColor.value === "white"}
+										aria-label="White pad" disabled={editingDisabled} onClick={() => { padColor.value = "white"; }} />
+								</div>
+							</div>
+						)}
+					</Show>
+
+					<p class="edit-hint">{TOOL_HINTS[tool.value]}</p>
 
 					<footer class="edit-foot">
 						<div class="edit-history">
-							<button type="button" class="btn btn-ghost btn-sm" disabled={busy || hist.idx === 0} onClick={undo}>Undo</button>
-							<button type="button" class="btn btn-ghost btn-sm" disabled={busy || hist.idx >= hist.ops.length} onClick={redo}>Redo</button>
+							<button type="button" class="btn btn-ghost btn-sm" disabled={undoDisabled} onClick={undo}>Undo</button>
+							<button type="button" class="btn btn-ghost btn-sm" disabled={redoDisabled} onClick={redo}>Redo</button>
 							<button
 								type="button"
 								class="btn btn-ghost btn-sm"
-								disabled={busy || (hist.idx === 0 && hist.ops.length === 0)}
+								disabled={resetDisabled}
 								onClick={resetAll}
 							>
 								Reset
@@ -438,8 +520,8 @@ export function EditModal(props: EditModalProps) {
 						</div>
 						<div class="edit-actions">
 							<button type="button" class="btn btn-ghost" data-close disabled={busy}>Cancel</button>
-							<button type="button" class="btn btn-accent" disabled={busy || hist.idx === 0} onClick={handleUse}>
-								{busy ? "Preparing…" : "Use this image"}
+							<button type="button" class="btn btn-accent" disabled={undoDisabled} onClick={handleUse}>
+								Use this image
 							</button>
 						</div>
 					</footer>

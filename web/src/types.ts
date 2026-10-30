@@ -313,7 +313,8 @@ export interface RescanResponse {
 }
 
 // A photo opened in the enlarged face-check viewer. Faces may arrive after
-// the viewer opens (the enroll modal's check chain reports them later).
+// the viewer opens (the enroll modal's check chain patches them into the
+// modal instance's args via the modal service).
 export interface CheckView {
 	src: string;
 	title: string;

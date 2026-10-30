@@ -2,7 +2,8 @@
 // Enlarged preview used by the enroll modal: shows a pending photo with its
 // detected faces drawn over it before anything is uploaded. Read-only; it
 // stacks on top of the other modals. Faces may arrive after the viewer opens
-// (the enroll modal's check chain reports them via App).
+// (the enroll modal's check chain patches them into the instance's args via
+// the modal service).
 
 import { useEffect, useRef } from "preact/hooks";
 import type { CheckView, Face } from "../types";
@@ -10,18 +11,22 @@ import { drawWhenReady } from "../overlay";
 import { Modal } from "./Modal";
 
 interface FaceCheckModalProps {
-	view: CheckView | null;
+	/** injected by the modal service (instances render open) */
+	open: boolean;
+	/** injected by the modal service; closing unmounts the instance */
 	onCloseRequest: () => void;
+	/** the photo under review (non-null while the instance is mounted) */
+	view: CheckView;
 }
 
-export function FaceCheckModal({ view, onCloseRequest }: FaceCheckModalProps) {
+export function FaceCheckModal({ open, onCloseRequest, view }: FaceCheckModalProps) {
 	const imgRef = useRef<HTMLImageElement | null>(null);
 	const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
 	// Draw the boxes whenever the viewed photo's faces change (they may
 	// arrive after the image).
 	useEffect(() => {
-		if (!view || !view.faces || !imgRef.current || !canvasRef.current) return;
+		if (!view.faces || !imgRef.current || !canvasRef.current) return;
 		drawWhenReady(canvasRef.current, imgRef.current, view.faces, { labels: true });
 	}, [view]);
 
@@ -41,21 +46,21 @@ export function FaceCheckModal({ view, onCloseRequest }: FaceCheckModalProps) {
 		return { text: `${lead} · ${parts.join(", ")}`, warn: false };
 	}
 
-	const v = verdictText(view?.faces ?? null);
+	const v = verdictText(view.faces);
 
 	return (
 		<Modal
-			open={view !== null}
+			open={open}
 			id="checkModal"
 			cardId="checkCard"
 			eyebrow="face check"
 			titleId="checkTitle"
-			title={view?.title || "Face check"}
+			title={view.title || "Face check"}
 			onCloseRequest={onCloseRequest}
 			body={
 				<div class="modal-body">
 					<div class="canvas-wrap photo-canvas">
-						<img ref={imgRef} id="checkImg" alt="Photo under review" src={view?.src || undefined} />
+						<img ref={imgRef} id="checkImg" alt="Photo under review" src={view.src} />
 						<canvas ref={canvasRef} id="checkOverlay" />
 					</div>
 					<p class={"photo-verdict" + (v.warn ? " warn" : "")} id="checkVerdict" aria-live="polite">{v.text}</p>
