@@ -36,13 +36,13 @@ export function MainApp(props: MainAppProps) {
 	// signals), so both are captured once at creation.
 	const app = useModel(() => new AppModel({ mode: "app", user: props.user, onSessionEnd: props.onSessionEnd, toast }));
 
-	// Boot loads, then reload the people list whenever the repository
-	// changes (loadPeople is an action — untracked reads — so the tracked
+	// Boot loads, then reload the repo document whenever the repository
+	// changes (loadRepo is an action — untracked reads — so the tracked
 	// repoId read here drives the effect).
 	useEffect(() => { app.init(); }, [app]);
 	useSignalEffect(() => {
 		void app.repoId.value;
-		void app.loadPeople();
+		void app.loadRepo();
 	});
 
 	return (

@@ -54,7 +54,7 @@
  *   • Share link (read-only; an admin mints <server>/share/<repoID>/<token>):
  *     header "X-Share-Token: <repoID>/<token>" and NO Authorization header.
  *     Captures go to the share's own repo even when another repo ID is set.
- *     Probed with GET /api/people?repo=<repoID>.
+ *     Probed with GET /api/repo?repo=<repoID>.
  * "recogn: check access…" runs the probe on demand (200 = valid, 401 =
  * credential rejected, 403 = no access to that repo, network errors are
  * reported too); the first capture of a session runs it once in the
@@ -579,15 +579,15 @@
 
 	// One credential probe. API keys list their repos (GET /api/repos — the
 	// configured repo ID must appear there) and share links read the repo's
-	// people (GET /api/people?repo=…). 401 = rejected credential, 403 = no
-	// access to that repo, 200 = valid.
+	// info document (GET /api/repo?repo=…). 401 = rejected credential, 403 =
+	// no access to that repo, 200 = valid.
 	async function runAccessProbe() {
 		const cred = resolveCredential();
 		if (!cred) return { ok: false, message: credentialHint() };
 		const base = String(server).replace(/\/+$/, "");
 		const url = cred.mode === "apikey"
 			? base + "/api/repos"
-			: base + "/api/people?repo=" + encodeURIComponent(cred.repoId);
+			: base + "/api/repo?repo=" + encodeURIComponent(cred.repoId);
 		try {
 			const { status, text } = await probeRequest(url, cred.headers);
 			if (status === 401) return { ok: false, message: "recogn rejected the credential (HTTP 401) — check the userscript menu settings" };

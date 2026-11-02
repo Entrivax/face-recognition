@@ -161,10 +161,14 @@ export interface PersonSummary {
 	aliases?: string[];
 }
 
-export interface PeopleResponse {
+/** GET /api/repo?repo= — one repository's info + its people list. */
+export interface RepoResponse {
+	id: string;
+	name: string;
+	/** the recognizer's match threshold (global) */
+	threshold: number;
 	people: PersonSummary[];
 	count: number;
-	repo: string;
 }
 
 export interface PersonPhoto {

@@ -116,7 +116,7 @@ func TestAccessMatrixPinsRoles(t *testing.T) {
 		{
 			name: "people list",
 			call: func(t *testing.T, m *matrixEnv, c *http.Cookie, h map[string]string) *httptest.ResponseRecorder {
-				return do(t, m.e.s, http.MethodGet, "/api/people?repo="+m.e.repoID, nil, "", c, h)
+				return do(t, m.e.s, http.MethodGet, "/api/repo?repo="+m.e.repoID, nil, "", c, h)
 			},
 			anonWant: 401, shareWant: 200, otherShare: 401, readerWant: 200, writerWant: 200, outsiderWant: 403, adminWant: 200,
 		},
@@ -196,7 +196,7 @@ func TestAccessMatrixPinsRoles(t *testing.T) {
 func TestAccessErrorsAreUniform(t *testing.T) {
 	m := newMatrixEnv(t)
 
-	rec := do(t, m.e.s, http.MethodGet, "/api/people?repo="+m.e.repoID, nil, "", nil, nil)
+	rec := do(t, m.e.s, http.MethodGet, "/api/repo?repo="+m.e.repoID, nil, "", nil, nil)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("anon people list: got %d", rec.Code)
 	}
@@ -207,7 +207,7 @@ func TestAccessErrorsAreUniform(t *testing.T) {
 	}
 
 	// Outsider (authenticated, no grant) → 403 with the read wording.
-	rec = do(t, m.e.s, http.MethodGet, "/api/people?repo="+m.e.repoID, nil, "", m.outsider, nil)
+	rec = do(t, m.e.s, http.MethodGet, "/api/repo?repo="+m.e.repoID, nil, "", m.outsider, nil)
 	_ = json.NewDecoder(rec.Body).Decode(&body)
 	if rec.Code != http.StatusForbidden || body["error"] != "read access to this repository is required" {
 		t.Fatalf("outsider people list: got %d (%s)", rec.Code, body["error"])
@@ -281,7 +281,7 @@ func TestShareTokenSemantics(t *testing.T) {
 
 	// An authenticated user does NOT fall back to a share header: no grant
 	// on the repo → 403 even with a valid token in the header.
-	rec = do(t, e.s, http.MethodGet, "/api/people?repo="+e.repoID, nil, "", m.outsider, shareHdr(e.repoID, e.shareToken))
+	rec = do(t, e.s, http.MethodGet, "/api/repo?repo="+e.repoID, nil, "", m.outsider, shareHdr(e.repoID, e.shareToken))
 	if rec.Code != http.StatusForbidden {
 		t.Errorf("outsider with valid share header: got %d (%s), want 403", rec.Code, rec.Body.String())
 	}
@@ -301,20 +301,20 @@ func TestRepoParamAcceptsNameAndID(t *testing.T) {
 	e := m.e
 
 	// By name: the reader is still granted.
-	if rec := do(t, e.s, http.MethodGet, "/api/people?repo=Team", nil, "", e.reader, nil); rec.Code != http.StatusOK {
+	if rec := do(t, e.s, http.MethodGet, "/api/repo?repo=Team", nil, "", e.reader, nil); rec.Code != http.StatusOK {
 		t.Errorf("repo by name: got %d (%s)", rec.Code, rec.Body.String())
 	}
 	// By ID (case-insensitive): granted.
-	if rec := do(t, e.s, http.MethodGet, "/api/people?repo="+strings.ToUpper(e.repoID), nil, "", e.reader, nil); rec.Code != http.StatusOK {
+	if rec := do(t, e.s, http.MethodGet, "/api/repo?repo="+strings.ToUpper(e.repoID), nil, "", e.reader, nil); rec.Code != http.StatusOK {
 		t.Errorf("repo by uppercased ID: got %d", rec.Code)
 	}
 	// Unknown value: no access.
-	if rec := do(t, e.s, http.MethodGet, "/api/people?repo=nosuchrepo", nil, "", e.reader, nil); rec.Code != http.StatusForbidden {
+	if rec := do(t, e.s, http.MethodGet, "/api/repo?repo=nosuchrepo", nil, "", e.reader, nil); rec.Code != http.StatusForbidden {
 		t.Errorf("unknown repo: got %d (%s), want 403", rec.Code, rec.Body.String())
 	}
 
 	// Share header repo IDs are matched case-insensitively too.
-	rec := do(t, e.s, http.MethodGet, "/api/people?repo="+strings.ToUpper(e.repoID), nil, "", nil, shareHdr(strings.ToUpper(e.repoID), e.shareToken))
+	rec := do(t, e.s, http.MethodGet, "/api/repo?repo="+strings.ToUpper(e.repoID), nil, "", nil, shareHdr(strings.ToUpper(e.repoID), e.shareToken))
 	if rec.Code != http.StatusOK {
 		t.Errorf("share with uppercased repo: got %d (%s), want 200", rec.Code, rec.Body.String())
 	}
@@ -326,14 +326,14 @@ func TestDisabledShareRefused(t *testing.T) {
 	m := newMatrixEnv(t)
 	e := m.e
 
-	rec := do(t, e.s, http.MethodGet, "/api/people?repo="+e.repoID, nil, "", nil, shareHdr(e.repoID, e.shareToken))
+	rec := do(t, e.s, http.MethodGet, "/api/repo?repo="+e.repoID, nil, "", nil, shareHdr(e.repoID, e.shareToken))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("share access before disable: got %d", rec.Code)
 	}
 	if rec := sendJSON(t, e.s, e.admin, "/api/repos/"+e.repoID+"/share", map[string]bool{"enabled": false}); rec.Code != http.StatusOK {
 		t.Fatalf("disable share: got %d (%s)", rec.Code, rec.Body.String())
 	}
-	rec = do(t, e.s, http.MethodGet, "/api/people?repo="+e.repoID, nil, "", nil, shareHdr(e.repoID, e.shareToken))
+	rec = do(t, e.s, http.MethodGet, "/api/repo?repo="+e.repoID, nil, "", nil, shareHdr(e.repoID, e.shareToken))
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("share access after disable: got %d, want 401", rec.Code)
 	}

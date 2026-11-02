@@ -9,17 +9,26 @@ import type {
 	GrantBody,
 	OkResponse,
 	RenameRepoResponse,
+	RepoResponse,
 	ReposResponse,
 	ShareRepoResponse,
 	UsersResponse,
 } from "../types";
-import { expectJSON, request } from "./core";
+import { expectJSON, request, withRepoQuery } from "./core";
 
 // ---- repositories ----
 
 export async function listRepos(): Promise<ReposResponse> {
 	const r = await request("/api/repos");
 	return expectJSON(r, "could not load repositories");
+}
+
+// Reader+ (share tokens included): one repository's info in one document —
+// id, display name, the match threshold and its people list. The app store
+// and the share view both boot off this call.
+export async function getRepo(repoId: string): Promise<RepoResponse> {
+	const r = await request(withRepoQuery("/api/repo", repoId));
+	return expectJSON(r, "could not load the repository");
 }
 
 export async function createRepo(name: string): Promise<CreateRepoResponse> {

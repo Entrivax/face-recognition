@@ -273,7 +273,7 @@ func TestThumbChooser(t *testing.T) {
 			Thumb string `json:"thumb"`
 		} `json:"people"`
 	}
-	getJSON(t, e.s, e.writer, "/api/people?repo="+e.repoID, &people)
+	getJSON(t, e.s, e.writer, "/api/repo?repo="+e.repoID, &people)
 	for _, pp := range people.People {
 		if pp.ID == p.ID && pp.Thumb != wantURL {
 			t.Errorf("people list thumb = %q, want %q", pp.Thumb, wantURL)

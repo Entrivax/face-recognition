@@ -301,7 +301,7 @@ to one repository via `X-Share-Token: <repoID>/<token>`.
 | `GET`  | `/api/config` | any user | read the match threshold (global) |
 | `POST` | `/api/config` | admin | set the match threshold; POSTed values are persisted in the DB and survive restarts (an explicit `--threshold` flag still wins) |
 | `POST` | `/api/compare` | any user | compare the faces of two photos without the identity DB — multipart `image1` + `image2` → `{similarity, threshold, image1: {count, faces: [{index, bbox, score, used}]}, image2: {…}}`; the largest face of each photo is embedded and their cosine similarity returned (`used` marks the compared face; `threshold` is the recognizer's match threshold, for the same-person verdict) |
-| `GET`  | `/api/people?repo=` | reader+ | list a repository's enrolled people + photo counts (incl. `thumb` URL when a face thumbnail exists, and `aliases` when the person has metadata) |
+| `GET`  | `/api/repo?repo=` | reader+ | one repository's info in one document: `{id, name, threshold, people: [{id, name, photos, embeddings, thumb, aliases?}], count}` — the repo's display name and the match threshold ride the same call as the person list (share links read this at boot; `thumb` URLs appear when a face thumbnail exists, `aliases` when the person has metadata) |
 | `GET`  | `/api/people/{name}` | reader+ | one person's **details document**: `{id, name, photos:<count>, aliases?, birthdate?, urls?, description?}` — optional metadata only, no enrolled photo paths; never-filled fields are omitted |
 | `GET`  | `/api/people/{name}/photos` | reader+ | one person's enrolled photos (`thumb_src` = photo the avatar comes from) — the photos manager's payload |
 | `POST` | `/api/people/{name}/meta` | writer+ | replace a person's metadata — JSON `{"aliases": [...], "birthdate": {"year","month","day"}, "urls": [...], "description": "<markdown>"}`; every field optional, omitted/empty fields clear the stored value (full-replace). Validation: aliases deduped (max 20 × 120 chars), URLs must be absolute `http(s)` (max 50 × 2048), birthdate parts are range-checked with a day requiring a month or year (max year 2100; a complete date must exist on the calendar), description max 20 000 chars |
@@ -396,11 +396,11 @@ Scripts log in once and reuse the session — or send a personal API key:
 curl -s -c cookies.txt -X POST http://localhost:8080/api/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"change-me"}'
-curl -s -b cookies.txt "http://localhost:8080/api/people?repo=My%20people"
+curl -s -b cookies.txt "http://localhost:8080/api/repo?repo=My%20people"
 
 # Or present a personal API key (acts as its user) as a Bearer credential
 curl -s -H "Authorization: Bearer rk_..." \
-  "http://localhost:8080/api/people?repo=My people"
+  "http://localhost:8080/api/repo?repo=My people"
 ```
 
 **Security notes**: over plain HTTP the password crosses the wire in

@@ -455,11 +455,11 @@ func TestUserGrants(t *testing.T) {
 			t.Fatalf("walter grants after replace: %+v", u.Grants)
 		}
 	}
-	if rec := do(t, e.s, http.MethodGet, "/api/people?repo="+e.repoID, nil, "", e.writer, nil); rec.Code != http.StatusForbidden {
+	if rec := do(t, e.s, http.MethodGet, "/api/repo?repo="+e.repoID, nil, "", e.writer, nil); rec.Code != http.StatusForbidden {
 		t.Errorf("old grant should be gone: got %d, want 403", rec.Code)
 	}
 	// ...and the new one applies.
-	if rec := do(t, e.s, http.MethodGet, "/api/people?repo="+other, nil, "", e.writer, nil); rec.Code != http.StatusOK {
+	if rec := do(t, e.s, http.MethodGet, "/api/repo?repo="+other, nil, "", e.writer, nil); rec.Code != http.StatusOK {
 		t.Errorf("new grant should apply: got %d (%s)", rec.Code, rec.Body.String())
 	}
 
@@ -469,7 +469,7 @@ func TestUserGrants(t *testing.T) {
 	}); rec.Code != http.StatusOK {
 		t.Fatalf("grants by name: got %d (%s)", rec.Code, rec.Body.String())
 	}
-	if rec := do(t, e.s, http.MethodGet, "/api/people?repo="+e.repoID, nil, "", e.writer, nil); rec.Code != http.StatusOK {
+	if rec := do(t, e.s, http.MethodGet, "/api/repo?repo="+e.repoID, nil, "", e.writer, nil); rec.Code != http.StatusOK {
 		t.Errorf("grant by name should apply: got %d (%s)", rec.Code, rec.Body.String())
 	}
 

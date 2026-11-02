@@ -146,7 +146,10 @@ func (s *Server) routes() {
 	scoped := s.scoped
 	m.Handle("/api/recognize", scoped(http.HandlerFunc(s.handleRecognize)))
 	m.Handle("/api/enroll", scoped(http.HandlerFunc(s.handleEnrollFolder)))
-	m.Handle("/api/people", scoped(http.HandlerFunc(s.handlePeople)))
+	m.Handle("/api/repo", scoped(http.HandlerFunc(s.handleRepo)))
+	// Tombstone for the exact pre-refactor list path (a loud 404 instead of
+	// the SPA catch-all); /api/people/{name}… still dispatches below.
+	m.Handle("/api/people", scoped(http.HandlerFunc(s.handlePeopleGone)))
 	// GET /api/people/{name} is the reader-visible details view; every
 	// other path/method under /api/people/ is dispatched by
 	// handlePersonSubroutes with per-subroute roles (writer for

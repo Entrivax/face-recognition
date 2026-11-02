@@ -1,4 +1,4 @@
-// People, person details, metadata, photos, and thumbnail API wrappers.
+// Person details, metadata, photos, and thumbnail API wrappers.
 // Every data route is repo-scoped: callers pass the selected repository's
 // id and the wrapper appends ?repo=<id>.
 
@@ -7,19 +7,12 @@ import type {
 	DeletePhotoResponse,
 	DetectResponse,
 	MetaUpdate,
-	PeopleResponse,
 	PersonDetail,
 	PersonPhotosResponse,
 	RenameResponse,
 	ThumbResponse,
 } from "../types";
 import { expectJSON, fireUnauthorized, request, UnauthorizedError, withRepoQuery } from "./core";
-
-// Reader+ (readers included): the repo's people list.
-export async function getPeople(repoId: string): Promise<PeopleResponse> {
-	const r = await request(withRepoQuery("/api/people", repoId));
-	return expectJSON(r, "could not load people");
-}
 
 // Reader+: person details (name, optional metadata — aliases, partial
 // birthdate, URLs, markdown description — plus the photo count and the

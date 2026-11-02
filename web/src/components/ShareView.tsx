@@ -12,15 +12,15 @@
 //
 // The share tree is provided with the same app-store / modal-service
 // context pair as MainApp: a read-only store (fixed repository, no-op
-// mutating actions, its own people list) and the shared modal registry —
-// the details modal opens through the service like everywhere else.
-// Boot phase and the learned repository name are signals; Stage,
+// mutating actions, its own repo document) and the shared modal registry —
+// the details modal opens through the service like everywhere else. Boot
+// phase is a signal; the repository's human name and the threshold arrive
+// with the boot repo document (app.repoName / app.threshold). Stage,
 // PeoplePanel and StatusPill read the store themselves (no props).
 
-import { useCallback, useEffect } from "preact/hooks";
+import { useEffect } from "preact/hooks";
 import { useComputed, useModel, useSignal, type ReadonlySignal } from "@preact/signals";
 import { setOnShareInvalid, setShareContext } from "../api/core";
-import type { PersonDetail } from "../types";
 import { AppModel, AppProvider } from "../appStore";
 import { ModalProvider } from "../modalService";
 import { MODAL_DEFS } from "../modalRegistry";
@@ -60,10 +60,9 @@ interface ShareViewProps {
 type SharePhase = "loading" | "ready" | "invalid";
 
 export function ShareView({ repoId, token }: ShareViewProps) {
-	// Boot phase (which card renders) + the repository's human name, learned
-	// from the first person-details document (the store hooks it below).
+	// Boot phase (which card renders); the repository's human name rides the
+	// store's repoName signal (set by the boot loadRepo).
 	const phase = useSignal<SharePhase>("loading");
-	const repoName = useSignal<string | null>(null);
 
 	// Attach the share context to every API call and clear it again on
 	// unmount (a visitor who then somehow re-enters the app must not keep
@@ -78,29 +77,25 @@ export function ShareView({ repoId, token }: ShareViewProps) {
 	}, [repoId, token]);
 
 	// The read-only store handed to the share tree: fixed repository, no
-	// mutating actions, threshold unknown (the row hides for share visitors).
-	// A person detail carries repo_name — the one place a share visitor can
-	// learn the repository's human name (the repos list needs a session).
-	const onDetailLoaded = useCallback((d: PersonDetail) => {
-		if (d.repo_name) repoName.value = d.repo_name;
-	}, []);
-	const app = useModel(() => new AppModel({ mode: "share", fixedRepoId: repoId, onPersonDetail: onDetailLoaded }));
+	// mutating actions. GET /api/repo carries the repository's human name
+	// and the threshold at boot (the repos list needs a session).
+	const app = useModel(() => new AppModel({ mode: "share", fixedRepoId: repoId }));
 
-	// Boot: verify the token by loading the repo's people list (the model
+	// Boot: verify the token by loading the repo's info document (the model
 	// also polls health every 30 s). A rejected load is a ShareInvalidError —
 	// the hook above has already flipped the phase; anything else resolves
 	// with peopleErr set.
 	useEffect(() => {
 		void app.init();
-		app.loadPeople().then(
+		app.loadRepo().then(
 			() => { phase.value = "ready"; },
 			() => {}, // invalid token — the hook already flipped the phase
 		);
 	}, [app]);
 
-	// Banner display name: the learned human name, else the short repo id.
-	// A computed so a late detail load swaps it into the rendered banner.
-	const bannerName = useComputed(() => repoName.value ?? shortRepoId(repoId));
+	// Banner display name: the server-reported human name, else the short
+	// repo id. A computed so the load's result swaps it into the banner.
+	const bannerName = useComputed(() => app.repoName.value ?? shortRepoId(repoId));
 
 	// The phase chain reads phase.value in render (a tracked read), so a
 	// flip re-renders exactly one branch: the loading/invalid cards stand
@@ -160,7 +155,7 @@ function ShareTree({ repoId, repoName }: {
 					<span class="brand-word">recogn</span>
 				</div>
 				<div class="share-banner">
-					<span class="share-banner-label">read-only shared repository</span>
+					<span class="share-banner-label">Repository</span>
 					<span class="share-banner-name" title={repoId}>{repoName}</span>
 				</div>
 				<StatusPill />

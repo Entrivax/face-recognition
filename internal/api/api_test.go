@@ -481,7 +481,7 @@ func TestShareReveal(t *testing.T) {
 	}
 
 	// The revealed token still works: the same link can be handed out again.
-	rec = do(t, e.s, http.MethodGet, "/api/people?repo="+e.repoID, nil, "", nil, shareHdr(e.repoID, e.shareToken))
+	rec = do(t, e.s, http.MethodGet, "/api/repo?repo="+e.repoID, nil, "", nil, shareHdr(e.repoID, e.shareToken))
 	if rec.Code != http.StatusOK {
 		t.Errorf("share token after reveal: got %d (%s)", rec.Code, rec.Body.String())
 	}
@@ -511,6 +511,68 @@ func TestShareReveal(t *testing.T) {
 	decodeBody(t, rec, &got)
 	if got.Shared || got.ShareURL != nil {
 		t.Errorf("reveal after disable: got %+v, want shared false / share_url null", got)
+	}
+}
+
+// TestRepoEndpoint pins GET /api/repo?repo= — the one-document repo info:
+// id, display name, threshold and the people list, for readers and share
+// tokens alike; the exact old GET /api/people path answers a loud 404.
+func TestRepoEndpoint(t *testing.T) {
+	e := newEnv(t, &stubEngine{threshold: 0.45}, "Team", true, true)
+	img := []byte("fake-image")
+	if err := e.db.AddPhotoHashedForRepo(e.repoID, "Alice", "a.png", db.HashBytes(img), []float32{1}); err != nil {
+		t.Fatal(err)
+	}
+
+	var got struct {
+		ID        string  `json:"id"`
+		Name      string  `json:"name"`
+		Threshold float64 `json:"threshold"`
+		Count     int     `json:"count"`
+		People    []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"people"`
+	}
+	if rec := getJSON(t, e.s, e.reader, "/api/repo?repo="+e.repoID, &got); rec.Code != http.StatusOK {
+		t.Fatalf("repo info: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if got.ID != e.repoID || got.Name != "Team" || got.Threshold != 0.45 || got.Count != 1 ||
+		len(got.People) != 1 || got.People[0].Name != "Alice" {
+		t.Errorf("unexpected repo document: %+v", got)
+	}
+
+	// A share token gets the same document (the share banner reads the name
+	// and the threshold straight from this boot call).
+	rec := do(t, e.s, http.MethodGet, "/api/repo?repo="+e.repoID, nil, "", nil, shareHdr(e.repoID, e.shareToken))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("share repo info: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "Team" || got.Threshold != 0.45 {
+		t.Errorf("share repo document: %+v", got)
+	}
+
+	// Admin + bogus repo → 404 (grants and shares never hit this).
+	if rec := getJSON(t, e.s, e.admin, "/api/repo?repo=nosuchrepo", nil); rec.Code != http.StatusNotFound {
+		t.Errorf("bogus repo: got %d (%s), want 404", rec.Code, rec.Body.String())
+	}
+	// POST → 405.
+	if rec := sendJSON(t, e.s, e.writer, "/api/repo?repo="+e.repoID, map[string]string{}); rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST repo: got %d, want 405", rec.Code)
+	}
+	// The old exact path is tombstoned: a JSON 404 with the move hint, never
+	// the SPA catch-all's HTML.
+	rec = do(t, e.s, http.MethodGet, "/api/people?repo="+e.repoID, nil, "", e.reader, nil)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("old people path: got %d, want 404", rec.Code)
+	}
+	var body map[string]string
+	_ = json.NewDecoder(rec.Body).Decode(&body)
+	if !strings.Contains(body["error"], "moved to GET /api/repo") {
+		t.Errorf("old people path body must carry the move hint: %q", body["error"])
 	}
 }
 
@@ -625,7 +687,7 @@ func TestRepoDeleteReportsCounts(t *testing.T) {
 		}
 	}
 	// The share token no longer grants anything.
-	rec2 := do(t, e.s, http.MethodGet, "/api/people?repo="+e.repoID, nil, "", nil, shareHdr(e.repoID, e.shareToken))
+	rec2 := do(t, e.s, http.MethodGet, "/api/repo?repo="+e.repoID, nil, "", nil, shareHdr(e.repoID, e.shareToken))
 	if rec2.Code != http.StatusUnauthorized {
 		t.Errorf("share token of deleted repo: got %d, want 401", rec2.Code)
 	}

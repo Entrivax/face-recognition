@@ -153,7 +153,7 @@ func TestSetMetaRoundTrip(t *testing.T) {
 			Aliases []string `json:"aliases"`
 		} `json:"people"`
 	}
-	if rec := getJSON(t, e.s, e.writer, "/api/people?repo="+e.repoID, &list); rec.Code != http.StatusOK {
+	if rec := getJSON(t, e.s, e.writer, "/api/repo?repo="+e.repoID, &list); rec.Code != http.StatusOK {
 		t.Fatalf("people list: got %d", rec.Code)
 	}
 	if len(list.People) != 1 || len(list.People[0].Aliases) != 2 {

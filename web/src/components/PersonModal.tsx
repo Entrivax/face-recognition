@@ -102,9 +102,6 @@ export function PersonModal(props: PersonModalProps) {
 			const j = await api.getPerson(name, app.repoId.value ?? "");
 			if (personRef.current !== name) return;
 			detail.value = j;
-			// Share mode learns the repository's human name from the details
-			// document (the app store hooks it; MainApp leaves it as a no-op).
-			app.onPersonDetail(j);
 		} catch (e) {
 			if (personRef.current === name) {
 				loadHint.value = (e as Error).message || "Could not load the details.";

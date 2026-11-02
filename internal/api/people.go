@@ -8,11 +8,13 @@ import (
 	"recogn/internal/enroll"
 )
 
-// handlePeople answers GET /api/people?repo=<id|name>: the person list of
-// one repository, for callers holding at least the reader role on it
-// (share tokens included). The summary shape is unchanged; the repo ID
-// echoes back so clients can pin which dataset the rows belong to.
-func (s *Server) handlePeople(w http.ResponseWriter, r *http.Request) {
+// handleRepo answers GET /api/repo?repo=<id|name>: one repository's info —
+// id, display name, the match threshold and its people — in one document,
+// for callers holding at least the reader role on it (share tokens
+// included). The share view learns the repository's human name and the
+// threshold from this boot call; the rows are the same summaries the old
+// GET /api/people list carried.
+func (s *Server) handleRepo(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeErr(w, http.StatusMethodNotAllowed, "GET required")
 		return
@@ -22,6 +24,13 @@ func (s *Server) handlePeople(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.requireRepoRole(w, r, repoID, roleReader) {
+		return
+	}
+	repo, ok := s.db.GetRepo(repoID)
+	if !ok {
+		// Only an admin passing a bogus ?repo= reaches this: grants and
+		// share tokens always reference existing repositories.
+		writeErr(w, http.StatusNotFound, db.ErrRepoNotFound.Error())
 		return
 	}
 	people := s.db.PeopleByRepo(repoID)
@@ -49,7 +58,17 @@ func (s *Server) handlePeople(w http.ResponseWriter, r *http.Request) {
 			Thumb: thumb, Aliases: aliases,
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"people": out, "count": len(out), "repo": repoID})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": repo.ID, "name": repo.Name, "threshold": s.eng.Threshold(),
+		"people": out, "count": len(out),
+	})
+}
+
+// handlePeopleGone is the tombstone for the exact pre-refactor path: GET
+// /api/people moved to GET /api/repo. Registered so old clients get a loud
+// JSON 404 instead of falling through to the SPA catch-all (HTML 200).
+func (s *Server) handlePeopleGone(w http.ResponseWriter, r *http.Request) {
+	writeErr(w, http.StatusNotFound, "GET /api/people moved to GET /api/repo")
 }
 
 // handlePersonSubroutes dispatches /api/people/{name}/… — the reader-visible

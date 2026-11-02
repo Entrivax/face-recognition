@@ -1,9 +1,10 @@
 // App-wide data model: the signed-in session, the repository list with the
-// selected repo, health, the people list of that repo, the match threshold,
-// and what the viewer may do (Perms), plus the shared server actions —
-// built as a Preact signals model (createModel/useModel) instead of a
-// plain context value. Components read app.people.value etc. and re-render
-// per-signal rather than on every owner render.
+// selected repo, health, the selected repo's info document (people list,
+// human name, threshold), and what the viewer may do (Perms), plus the
+// shared server actions — built as a Preact signals model
+// (createModel/useModel) instead of a plain context value. Components read
+// app.people.value etc. and re-render per-signal rather than on every owner
+// render.
 //
 // MainApp creates the writable instance (useModel(() => new AppModel(...)));
 // ShareView creates a read-only one (fixed repository, no-op mutating
@@ -20,7 +21,7 @@ import type { ReadonlySignal } from "@preact/signals";
 import * as api from "./api";
 import { ShareInvalidError } from "./api/core";
 import type { ToastKind } from "./toast";
-import type { Health, PersonDetail, PersonSummary, RepoInfo, SessionUser } from "./types";
+import type { Health, PersonSummary, RepoInfo, SessionUser } from "./types";
 
 /** What the viewer (signed-in user or share visitor) may do in this repo. */
 export interface Perms {
@@ -36,8 +37,7 @@ export interface Perms {
 export type AppModelDeps =
 	| { mode: "app"; user: SessionUser | null; onSessionEnd: () => void;
 	    toast: { show(msg: string, kind?: ToastKind): void } }
-	| { mode: "share"; fixedRepoId: string;
-	    onPersonDetail?: (d: PersonDetail) => void };
+	| { mode: "share"; fixedRepoId: string };
 
 export interface IAppModel {
 	user: ReadonlySignal<SessionUser | null>;
@@ -51,26 +51,27 @@ export interface IAppModel {
 	repo: ReadonlySignal<RepoInfo | null>;
 	people: ReadonlySignal<PersonSummary[]>;
 	peopleErr: ReadonlySignal<boolean>;
-	/** server-persisted threshold; null = unknown (share mode) → row hidden */
+	/** the selected repository's human name as the server reports it (null
+	 *  while unknown — the share banner falls back to the short repo id) */
+	repoName: ReadonlySignal<string | null>;
+	/** server-persisted threshold; null = unknown (still loading / failed) */
 	threshold: ReadonlySignal<number | null>;
 	perms: ReadonlySignal<Perms>;
-	/** boot loads: health (+ repos & config in app mode). Owner effect. */
+	/** boot loads: health (+ repos in app mode). Owner effect. */
 	init(): void;
-	/** load the selected repo's people list (supersede-guarded). Resolves
-	 *  on failure too (→ peopleErr); rejects only on ShareInvalidError —
-	 *  ShareView's boot keys the invalid phase off that rejection. */
-	loadPeople(): Promise<void>;
+	/** load the selected repo's info document — people list, name,
+	 *  threshold (supersede-guarded). Resolves on failure too (→ peopleErr);
+	 *  rejects only on ShareInvalidError — ShareView's boot keys the
+	 *  invalid phase off that rejection. */
+	loadRepo(): Promise<void>;
 	setRepoId(id: string): void;
 	logout(): Promise<void>;
-	/** any mutation → reload the people list, the repo counts and health
-	 *  (share mode: people + health only) */
+	/** any mutation → reload the repo document, the repo counts and health
+	 *  (share mode: repo document + health only) */
 	refreshAll(): void;
 	commitThreshold(v: number): Promise<void>;
 	rescan(): Promise<void>;
 	removePerson(name: string): Promise<void>;
-	/** every person-details document a person modal loads (share mode
-	 *  learns the repository's human name from it; app mode: no-op) */
-	onPersonDetail(d: PersonDetail): void;
 }
 
 const REPO_KEY = "recogn.repo";
@@ -89,6 +90,9 @@ export const AppModel = createModel((deps: AppModelDeps): IAppModel => {
 	const repoId = signal<string | null>(share ? deps.fixedRepoId : null);
 	const people = signal<PersonSummary[]>([]);
 	const peopleErr = signal(false);
+	// The selected repository's human name (from GET /api/repo); the share
+	// banner falls back to the short repo id while null.
+	const repoName = signal<string | null>(null);
 	// Global match threshold; null = unknown (still loading / failed) so the
 	// panel can hide the row instead of showing a wrong value.
 	const threshold = signal<number | null>(null);
@@ -132,47 +136,42 @@ export const AppModel = createModel((deps: AppModelDeps): IAppModel => {
 		}
 	};
 
-	// The people fetch is async and the selected repo can change while it is
-	// in flight: loadPeople records the repo it fetches for and ignores both
+	// The repo fetch is async and the selected repo can change while it is
+	// in flight: loadRepo records the repo it fetches for and ignores both
 	// the success and the failure of a request that has since been
-	// superseded (an older repo's list must not land under the new repo).
-	let peopleReq: string | null = null;
-	const loadPeople = async () => {
+	// superseded (an older repo's document must not land under the new
+	// repo). One GET /api/repo round trip carries the people list, the
+	// repository's human name and the threshold.
+	let repoReq: string | null = null;
+	const loadRepo = async () => {
 		const want = repoId.value;
 		if (!want) {
-			peopleReq = null;
+			repoReq = null;
 			people.value = [];
+			repoName.value = null;
 			return;
 		}
-		peopleReq = want;
+		if (repoReq !== want) repoName.value = null; // new repo: drop the stale name
+		repoReq = want;
 		try {
-			const j = await api.getPeople(want);
-			if (peopleReq !== want) return; // superseded request
+			const j = await api.getRepo(want);
+			if (repoReq !== want) return; // superseded request
 			people.value = j.people || [];
+			repoName.value = j.name;
+			threshold.value = j.threshold;
 			peopleErr.value = false;
 		} catch (e) {
-			if (peopleReq !== want) return; // superseded request
+			if (repoReq !== want) return; // superseded request
 			if (e instanceof ShareInvalidError) throw e; // the share hook already flipped the phase
 			peopleErr.value = true;
 		}
 	};
 
-	// GET /api/config is open to any signed-in user — the slider mirrors the
-	// server's persisted threshold and readers see the value as read-only.
-	const loadConfig = async () => {
-		try {
-			const c = await api.getConfig();
-			threshold.value = c.threshold;
-		} catch {
-			threshold.value = null;
-		}
-	};
-
 	// Any mutation (person removed, photos added/deleted, avatar changed,
-	// enroll succeeded) reloads the people list, the repo list (people
+	// enroll succeeded) reloads the repo document, the repo list (people
 	// counts) and health.
 	const refreshAll = () => {
-		void loadPeople().catch(() => {}); // rejects only on share-invalid; the hook owns that flip
+		void loadRepo().catch(() => {}); // rejects only on share-invalid; the hook owns that flip
 		void checkHealth();
 		if (!share) void loadRepos();
 	};
@@ -202,15 +201,15 @@ export const AppModel = createModel((deps: AppModelDeps): IAppModel => {
 		repo,
 		people,
 		peopleErr,
+		repoName,
 		threshold,
 		perms,
 		init() {
 			void checkHealth();
-			if (share) return; // share mode loads only health (people list comes from the boot call)
+			if (share) return; // share mode loads only health (the repo document comes from the boot call)
 			void loadRepos();
-			void loadConfig();
 		},
-		loadPeople,
+		loadRepo,
 		setRepoId(id: string) {
 			repoId.value = id;
 		},
@@ -259,10 +258,6 @@ export const AppModel = createModel((deps: AppModelDeps): IAppModel => {
 			} catch (e) {
 				deps.toast.show((e as Error).message, "err");
 			}
-		},
-		onPersonDetail(d: PersonDetail) {
-			if (deps.mode === "share") deps.onPersonDetail?.(d);
-			// app mode: nothing to learn — the repos list already carries names
 		},
 	};
 });
