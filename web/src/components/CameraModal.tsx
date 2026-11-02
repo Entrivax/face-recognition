@@ -6,11 +6,11 @@
 //
 // getUserMedia exists only in a secure context (HTTPS or localhost); the
 // opener buttons hide on `cameraAvailable`, and the modal still guards the
-// case with a message. Stream lifecycle: every stream is stopped on unmount,
-// before each restart, and superseded async starts are discarded by a
+// case with a message. Stream lifecycle: every stream is stopped on close or
+// unmount and before each restart; superseded async starts are discarded by a
 // sequence guard — no camera can stay hot after the modal is gone.
 
-import { useEffect, useRef } from "preact/hooks";
+import { useLayoutEffect, useRef } from "preact/hooks";
 import { useSignal } from "@preact/signals";
 import { Show } from "@preact/signals/utils";
 import { Modal } from "./Modal";
@@ -46,6 +46,7 @@ export function CameraModal({ open, onCloseRequest, onCapture }: CameraModalProp
 	const errIsUnsupported = useSignal(false);
 	const devices = useSignal<MediaDeviceInfo[]>([]);
 	const deviceId = useSignal("");
+	const capturing = useSignal(false);
 	// Front cameras (and desktop webcams, which report no facingMode) are
 	// previewed mirrored; the capture applies the same flip so the file
 	// matches what the user framed. Rear cameras stay unmirrored.
@@ -72,12 +73,12 @@ export function CameraModal({ open, onCloseRequest, onCapture }: CameraModalProp
 
 	// Start (or restart on a camera switch): one live stream at a time.
 	const start = async (wantId?: string) => {
+		const seq = ++seqRef.current;
 		const md = navigator.mediaDevices;
 		if (!md?.getUserMedia) {
 			fail("Camera capture needs a secure context — open this page over HTTPS or localhost.", true);
 			return;
 		}
-		const seq = ++seqRef.current;
 		stopStream();
 		status.value = "starting";
 		errText.value = "";
@@ -88,7 +89,7 @@ export function CameraModal({ open, onCloseRequest, onCapture }: CameraModalProp
 					: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
 				audio: false,
 			});
-			if (seq !== seqRef.current) { // a newer start or the unmount won
+			if (seq !== seqRef.current) { // a newer start or close won
 				stream.getTracks().forEach((t) => t.stop());
 				return;
 			}
@@ -113,15 +114,16 @@ export function CameraModal({ open, onCloseRequest, onCapture }: CameraModalProp
 		}
 	};
 
-	// Mount → start; unmount → always release the camera.
-	useEffect(() => {
+	// Open → start; close or unmount → always release the camera.
+	useLayoutEffect(() => {
+		if (!open) return;
 		void start();
 		return () => { seqRef.current++; stopStream(); };
-	}, []);
+	}, [open]);
 
 	const capture = () => {
 		const v = videoRef.current;
-		if (status.value !== "live" || !v || !v.videoWidth) return;
+		if (capturing.value || status.value !== "live" || !v || !v.videoWidth) return;
 		const canvas = document.createElement("canvas");
 		canvas.width = v.videoWidth;
 		canvas.height = v.videoHeight;
@@ -129,12 +131,25 @@ export function CameraModal({ open, onCloseRequest, onCapture }: CameraModalProp
 		if (!ctx) { fail("Capture failed — the frame could not be drawn."); return; }
 		if (mirror.value) { ctx.translate(canvas.width, 0); ctx.scale(-1, 1); }
 		ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
-		canvas.toBlob((blob) => {
-			if (!blob) { fail("Capture failed — the frame could not be encoded."); return; }
-			stopStream();
-			onCapture(new File([blob], `camera-${Date.now()}.jpg`, { type: "image/jpeg" }));
-			onCloseRequest();
-		}, "image/jpeg", 0.92);
+		const seq = seqRef.current;
+		capturing.value = true;
+		try {
+			canvas.toBlob((blob) => {
+				capturing.value = false;
+				if (seq !== seqRef.current) return;
+				if (!blob) { fail("Capture failed — the frame could not be encoded."); return; }
+				stopStream();
+				onCapture(new File([blob], `camera-${Date.now()}.jpg`, { type: "image/jpeg" }));
+				onCloseRequest();
+			}, "image/jpeg", 0.92);
+		} catch (e) {
+			capturing.value = false;
+			if (e instanceof DOMException && e.name === "SecurityError") {
+				fail("Capture failed — the frame could not be encoded.");
+				return;
+			}
+			throw e;
+		}
 	};
 
 	const live = status.value === "live";
@@ -191,7 +206,7 @@ export function CameraModal({ open, onCloseRequest, onCapture }: CameraModalProp
 							type="button"
 							id="cameraShutter"
 							class="btn btn-accent"
-							disabled={!live}
+							disabled={!live || capturing.value}
 							onClick={capture}
 						>
 							Take photo

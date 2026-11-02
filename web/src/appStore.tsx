@@ -137,33 +137,38 @@ export const AppModel = createModel((deps: AppModelDeps): IAppModel => {
 	};
 
 	// The repo fetch is async and the selected repo can change while it is
-	// in flight: loadRepo records the repo it fetches for and ignores both
-	// the success and the failure of a request that has since been
-	// superseded (an older repo's document must not land under the new
-	// repo). One GET /api/repo round trip carries the people list, the
-	// repository's human name and the threshold.
+	// in flight: loadRepo records the repo and request generation and ignores
+	// both the success and failure of a superseded request. One GET /api/repo
+	// round trip carries the people list, repository name and threshold.
 	let repoReq: string | null = null;
+	let repoGeneration = 0;
+	let pendingRepoGeneration: number | null = null;
 	const loadRepo = async () => {
 		const want = repoId.value;
+		const generation = ++repoGeneration;
 		if (!want) {
 			repoReq = null;
+			pendingRepoGeneration = null;
 			people.value = [];
 			repoName.value = null;
 			return;
 		}
 		if (repoReq !== want) repoName.value = null; // new repo: drop the stale name
 		repoReq = want;
+		pendingRepoGeneration = generation;
 		try {
 			const j = await api.getRepo(want);
-			if (repoReq !== want) return; // superseded request
+			if (repoReq !== want || repoGeneration !== generation) return; // superseded request
 			people.value = j.people || [];
 			repoName.value = j.name;
 			threshold.value = j.threshold;
 			peopleErr.value = false;
 		} catch (e) {
-			if (repoReq !== want) return; // superseded request
+			if (repoReq !== want || repoGeneration !== generation) return; // superseded request
 			if (e instanceof ShareInvalidError) throw e; // the share hook already flipped the phase
 			peopleErr.value = true;
+		} finally {
+			if (pendingRepoGeneration === generation) pendingRepoGeneration = null;
 		}
 	};
 
@@ -228,7 +233,10 @@ export const AppModel = createModel((deps: AppModelDeps): IAppModel => {
 			if (deps.mode === "share") return; // readers cannot change the threshold
 			try {
 				const j = await api.setThreshold(v);
+				repoGeneration++;
 				threshold.value = j.threshold;
+				// Replace an invalidated read so its people and name still load.
+				if (pendingRepoGeneration !== null) void loadRepo().catch(() => {});
 				deps.toast.show(`Threshold set to ${Number(j.threshold).toFixed(2)} (saved).`, "ok");
 			} catch (e) {
 				deps.toast.show((e as Error).message || "Could not set the threshold.", "err");
