@@ -22,7 +22,7 @@
 // and a computed over props would capture the first render's name.
 
 import { useEffect, useRef } from "preact/hooks";
-import { batch, useSignal, useSignalEffect } from "@preact/signals";
+import { batch, useSignal, useSignalEffect, useComputed } from "@preact/signals";
 import { Show } from "@preact/signals/utils";
 import * as api from "../api";
 import type { PersonDetail } from "../types";
@@ -30,10 +30,12 @@ import { plural } from "../util";
 import { renderMarkdown } from "../markdown";
 import {
 	BIRTH_FORMATS_HINT,
+	ageAt,
 	birthAgeLine,
 	formatBirthText,
 	formatBirthTextual,
 	parseBirthText,
+	todayLocalISO,
 } from "../birthdate";
 import { useToast } from "../toast";
 import { useApp } from "../appStore";
@@ -71,6 +73,20 @@ export function PersonModal(props: PersonModalProps) {
 	// YYYY / -MM-DD / -MM- (see birthdate.ts).
 	const birthField = useSignal("");
 	const description = useSignal("");
+
+	const ageCalcOpen = useSignal(false);
+	const ageCalcDate = useSignal("");
+	const ageCalcResult = useComputed(() => {
+		const b = detail.value?.birthdate;
+		const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ageCalcDate.value);
+		if (!b || !m) return null;
+		const at = new Date(`${ageCalcDate.value}T00:00:00Z`);
+		const age = ageAt(b, at);
+		if (age == null) return null;
+		if (age < 0) return "not yet born";
+		const exact = b.month != null && b.day != null;
+		return `${exact ? "" : "≈ "}${plural(age, "year")} old on ${ageCalcDate.value}`;
+	});
 
 	// The person whose details are shown, mirrored from props (props are
 	// not signals): loadDetail's stale guard and the photo target read it
@@ -324,7 +340,40 @@ export function PersonModal(props: PersonModalProps) {
 														{birthText}
 														{birthIso && <span class="person-birth-iso"> ({birthIso})</span>}
 													</p>
-													{birthExtra && <p class="person-birth-extra">{birthExtra}</p>}
+													{birthExtra && (d.birthdate?.year != null ? (
+											<button
+												type="button"
+												class="person-birth-extra person-birth-toggle"
+												id="personAgeToggle"
+												aria-expanded={ageCalcOpen.value}
+												title="Age calculator"
+												onClick={() => {
+													if (!ageCalcOpen.value && !ageCalcDate.value) ageCalcDate.value = todayLocalISO();
+													ageCalcOpen.value = !ageCalcOpen.value;
+												}}
+											>
+												{birthExtra}
+											</button>
+										) : (
+											// A countdown-only line (no year) — no age is computable.
+											<p class="person-birth-extra">{birthExtra}</p>
+										))}
+										<Show when={ageCalcOpen}>
+											{() => (
+												<div class="person-age-calc" id="personAgeCalc">
+													<label class="person-age-calc-label" for="personAgeCalcDate">Age on</label>
+													<input
+														id="personAgeCalcDate"
+														type="date"
+														value={ageCalcDate}
+														onInput={(e) => { ageCalcDate.value = e.currentTarget.value; }}
+													/>
+													<Show when={ageCalcResult}>
+														{(r) => <p class="person-age-calc-result">{r}</p>}
+													</Show>
+												</div>
+											)}
+										</Show>
 												</section>
 											)}
 

@@ -521,6 +521,21 @@ body.modal-open { overflow: hidden; }
 }
 /* the same birthdate in dashed numeric form (YYYY-MM-DD when complete) */
 .person-birth-iso { font-family: var(--mono); font-size: 12px; color: var(--ink-faint); }
+/* hidden age calculator: the age line is a button that reveals the panel */
+.person-birth-toggle {
+	padding: 0; background: none; border: none;
+	display: block; text-align: left; cursor: pointer;
+}
+.person-birth-toggle:hover { text-decoration: underline; text-underline-offset: 3px; }
+.person-age-calc { margin-top: 8px; display: grid; gap: 6px; justify-items: start; }
+.person-age-calc-label { font-family: var(--mono); font-size: 11px; color: var(--ink-faint); }
+.person-age-calc input {
+	background: var(--bg-raise); border: 1px solid var(--line);
+	border-radius: 8px; color: var(--ink);
+	padding: 5px 8px; font-family: var(--mono); font-size: 12px;
+}
+.person-age-calc input:focus { outline: none; border-color: var(--accent); }
+.person-age-calc-result { margin: 0; font-family: var(--mono); font-size: 11.5px; color: var(--ink-dim); }
 .person-links { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
 .person-links a {
 	font-family: var(--mono); font-size: 11.5px; color: var(--accent);

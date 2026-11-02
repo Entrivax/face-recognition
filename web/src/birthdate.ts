@@ -16,6 +16,7 @@
 // injectable `now` for tests.
 
 import type { BirthDate } from "./types";
+import { plural } from "./util";
 
 /** The known components of a partial birthdate (absent = unknown). */
 export interface BirthParts {
@@ -150,6 +151,24 @@ function daysToBirthday(month: number, day: number, now: Date): number {
 }
 
 /**
+ * Whole years elapsed between the floored birthdate and `at` (both UTC).
+ * The flooring matches birthAgeLine: unknown month → January, unknown day
+ * within a known month → the 1st. Null when the birthdate has no year.
+ * Negative for a future birthdate (the caller decides how to show that).
+ */
+export function ageAt(b?: BirthDate | null, at: Date = new Date()): number | null {
+	if (b?.year == null) return null;
+	const m = b.month ?? 1;
+	const d = b.month != null ? (b.day ?? 1) : 1;
+	return yearsSince(b.year, m, d, at);
+}
+
+/** The local calendar date as YYYY-MM-DD (default value for date inputs). */
+export function todayLocalISO(now: Date = new Date()): string {
+	return `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}`;
+}
+
+/**
  * The age/countdown line for the details view, or null when nothing can be
  * computed: the exact age needs the full date; a partial one shows "≈" with
  * the birth date floored to the start of the month (day unknown) or year
@@ -160,14 +179,9 @@ export function birthAgeLine(b?: BirthDate | null, now: Date = new Date()): stri
 	const parts: string[] = [];
 
 	if (b.year != null) {
-		// Floor to the start of the month when the day is unknown, and to
-		// the start of the year when the month is unknown too.
-		const y = b.year;
-		const m = b.month ?? 1;
-		const d = b.month != null ? (b.day ?? 1) : 1;
-		const age = yearsSince(y, m, d, now);
+		const age = ageAt(b, now) as number;
 		const exact = b.month != null && b.day != null;
-		parts.push(`${exact ? "" : "≈ "}${age} ${age === 1 ? "year" : "years"}`);
+		parts.push(`${exact ? "" : "≈ "}${plural(age, "year")}`);
 	}
 
 	if (b.month != null && b.day != null) {
