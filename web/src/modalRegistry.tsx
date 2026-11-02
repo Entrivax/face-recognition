@@ -19,13 +19,14 @@ import { PhotosModal } from "./components/PhotosModal";
 import { CompareModal } from "./components/CompareModal";
 import { FaceCheckModal } from "./components/FaceCheckModal";
 import { EditModal } from "./components/EditModal";
+import { CameraModal } from "./components/CameraModal";
 import { ReposModal } from "./components/ReposModal";
 import { UsersModal } from "./components/UsersModal";
 import { ApiKeysModal } from "./components/ApiKeysModal";
 import { ChangePasswordModal } from "./components/ChangePasswordModal";
 
 export type ModalKey =
-	| "enroll" | "person" | "photos" | "compare" | "check"
+	| "enroll" | "person" | "photos" | "compare" | "check" | "camera"
 	| "edit" | "repos" | "users" | "keys" | "password";
 
 /** Per-key args accepted by open/patch. */
@@ -39,6 +40,9 @@ export interface ModalArgs {
 	compare: { seed?: CompareSeed | null };
 	/** the enlarged face-check viewer's photo + faces */
 	check: { view: CheckView };
+	/** the camera capture: the taken File is handed to the opener, then the
+	 *  modal closes itself */
+	camera: { onCapture: (file: File) => void };
 	/** the stage photo editor: source file, the export callback, and the
 	 *  per-file session vault (initialSession in, onSaveSession out at close) */
 	edit: {
@@ -61,6 +65,7 @@ export const MODAL_DEFS: Record<ModalKey, ComponentType<any>> = {
 	compare: CompareModal,
 	check: FaceCheckModal,
 	edit: EditModal,
+	camera: CameraModal,
 	repos: ReposModal,
 	users: UsersModal,
 	keys: ApiKeysModal,

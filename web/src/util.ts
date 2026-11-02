@@ -1,5 +1,11 @@
 // Small shared helpers.
 
+/** In-app camera capture needs getUserMedia, which exists only in a secure
+ *  context (HTTPS or localhost). A plain const: it never changes without a
+ *  reload, so call sites branch on it with plain JSX, not Show. */
+export const cameraAvailable =
+	typeof navigator.mediaDevices?.getUserMedia === "function";
+
 export function fmtSize(bytes: number): string {
 	return bytes >= 1024 * 1024
 		? `${(bytes / (1024 * 1024)).toFixed(1)} MB`

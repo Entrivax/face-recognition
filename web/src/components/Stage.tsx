@@ -25,6 +25,7 @@ import { useToast } from "../toast";
 import { useApp } from "../appStore";
 import { useModals } from "../modalRegistry";
 import { usePasteFiles, PASTE_FALLBACK } from "../paste";
+import { cameraAvailable } from "../util";
 import type { EditSession } from "./EditModal";
 
 /** The editor's session vault: the committed session of the file it belongs
@@ -171,6 +172,12 @@ export function Stage() {
 		});
 	}, [modals, applyEdited, saveEditorSession]);
 
+	// In-app camera capture: the taken File enters exactly like an upload
+	// (preview + recognition re-run through handleFile).
+	const openCamera = useCallback(() => {
+		modals.open("camera", { onCapture: (f) => void handleFile(f) });
+	}, [modals, handleFile]);
+
 	const onDropzoneClick = () => {
 		if (previewURL.value === null) openPicker();
 	};
@@ -266,6 +273,18 @@ export function Stage() {
 			</div>
 
 			<div class="stage-actions">
+				{cameraAvailable && (
+					<button
+						id="cameraBtn"
+						class="btn"
+						onClick={(e) => {
+							e.stopPropagation();
+							openCamera();
+						}}
+					>
+						Take photo
+					</button>
+				)}
 				{app.perms.value.writer && (
 					<>
 						<button

@@ -128,7 +128,7 @@ html, body {
 .canvas-wrap canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
 
 .stage-actions {
-	display: flex; align-items: center; gap: 10px;
+	display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
 	margin-top: 14px; min-height: 34px;
 }
 .stage-meta { margin-left: auto; font-family: var(--mono); font-size: 11.5px; color: var(--ink-faint); }
@@ -716,6 +716,36 @@ body.modal-open { overflow: hidden; }
 .enroll-thumb-note:empty { display: none; }
 .modal.locked .enroll-drop, .modal.locked .enroll-thumbs { opacity: 0.55; pointer-events: none; }
 .enroll-meta { margin: 12px 0 0; font-family: var(--mono); font-size: 11px; color: var(--ink-faint); }
+
+/* small camera-capture button rows under the enroll/photos dropzones */
+.enroll-alt { margin-top: 10px; }
+
+/* ---------- camera capture modal ---------- */
+.camera-body { padding-top: 14px; }
+.camera-stage {
+	position: relative;
+	background: #000; border-radius: 8px; overflow: hidden;
+	aspect-ratio: 4 / 3;
+}
+.camera-stage video { display: block; width: 100%; height: 100%; object-fit: contain; }
+.camera-stage.mirror video { transform: scaleX(-1); }
+.camera-overlay {
+	position: absolute; inset: 0; z-index: 1;
+	display: grid; place-content: center; justify-items: center; gap: 10px;
+	text-align: center; padding: 16px;
+	background: rgba(4, 7, 10, 0.75);
+	color: var(--ink-dim); font-family: var(--mono); font-size: 12px; line-height: 1.5;
+}
+.camera-select {
+	font-family: var(--display); font-size: 12.5px;
+	background: var(--bg-raise); border: 1px solid var(--line);
+	border-radius: 8px; color: var(--ink);
+	padding: 7px 10px; max-width: 100%; margin: 10px 0 0;
+	cursor: pointer;
+}
+.camera-select:focus-visible { outline: none; border-color: var(--accent); }
+.camera-select:disabled { opacity: 0.6; cursor: default; }
+
 .modal-foot {
 	display: flex; justify-content: flex-end; gap: 10px;
 	margin-top: 20px; padding-top: 16px;

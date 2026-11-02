@@ -43,7 +43,7 @@ import * as api from "../api";
 import type { Face } from "../types";
 import { BIRTH_FORMATS_HINT, formatBirthText, parseBirthText } from "../birthdate";
 import { drawFaces } from "../overlay";
-import { fmtSize, plural } from "../util";
+import { fmtSize, plural, cameraAvailable } from "../util";
 import { useToast, type ToastKind } from "../toast";
 import { useApp, type IAppModel } from "../appStore";
 import { useModals, type TypedModalService } from "../modalRegistry";
@@ -646,6 +646,21 @@ export function EnrollModal(props: EnrollModalProps) {
 							}}
 						/>
 					</div>
+
+					{/* camera capture joins the review list like any picked file */}
+					{cameraAvailable && (
+						<div class="enroll-alt" id="enrollCamRow">
+							<button
+								type="button"
+								class="btn btn-ghost btn-sm"
+								id="enrollCamBtn"
+								disabled={model.enrolling}
+								onClick={() => modals.open("camera", { onCapture: (f) => model.addPending([f]) })}
+							>
+								Take photo
+							</button>
+						</div>
+					)}
 
 					<ul ref={(el) => { model.thumbsRef.value = el; }} id="enrollThumbs" class="enroll-thumbs" hidden={model.noPending}>
 						<For each={model.pending} getKey={(p) => p.key}>

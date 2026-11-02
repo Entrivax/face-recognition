@@ -33,6 +33,7 @@ import { useToast } from "../toast";
 import { useApp } from "../appStore";
 import { useModals } from "../modalRegistry";
 import { usePasteFiles } from "../paste";
+import { cameraAvailable } from "../util";
 import { Modal } from "./Modal";
 
 interface PhotosModalProps {
@@ -494,6 +495,20 @@ export function PhotosModal(props: PhotosModalProps) {
 										}}
 									/>
 								</div>
+								{/* camera capture uploads straight into the person's dataset */}
+								{cameraAvailable && (
+									<div class="enroll-alt" id="photoCamRow">
+										<button
+											type="button"
+											class="btn btn-ghost btn-sm"
+											id="photoCamBtn"
+											disabled={busy}
+											onClick={() => modals.open("camera", { onCapture: (f) => void addPhotos([f]) })}
+										>
+											Take photo
+										</button>
+									</div>
+								)}
 							</div>
 						}
 					>
