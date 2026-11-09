@@ -96,12 +96,12 @@ export function Stage() {
 			toast.show("That file isn't an image.", "err");
 			return;
 		}
-		currentFileRef.current = file;
-		editOriginal.value = editedFrom ?? null;
 		const seq = ++reqSeq.current;
 		// Show the preview immediately (revoking the previous object URL).
 		const url = URL.createObjectURL(file);
 		resetStage()
+		currentFileRef.current = file;
+		editOriginal.value = editedFrom ?? null;
 		batch(() => {
 			stageURLRef.current = url;
 			previewURL.value = url;
